@@ -44,13 +44,28 @@ class EventType(str, Enum):
     # Layer 6 — Execution
     ACTION_REQUESTED = "ActionRequested"
     ACTION_APPROVED = "ActionApproved"
+    ACTION_REJECTED = "ActionRejected"
+    ACTION_EXECUTING = "ActionExecuting"
     ACTION_EXECUTED = "ActionExecuted"
+    ACTION_FAILED = "ActionFailed"
+    ACTION_CANCELLED = "ActionCancelled"
 
     # Layer 7 — Observation
     OUTCOME_OBSERVED = "OutcomeObserved"
 
     # Layer 8 — Learning
     LEARNING_UPDATED = "LearningUpdated"
+
+    # Organization lifecycle / onboarding (owned by Organization V1)
+    ORG_CREATED = "OrgCreated"
+    ORG_PROFILE_COMPLETED = "OrgProfileCompleted"
+    ORG_GMAIL_CONNECTED = "OrgGmailConnected"
+    ORG_CALENDAR_CONNECTED = "OrgCalendarConnected"
+    ORG_FIRST_SIGNAL = "OrgFirstSignal"
+    ORG_MEMORY_READY = "OrgMemoryReady"
+    ORG_STATE_READY = "OrgStateReady"
+    ORG_FIRST_BRIEF = "OrgFirstBrief"
+    ORG_ACTIVATED = "OrgActivated"
 
 
 @dataclass(slots=True)

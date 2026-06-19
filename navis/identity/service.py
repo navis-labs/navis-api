@@ -9,8 +9,11 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from navis.identity.audit import AuditAction, AuditService
 from navis.identity.models import Membership, Organization, Role, Session, User
+from navis.identity.org_service import OrganizationService
 from navis.identity.schemas import SignupRequest
+from navis.identity.tokens import TokenRevocationService
 from navis.platform.config import settings
 from navis.platform.security import (
     create_access_token,
@@ -22,11 +25,6 @@ from navis.platform.security import (
 
 class AuthError(Exception):
     """Authentication/registration failure (maps to 400/401 at the edge)."""
-
-
-def _slugify(name: str) -> str:
-    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "org"
-    return f"{base}-{uuid.uuid4().hex[:6]}"
 
 
 def _hash_token(token: str) -> str:
@@ -48,14 +46,18 @@ class IdentityService:
             hashed_password=hash_password(data.password),
             is_verified=False,
         )
-        org = Organization(name=data.organization_name, slug=_slugify(data.organization_name))
-        self.db.add_all([user, org])
+        self.db.add(user)
+        # Org lifecycle goes through the seam (P2 extraction prep), not inline here.
+        org = await OrganizationService(self.db).create(name=data.organization_name)
         await self.db.flush()
 
         # First user of an org is the founder.
         membership = Membership(user_id=user.id, organization_id=org.id, role=Role.FOUNDER)
         self.db.add(membership)
         await self.db.flush()
+        await AuditService(self.db).record(
+            AuditAction.SIGNUP, org_id=org.id, actor_id=user.id, target_id=str(org.id)
+        )
         return user, org, membership
 
     async def authenticate(self, email: str, password: str) -> User:
@@ -69,8 +71,21 @@ class IdentityService:
         return user
 
     async def primary_membership(self, user: User) -> Membership | None:
+        # Deterministic: oldest membership wins (stable across requests).
         return await self.db.scalar(
-            select(Membership).where(Membership.user_id == user.id).limit(1)
+            select(Membership)
+            .where(Membership.user_id == user.id)
+            .order_by(Membership.created_at.asc(), Membership.id.asc())
+            .limit(1)
+        )
+
+    async def logout(self, *, jti: str | None, user_id: uuid.UUID, expires_at: datetime | None) -> None:
+        """Revoke the presented access token and audit the logout."""
+        revocation = TokenRevocationService(self.db)
+        if jti:
+            await revocation.revoke_jti(jti, user_id=user_id, expires_at=expires_at)
+        await AuditService(self.db).record(
+            AuditAction.LOGOUT, actor_id=user_id, target_id=str(user_id)
         )
 
     async def issue_tokens(self, user: User, org_id: uuid.UUID | None) -> tuple[str, str]:

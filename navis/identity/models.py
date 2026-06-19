@@ -64,6 +64,9 @@ class User(UUIDPrimaryKey, Timestamped, Base):
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     # Set when the user signs in with Google instead of a password.
     google_sub: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    # Access tokens issued (iat) before this instant are rejected — the bulk-revoke
+    # lever for deactivation and membership removal. NULL = no bulk revocation.
+    tokens_valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     memberships: Mapped[list["Membership"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"

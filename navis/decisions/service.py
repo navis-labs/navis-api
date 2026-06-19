@@ -1,22 +1,25 @@
-"""Decision service: assemble the brief from state + reasoning, persist, announce.
+"""DecisionService — convert ReasoningSignals into a persisted DailyBrief.
 
-This is the seam where the whole pipeline converges:
-    state -> reasoning -> what-matters-today -> DailyBrief
+Decision consumes ReasoningSignal[] ONLY. It does not build State, run Reasoning,
+or touch Memory/Signals/Execution — the pipeline assembly (State V2 -> Reasoning V2
+-> Decision) lives in orchestration. This service ranks, persists (idempotent
+upsert on the deterministic brief id), and announces BRIEF_READY.
 """
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 
 from sqlalchemy import desc, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from navis.decisions.base import compute_brief_id
 from navis.decisions.models import DailyBrief
 from navis.decisions.what_matters_today import WhatMattersTodayEngine
 from navis.platform.events import DomainEvent, EventType, event_bus
 from navis.platform.monitoring import get_logger
-from navis.reasoning import run_reasoning
-from navis.state.builder import build_organizational_state
+from navis.reasoning.v2.contract import ReasoningSignal
 
 logger = get_logger("decisions")
 
@@ -26,35 +29,67 @@ class DecisionService:
         self.db = db
         self.engine = WhatMattersTodayEngine()
 
-    async def generate_brief(self, org_id: uuid.UUID) -> DailyBrief:
-        state = await build_organizational_state(self.db, org_id)
-        signals = run_reasoning(state)
-        items = self.engine.rank(signals)
-
-        brief = DailyBrief(
-            organization_id=org_id,
-            generated_at=datetime.now(timezone.utc),
-            state_summary=state.summary(),
-            items=[item.to_dict() for item in items],
+    async def decide(
+        self,
+        org_id: uuid.UUID,
+        signals: list[ReasoningSignal],
+        *,
+        reasoning_version: int,
+        state_watermark: str | None,
+        as_of: datetime | None,
+        policy: dict | None = None,
+    ) -> DailyBrief:
+        # Runtime policy is injected by orchestration (Adaptive → active snapshot).
+        # Absent a policy, the engine's own defaults apply — identical behavior.
+        engine = self.engine
+        if policy and ("brief_max_items" in policy or "brief_min_confidence" in policy):
+            engine = WhatMattersTodayEngine(
+                max_items=int(policy.get("brief_max_items", self.engine.max_items)),
+                min_confidence=float(policy.get("brief_min_confidence", self.engine.min_confidence)),
+            )
+        decisions = engine.decide(
+            signals,
+            org_id=org_id,
+            reasoning_version=reasoning_version,
+            state_watermark=state_watermark,
+            as_of=as_of,
         )
-        self.db.add(brief)
-        await self.db.flush()
+        brief_id = compute_brief_id(org_id, reasoning_version, state_watermark)
+        payload = [d.to_dict() for d in decisions]
+
+        # Idempotent upsert: replaying the same Reasoning rewrites the same brief.
+        stmt = (
+            pg_insert(DailyBrief)
+            .values(
+                id=brief_id,
+                organization_id=org_id,
+                reasoning_version=reasoning_version,
+                state_watermark=state_watermark,
+                as_of=as_of,
+                decisions=payload,
+            )
+            .on_conflict_do_update(
+                index_elements=["id"],
+                set_={"decisions": payload, "as_of": as_of, "state_watermark": state_watermark},
+            )
+        )
+        await self.db.execute(stmt)
 
         await event_bus.publish(
             DomainEvent(
                 type=EventType.BRIEF_READY,
                 org_id=org_id,
                 source="decisions",
-                payload={"brief_id": str(brief.id), "item_count": len(items)},
+                payload={"brief_id": str(brief_id), "decision_count": len(decisions)},
             )
         )
-        logger.info("brief generated org=%s items=%d", org_id, len(items))
-        return brief
+        logger.info("brief %s org=%s decisions=%d", brief_id, org_id, len(decisions))
+        return await self.db.get(DailyBrief, brief_id)
 
     async def latest_brief(self, org_id: uuid.UUID) -> DailyBrief | None:
         return await self.db.scalar(
             select(DailyBrief)
             .where(DailyBrief.organization_id == org_id)
-            .order_by(desc(DailyBrief.generated_at))
+            .order_by(desc(DailyBrief.as_of))
             .limit(1)
         )

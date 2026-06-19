@@ -1,10 +1,26 @@
-"""Learning — Layer 8. Where Navis becomes smarter.
+"""Learning — Layer 8. Historical outcome attribution.
 
-Outcomes adjust the confidence Navis places on each kind of signal:
+Answers one question: "what actually works?" — by attributing observed outcomes
+to the reasoning signals / decisions that produced them. Append-only, deterministic,
+idempotent, replayable, multi-tenant.
 
-    investor alerts succeed 93% -> raise confidence
-    hiring alerts ignored repeatedly -> lower confidence
+Learning is NOT intelligence/reasoning/prediction/recommendation. It stores counts
+and patterns (facts), never scores or actions.
 
-Patterns (founder/team/decision/outcome) accumulate here and feed back into
-reasoning and decisions over time.
+    OUTCOME_OBSERVED -> learning_event -> count aggregates -> patterns
 """
+from navis.learning.models import (
+    AggregateDimension,
+    LearningAggregate,
+    LearningEvent,
+    LearningResult,
+)
+from navis.learning.service import LearningService
+
+__all__ = [
+    "AggregateDimension",
+    "LearningAggregate",
+    "LearningEvent",
+    "LearningResult",
+    "LearningService",
+]

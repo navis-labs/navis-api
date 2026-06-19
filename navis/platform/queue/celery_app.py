@@ -55,4 +55,18 @@ celery_app.conf.beat_schedule = {
         "task": "navis.orchestration.sync.renew_watches",
         "schedule": 60 * 60 * 6,  # every 6h
     },
+    # Execution: drain approved actions + relay the outbox to the bus.
+    "execute-approved-actions": {
+        "task": "navis.execution.worker.execute_approved_actions",
+        "schedule": 30,
+    },
+    "relay-execution-outbox": {
+        "task": "navis.execution.worker.relay_execution_outbox",
+        "schedule": 15,
+    },
+    # Recover orphaned EXECUTING requests (dead workers).
+    "recover-stale-executions": {
+        "task": "navis.execution.worker.recover_stale_executions",
+        "schedule": 60,
+    },
 }

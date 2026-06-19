@@ -1,7 +1,15 @@
-"""Observation — Layer 7. Did it work?
+"""Observation — Layer 7. The append-only outcome system of record.
 
-After an action (or even a passive expectation), observation watches reality for
-the result: did they reply? was the meeting booked? was the commitment completed?
-It emits OutcomeObservation, which feeds learning. Most startups never build this
-loop — it's what lets Navis improve.
+"What happened after execution?" — nothing else. Observation consumes Execution
+events + provider webhooks, stores immutable, fully-provenanced outcome facts
+(no success/confidence/prediction — those are Learning's), and emits
+OUTCOME_OBSERVED with structured lineage so Learning attributes effects to the
+reasoning signals that caused them.
+
+It NEVER reads Memory/State/Reasoning/Decision/Learning/Intelligence — only
+Execution events and webhooks.
 """
+from navis.observation.models import Outcome, OutcomeType
+from navis.observation.service import ObservationService
+
+__all__ = ["Outcome", "OutcomeType", "ObservationService"]

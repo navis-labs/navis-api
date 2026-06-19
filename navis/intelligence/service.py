@@ -1,70 +1,58 @@
-"""Compute an Organizational Intelligence Score.
+"""IntelligenceService — project Learning into append-only organizational insights.
 
-Inputs: current State (how much is on fire), Learning (how reliable our signals
-have become), Memory (how much the company actually knows about itself).
-
-This is intentionally a transparent, explainable formula in phase 1 — trust-first.
-It can be replaced by a learned model later without changing the contract.
+Deterministic and append-only: same Learning => same insight_ids => same rows.
+created_at is logical time (max occurred_at of the consumed learning), never wall clock.
+Intelligence consumes Learning ONLY. No State, Memory, Signals, Reasoning, etc.
 """
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from typing import Any
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from navis.learning.models import ConfidenceWeight
-from navis.memory.models import Person
-from navis.state.builder import build_organizational_state
+from navis.intelligence.insights import InsightDraft, LearningView
+from navis.intelligence.insights import project as project_view
+from navis.intelligence.models import compute_insight_id
 
 
-@dataclass(slots=True)
-class IntelligenceScore:
-    org_id: uuid.UUID
-    score: float            # 0..100
-    coverage: float         # how much memory exists
-    reliability: float      # how trustworthy our signals are
-    control: float          # how few risks are currently open
-    explanation: str
+def draft_to_values(view: LearningView, draft: InsightDraft) -> dict[str, Any]:
+    """Pure mapping from a draft + view to an append-only insight row."""
+    insight_id = compute_insight_id(
+        view.org_id, draft.insight_type.value, draft.key, view.learning_version
+    )
+    return {
+        "insight_id": insight_id,
+        "organization_id": view.org_id,
+        "insight_type": draft.insight_type.value,
+        "key": draft.key,
+        "title": draft.title,
+        "summary": draft.summary,
+        "evidence": draft.evidence,
+        "sample_size": draft.sample_size,
+        "confidence": draft.confidence,
+        "supporting_learning_event_ids": sorted(draft.supporting)[:50],
+        "learning_version": view.learning_version,
+        "created_at": view.as_of,
+    }
+
+
+def project_values(view: LearningView) -> list[dict[str, Any]]:
+    """The full deterministic projection as plain row dicts (pure, no I/O)."""
+    return [draft_to_values(view, d) for d in project_view(view)]
 
 
 class IntelligenceService:
-    def __init__(self, db: AsyncSession) -> None:
-        self.db = db
+    def __init__(self, repo) -> None:
+        self.repo = repo
 
-    async def score(self, org_id: uuid.UUID) -> IntelligenceScore:
-        state = await build_organizational_state(self.db, org_id)
+    async def project(self, org_id: uuid.UUID) -> list[dict[str, Any]]:
+        view = await self.repo.build_view(org_id)
+        if view.learning_version == 0:
+            return []  # nothing learned yet => no insights
+        rows = project_values(view)
+        for values in rows:
+            await self.repo.append_insight(values)
+        await self.repo.flush()
+        return rows
 
-        people = await self.db.scalar(
-            select(func.count(Person.id)).where(Person.organization_id == org_id)
-        ) or 0
-        coverage = min(1.0, people / 50.0)  # saturates around a 50-person graph
-
-        avg_rate = await self.db.scalar(
-            select(func.avg(ConfidenceWeight.success_rate)).where(
-                ConfidenceWeight.organization_id == org_id
-            )
-        )
-        reliability = float(avg_rate) if avg_rate is not None else 0.5
-
-        open_risks = (
-            state.commitments.total_open
-            + len(state.relationships.going_cold())
-            + len(state.projects.stalled())
-        )
-        control = max(0.0, 1.0 - open_risks / 20.0)
-
-        raw = 0.4 * coverage + 0.3 * reliability + 0.3 * control
-        return IntelligenceScore(
-            org_id=org_id,
-            score=round(raw * 100, 1),
-            coverage=round(coverage, 3),
-            reliability=round(reliability, 3),
-            control=round(control, 3),
-            explanation=(
-                f"coverage={coverage:.2f} (memory depth), "
-                f"reliability={reliability:.2f} (signal track record), "
-                f"control={control:.2f} ({open_risks} open risks)."
-            ),
-        )
+    async def get_insights(self, org_id: uuid.UUID):
+        return await self.repo.get_insights(org_id)

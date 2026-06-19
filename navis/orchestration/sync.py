@@ -12,6 +12,7 @@ Signals capture; orchestration persists cursors/tokens/watch. Clean seam.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import Any
 
 from sqlalchemy import select
@@ -145,20 +146,37 @@ async def ensure_watch_for_integration(integration: Integration) -> dict:
         await transport.aclose()
 
 
-async def _run_all() -> dict:
-    async with session_scope() as db:
-        integrations = (
-            await db.scalars(select(Integration).where(Integration.is_active.is_(True)))
-        ).all()
+async def _dispatch_all() -> int:
+    """Fan-out: enqueue ONE per-integration task per active integration (paginated)."""
+    dispatched, after, page = 0, None, 1000
+    while True:
+        async with session_scope() as db:
+            stmt = (
+                select(Integration.id)
+                .where(Integration.is_active.is_(True))
+                .order_by(Integration.id)
+                .limit(page)
+            )
+            if after is not None:
+                stmt = stmt.where(Integration.id > after)
+            ids = (await db.scalars(stmt)).all()
+        if not ids:
+            break
+        for iid in ids:
+            sync_one_integration.delay(str(iid))
+        dispatched += len(ids)
+        after = ids[-1]
+        if len(ids) < page:
+            break
+    return dispatched
 
-    total = 0
-    for integ in integrations:
-        try:
-            res = await sync_integration(integ)
-            total += res.get("ingested", 0)
-        except Exception:  # one integration failing never blocks the rest
-            logger.exception("sync failed for integration=%s", integ.id)
-    return {"integrations": len(integrations), "ingested": total}
+
+async def _sync_by_id(integration_id: uuid.UUID) -> dict:
+    async with session_scope() as db:
+        integration = await db.get(Integration, integration_id)
+    if integration is None or not integration.is_active:
+        return {"skipped": "inactive"}
+    return await sync_integration(integration)
 
 
 async def _renew_all_watches() -> dict:
@@ -197,9 +215,14 @@ async def _sync_account(provider: str, email: str | None, history_id: str | None
     return await sync_integration(integration)
 
 
+@celery_app.task(name="navis.orchestration.sync.sync_one_integration")
+def sync_one_integration(integration_id: str) -> dict:
+    return asyncio.run(_sync_by_id(uuid.UUID(integration_id)))
+
+
 @celery_app.task(name="navis.orchestration.sync.sync_all_sources")
 def sync_all_sources() -> dict:
-    return asyncio.run(_run_all())
+    return {"dispatched": asyncio.run(_dispatch_all())}
 
 
 @celery_app.task(name="navis.orchestration.sync.renew_watches")

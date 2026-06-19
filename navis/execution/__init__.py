@@ -1,8 +1,22 @@
-"""Execution — Layer 6. Human-approved actions.
+"""Execution — Layer 6. The ONLY layer that creates external side effects.
 
-A decision becomes an Action. Actions are NEVER auto-fired: they require human
-approval (the product is human-in-the-loop). Commands: send_email, create_task,
-schedule_meeting, create_workflow.
+Execution consumes Decision (via the proposer) and produces ExecutionRequest +
+ExecutionEvent (outbox). It never calculates risk/priority/confidence and never
+reads Memory/State/Signals. Every action is human-approved, idempotent, fully
+traceable to its Decision -> ReasoningSignals -> State watermark, and executed
+out-of-band by a worker behind a provider abstraction.
 
-    Decision -> Action(requested) -> [human approves] -> Action(executed) -> Outcome
+    Decision -> request(REQUESTED) -> [human approve] -> APPROVED
+        -> worker: EXECUTING -> provider -> EXECUTED/FAILED  (+ outbox events)
 """
+from navis.execution.models import ActionType, ExecutionOutbox, ExecutionRequest
+from navis.execution.service import ExecutionService
+from navis.execution.status import ExecutionStatus
+
+__all__ = [
+    "ActionType",
+    "ExecutionRequest",
+    "ExecutionOutbox",
+    "ExecutionService",
+    "ExecutionStatus",
+]

@@ -1,6 +1,10 @@
-"""Intelligence — the final layer. What nobody builds.
+"""Intelligence — what has this organization learned about itself?
 
-Most companies stop at AI. Navis continues: it combines Learning + State + Memory
-into an Organizational Intelligence Score and adaptive recommendations — a measure
-of how well the company understands and runs itself, trending over time.
+The final layer. It consumes Learning ONLY (learning_events / learning_aggregates /
+learning_patterns) and projects it into append-only IntelligenceInsights — immutable
+FACTS the organization has learned about itself (signal/decision/team/customer/
+organizational/adaptation), each fully traceable to its supporting learning events.
+
+Not recommendations. Not actions. Not scores. Not risk. Deterministic and rebuildable:
+drop the table, re-project Learning, get identical insights.
 """

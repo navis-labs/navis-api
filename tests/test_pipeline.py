@@ -1,30 +1,17 @@
-"""Pure-pipeline tests: the parts that need no database.
+"""End-to-end pipeline (no DB): Memory -> State V2 -> Reasoning V2 -> Decision.
 
-Covers the reasoning core of the product: extract commitments from an email,
-project a state, run reasoning, and confirm "what matters today" ranks the
-overdue commitment to the top.
+Proves the layers compose deterministically through their real contracts.
 """
 from __future__ import annotations
 
-import uuid
-from datetime import datetime, timedelta, timezone
-
+from navis.decisions.base import DecisionCategory
 from navis.decisions.what_matters_today import WhatMattersTodayEngine
 from navis.memory.envelope import EntityType
 from navis.memory.service import build_memory_records
-from navis.reasoning import run_reasoning
-from navis.state.aggregate import (
-    CommitmentState,
-    CommitmentView,
-    OrganizationalState,
-    RelationshipState,
-    RelationshipView,
-)
+from navis.reasoning.v2 import REASONING_VERSION, run_reasoning_v2
+from navis.state.v2.builders import build_projection
 from tests.memory.fakes import gmail_view
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
+from tests.state.fakes import ORG_A, corpus, rec
 
 
 def test_memory_extracts_people_from_email():
@@ -33,8 +20,7 @@ def test_memory_extracts_people_from_email():
                             "body_text": "", "thread_id": ""})
     )
     emails = {r.payload["email"] for r in records if r.entity_type == EntityType.PERSON}
-    assert "jane@acme.com" in emails
-    assert "me@startup.com" in emails
+    assert "jane@acme.com" in emails and "me@startup.com" in emails
 
 
 def test_memory_extracts_commitment_promise():
@@ -44,50 +30,32 @@ def test_memory_extracts_commitment_promise():
                             "to": "", "thread_id": ""})
     )
     commitments = [r for r in records if r.entity_type == EntityType.COMMITMENT]
-    assert commitments, "expected at least one commitment"
-    assert "send you" in commitments[0].payload["text"].lower()
+    assert commitments and "send you" in commitments[0].payload["text"].lower()
 
 
-def test_overdue_commitment_tops_the_brief():
-    org_id = uuid.uuid4()
-    overdue = CommitmentView(
-        id=uuid.uuid4(),
-        description="Send investor the updated deck",
-        status="overdue",
-        due_at=_now() - timedelta(days=3),
-        promised_at=_now() - timedelta(days=11),
-        age_days=11.0,
-        counterparty=None,
-    )
-    cold = RelationshipView(
-        id=uuid.uuid4(),
-        person="investor@vc.com",
-        kind="investor",
-        last_contact_at=_now() - timedelta(days=11),
-        days_since_contact=11.0,
-        health=0.3,
-    )
-    state = OrganizationalState(
-        org_id=org_id,
-        built_at=_now(),
-        commitments=CommitmentState(overdue=[overdue]),
-        relationships=RelationshipState(relationships=[cold]),
-    )
+def test_state_reasoning_decision_compose_deterministically():
+    # Stale corpus so risk signals fire (heartbeat pushes as_of ~40 days ahead).
+    recs = corpus(ORG_A) + [
+        rec(EntityType.PERSON, "hb@acme.com", {"email": "hb@acme.com", "role": "from"},
+            offset=40 * 86400, tag="hb", org_id=ORG_A)
+    ]
+    state = build_projection(ORG_A, recs)
+    signals = run_reasoning_v2(state)
+    wm = str(state.watermark.last_memory_id)
 
-    signals = run_reasoning(state)
-    assert signals, "reasoning should produce signals"
+    engine = WhatMattersTodayEngine()
+    a = engine.decide(signals, org_id=ORG_A, reasoning_version=REASONING_VERSION,
+                      state_watermark=wm, as_of=state.as_of)
+    b = engine.decide(signals, org_id=ORG_A, reasoning_version=REASONING_VERSION,
+                      state_watermark=wm, as_of=state.as_of)
 
-    brief = WhatMattersTodayEngine().rank(signals)
-    assert brief, "brief should have items"
-    # The overdue commitment is the highest-severity concrete risk.
-    titles = [item.title for item in brief]
-    assert any("Send investor the updated deck" in t for t in titles)
-    # Every item is explainable (trust-first).
-    assert all(item.why for item in brief)
-
-
-if __name__ == "__main__":
-    test_memory_extracts_people_from_email()
-    test_memory_extracts_commitment_promise()
-    test_overdue_commitment_tops_the_brief()
-    print("all pipeline tests passed")
+    assert a, "expected decisions from the brief"
+    assert [d.to_dict() for d in a] == [d.to_dict() for d in b]  # deterministic
+    # Ranks are dense 1..N and every decision is traceable + categorized.
+    assert [d.priority_rank for d in a] == list(range(1, len(a) + 1))
+    for d in a:
+        assert d.org_id == ORG_A
+        assert d.reasoning_signal_ids and d.reasoning_version == REASONING_VERSION
+        assert d.state_watermark == wm
+        assert d.created_at == state.as_of  # logical clock, not now()
+        assert isinstance(d.category, DecisionCategory)

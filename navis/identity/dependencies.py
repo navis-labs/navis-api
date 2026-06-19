@@ -13,6 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.models import Membership, User
+from navis.identity.tokens import TokenRevocationService, token_predates_bulk_revoke
 from navis.platform.database import get_session
 from navis.platform.security import TokenError, decode_token
 from sqlalchemy import select
@@ -41,9 +42,16 @@ async def get_current_context(
     if not user_id:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "malformed token")
 
+    # Revocation is enforced on EVERY authenticated route (parity with get_principal):
+    # logout (jti denylist) and deactivation/membership-removal (bulk-revoke watermark).
+    if await TokenRevocationService(db).is_jti_revoked(payload.get("jti")):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token revoked")
+
     user = await db.get(User, uuid.UUID(user_id))
     if not user or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
+    if token_predates_bulk_revoke(payload, user):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token revoked")
 
     membership = None
     if org_id:

@@ -1,7 +1,10 @@
 """Auth + identity HTTP routes."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import uuid
@@ -19,6 +22,7 @@ from navis.identity.schemas import (
 )
 from navis.identity.service import AuthError, IdentityService
 from navis.platform.database import get_session
+from navis.platform.events import DomainEvent, EventType, event_bus
 from navis.platform.security import TokenError, decode_token
 
 router = APIRouter(prefix="/auth", tags=["identity"])
@@ -32,6 +36,13 @@ async def signup(data: SignupRequest, db: AsyncSession = Depends(get_session)) -
     except AuthError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     access, refresh = await svc.issue_tokens(user, org.id)
+    # Commit so the org row is visible, THEN announce it. Organization is provisioned
+    # by an orchestration subscriber to this event — Identity never imports Organization.
+    await db.commit()
+    await event_bus.publish(
+        DomainEvent(type=EventType.ORG_CREATED, org_id=org.id, source="identity",
+                    payload={"organization_id": str(org.id), "user_id": str(user.id)})
+    )
     return TokenPair(access_token=access, refresh_token=refresh)
 
 
@@ -65,6 +76,26 @@ async def refresh(data: RefreshRequest, db: AsyncSession = Depends(get_session))
     except AuthError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
     return TokenPair(access_token=access, refresh_token=new_refresh)
+
+
+_logout_bearer = HTTPBearer(auto_error=True)
+
+
+@router.post("/logout")
+async def logout(
+    credentials: HTTPAuthorizationCredentials = Depends(_logout_bearer),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, str]:
+    try:
+        payload = decode_token(credentials.credentials, expected_type="access")
+    except TokenError as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
+    exp = payload.get("exp")
+    expires_at = datetime.fromtimestamp(int(exp), tz=timezone.utc) if exp else None
+    await IdentityService(db).logout(
+        jti=payload.get("jti"), user_id=uuid.UUID(payload["sub"]), expires_at=expires_at
+    )
+    return {"status": "logged_out"}
 
 
 @router.get("/me", response_model=MeOut)

@@ -1,0 +1,35 @@
+"""Calendar outcome parser — meeting accepted / completed.
+
+Keys on the calendar event_id (== provider_reference.external_id for a meeting we
+scheduled). Status maps to the outcome type.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from navis.observation.models import OutcomeType
+from navis.observation.webhooks.base import ObservationWebhookEvent
+
+_STATUS_OUTCOME = {
+    "accepted": OutcomeType.MEETING_ACCEPTED,
+    "completed": OutcomeType.MEETING_COMPLETED,
+}
+
+
+def parse_calendar(body: dict[str, Any]) -> ObservationWebhookEvent | None:
+    external_id = body.get("event_id")
+    status = (body.get("status") or "").lower()
+    outcome_type = _STATUS_OUTCOME.get(status)
+    if not external_id or outcome_type is None:
+        return None
+    ts = body.get("occurred_at")
+    occurred = datetime.fromisoformat(ts) if ts else datetime.now(timezone.utc)
+    return ObservationWebhookEvent(
+        provider="calendar",
+        external_id=str(external_id),
+        outcome_type=outcome_type,
+        occurred_at=occurred,
+        source_event_id=str(body.get("event_id_token") or f"calendar:{external_id}:{status}"),
+        raw={"status": status, "attendee": body.get("attendee")},
+    )

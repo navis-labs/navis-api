@@ -42,11 +42,17 @@ from navis.signals.google.pubsub_auth import (
 )
 from navis.signals.service import SignalIngestionService
 
+from navis.organization.contract import Capability
+from navis.organization.guards import require_capability
+
 logger = get_logger("signals.router")
 router = APIRouter(tags=["signals"])
 
 
-@router.get("/integrations/google/connect")
+@router.get(
+    "/integrations/google/connect",
+    dependencies=[Depends(require_capability(Capability.GMAIL))],
+)
 async def google_connect(ctx: CurrentContext = Depends(get_current_context)) -> dict[str, str]:
     # State carries org + user so the callback can attribute the integration.
     state = f"{ctx.org_id}:{ctx.user.id}"
@@ -135,7 +141,11 @@ class SeedSignal(BaseModel):
     payload: dict[str, Any] = {}
 
 
-@router.post("/integrations/seed", status_code=201)
+@router.post(
+    "/integrations/seed",
+    status_code=201,
+    dependencies=[Depends(require_capability(Capability.GMAIL))],
+)
 async def seed_signal(
     body: SeedSignal,
     ctx: CurrentContext = Depends(get_current_context),
