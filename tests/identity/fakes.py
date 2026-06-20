@@ -27,12 +27,21 @@ def _eval(obj, clause) -> bool:
     op = clause.operator.__name__
     left = getattr(obj, key, None)
     right = getattr(clause.right, "value", None)
+    rtype = type(clause.right).__name__  # True_/False_/Null for `IS <literal>`
     if op == "eq":
         return left == right
     if op in ("is_", "is"):
-        return left is None if right is None else left == right
+        if rtype == "True_":
+            return left is True
+        if rtype == "False_":
+            return left is False
+        return left is None  # IS NULL
     if op in ("isnot", "is_not"):
-        return left is not None
+        if rtype == "True_":
+            return left is not True
+        if rtype == "False_":
+            return left is not False
+        return left is not None  # IS NOT NULL
     if op == "lt":
         return left is not None and left < right
     if op in ("in_op", "in_"):
@@ -41,6 +50,13 @@ def _eval(obj, clause) -> bool:
         ]
         return left in vals
     raise NotImplementedError(f"fake session: unsupported operator {op}")
+
+
+class _RowCount:
+    """Mimics the CursorResult returned by a bulk UPDATE/DELETE (.rowcount only)."""
+
+    def __init__(self, rowcount):
+        self.rowcount = rowcount
 
 
 class _Result:
@@ -84,6 +100,26 @@ class FakeSession:
 
     async def flush(self):
         return None
+
+    async def execute(self, stmt):
+        """Minimal support for bulk UPDATE / DELETE (used by revoke/purge paths)."""
+        from sqlalchemy import Delete, Update
+
+        tname = getattr(getattr(stmt, "table", None), "name", None)
+        model = next(
+            (m for m in self.store if getattr(m, "__tablename__", None) == tname), None
+        )
+        rows = self.store.get(model, []) if model is not None else []
+        where = stmt.whereclause
+        affected = [r for r in rows if (where is None or _eval(r, where))]
+        if isinstance(stmt, Update):
+            for col, val in stmt._values.items():
+                value = getattr(val, "value", val)
+                for r in affected:
+                    setattr(r, col.key, value)
+        elif isinstance(stmt, Delete) and model is not None:
+            self.store[model] = [r for r in rows if r not in affected]
+        return _RowCount(len(affected))
 
     # ---- reads ----
     async def get(self, model, pk):

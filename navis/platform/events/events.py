@@ -67,10 +67,35 @@ class EventType(str, Enum):
     ORG_FIRST_BRIEF = "OrgFirstBrief"
     ORG_ACTIVATED = "OrgActivated"
 
+    # Identity administration (delegated-admin mutations; consumed by security
+    # analytics / learning / intelligence — none of which Identity imports).
+    MEMBER_INVITED = "MemberInvited"
+    MEMBER_REMOVED = "MemberRemoved"
+    ROLE_ASSIGNED = "RoleAssigned"
+    API_KEY_CREATED = "ApiKeyCreated"
+    API_KEY_REVOKED = "ApiKeyRevoked"
+    SERVICE_ACCOUNT_CREATED = "ServiceAccountCreated"
+    SERVICE_ACCOUNT_ROTATED = "ServiceAccountRotated"
+    SERVICE_ACCOUNT_REVOKED = "ServiceAccountRevoked"
+    SSO_UPDATED = "SsoUpdated"
+    AUTHORIZATION_DENIED = "AuthorizationDenied"
+
+
+EVENT_SCHEMA_VERSION = 1
+
 
 @dataclass(slots=True)
 class DomainEvent:
-    """Immutable fact: something happened. Carries an org_id for tenancy."""
+    """Immutable fact: something happened. Carries an org_id for tenancy.
+
+    Lineage fields (added in Platform V2, all backward-compatible):
+      * correlation_id — ties every event in one logical flow together (auto-filled
+        from the active request/task id), so a whole pipeline run is traceable.
+      * causation_id   — the id of the event that DIRECTLY caused this one, giving a
+        precise parent→child chain for replay and debugging.
+      * schema_version — the payload contract version, so consumers can evolve
+        payloads without silent schema drift.
+    """
 
     type: EventType
     org_id: uuid.UUID | None = None
@@ -78,6 +103,24 @@ class DomainEvent:
     id: uuid.UUID = field(default_factory=uuid.uuid4)
     occurred_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     source: str | None = None
+    correlation_id: str | None = None
+    causation_id: str | None = None
+    schema_version: int = EVENT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        # Default the correlation id to the ambient request/task id so events emitted
+        # while handling a request inherit its trace without callers doing anything.
+        if self.correlation_id is None:
+            from navis.platform.monitoring.logging import get_request_id
+
+            rid = get_request_id()
+            self.correlation_id = rid if rid != "-" else str(self.id)
+
+    def caused(self, type: EventType, **kwargs: Any) -> "DomainEvent":
+        """Build a child event that records THIS event as its cause (lineage chain)."""
+        kwargs.setdefault("org_id", self.org_id)
+        kwargs.setdefault("correlation_id", self.correlation_id)
+        return DomainEvent(type=type, causation_id=str(self.id), **kwargs)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,4 +130,7 @@ class DomainEvent:
             "payload": self.payload,
             "occurred_at": self.occurred_at.isoformat(),
             "source": self.source,
+            "correlation_id": self.correlation_id,
+            "causation_id": self.causation_id,
+            "schema_version": self.schema_version,
         }

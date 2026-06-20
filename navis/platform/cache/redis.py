@@ -23,17 +23,29 @@ from navis.platform.monitoring import get_logger
 
 logger = get_logger("cache")
 
-redis_client: aioredis.Redis = aioredis.from_url(
-    settings.redis_url,
-    encoding="utf-8",
-    decode_responses=True,
-    max_connections=settings.redis_max_connections,
-    socket_timeout=settings.redis_socket_timeout_seconds,
-    socket_connect_timeout=settings.redis_socket_timeout_seconds,
-    socket_keepalive=True,
-    health_check_interval=30,
-    retry=Retry(ExponentialBackoff(cap=1.0, base=0.05), retries=2),
-    retry_on_timeout=True,
+def _make_client(url: str) -> aioredis.Redis:
+    return aioredis.from_url(
+        url,
+        encoding="utf-8",
+        decode_responses=True,
+        max_connections=settings.redis_max_connections,
+        socket_timeout=settings.redis_socket_timeout_seconds,
+        socket_connect_timeout=settings.redis_socket_timeout_seconds,
+        socket_keepalive=True,
+        health_check_interval=30,
+        retry=Retry(ExponentialBackoff(cap=1.0, base=0.05), retries=2),
+        retry_on_timeout=True,
+    )
+
+
+# Cache and the event stream get independent clients so their failure domains can be
+# split onto separate Redis instances via config (both default to `redis_url`). A
+# cache outage then cannot take down event mirroring, and vice versa.
+redis_client: aioredis.Redis = _make_client(settings.effective_redis_cache_url)
+events_redis_client: aioredis.Redis = (
+    redis_client
+    if settings.effective_redis_events_url == settings.effective_redis_cache_url
+    else _make_client(settings.effective_redis_events_url)
 )
 
 
@@ -50,11 +62,12 @@ async def ping() -> bool:
 
 
 async def aclose() -> None:
-    """Close the pool on shutdown."""
-    try:
-        await redis_client.aclose()
-    except RedisError:  # pragma: no cover
-        pass
+    """Close the pool(s) on shutdown."""
+    for client in {id(redis_client): redis_client, id(events_redis_client): events_redis_client}.values():
+        try:
+            await client.aclose()
+        except RedisError:  # pragma: no cover
+            pass
 
 
 # ---- Typed cache helpers (graceful-degrade) ----

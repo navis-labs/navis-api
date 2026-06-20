@@ -34,8 +34,8 @@ class ServiceAccountService:
         )
         return sa, plaintext
 
-    async def rotate(self, sa_id: uuid.UUID) -> str:
-        sa = await self._require(sa_id)
+    async def rotate(self, sa_id: uuid.UUID, *, org_id: uuid.UUID) -> str:
+        sa = await self._require(sa_id, org_id)
         await self.keys.revoke_for_service_account(sa.id)
         _, plaintext = await self.keys.create(
             org_id=sa.organization_id, name=f"{sa.name} key (rotated)",
@@ -43,16 +43,26 @@ class ServiceAccountService:
         )
         return plaintext
 
-    async def revoke(self, sa_id: uuid.UUID) -> ServiceAccount:
-        sa = await self._require(sa_id)
+    async def revoke(self, sa_id: uuid.UUID, *, org_id: uuid.UUID) -> ServiceAccount:
+        sa = await self._require(sa_id, org_id)
         sa.revoked_at = datetime.now(timezone.utc)
         await self.keys.revoke_for_service_account(sa.id)
         await self.db.flush()
         return sa
 
-    async def list_for_org(self, org_id: uuid.UUID) -> list[ServiceAccount]:
+    async def list_for_org(
+        self, org_id: uuid.UUID, *, limit: int = 50, offset: int = 0
+    ) -> list[ServiceAccount]:
         return list(
-            (await self.db.scalars(select(ServiceAccount).where(ServiceAccount.organization_id == org_id))).all()
+            (
+                await self.db.scalars(
+                    select(ServiceAccount)
+                    .where(ServiceAccount.organization_id == org_id)
+                    .order_by(ServiceAccount.created_at.desc(), ServiceAccount.id)
+                    .limit(limit)
+                    .offset(offset)
+                )
+            ).all()
         )
 
     async def active_keys(self, sa_id: uuid.UUID) -> list[ApiKey]:
@@ -64,8 +74,9 @@ class ServiceAccountService:
             ).all()
         )
 
-    async def _require(self, sa_id: uuid.UUID) -> ServiceAccount:
+    async def _require(self, sa_id: uuid.UUID, org_id: uuid.UUID) -> ServiceAccount:
+        # Org-scoped: a SA from another tenant is indistinguishable from "not found".
         sa = await self.db.get(ServiceAccount, sa_id)
-        if sa is None:
+        if sa is None or sa.organization_id != org_id:
             raise LookupError("service account not found")
         return sa

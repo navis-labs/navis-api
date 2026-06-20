@@ -1,0 +1,79 @@
+"""Application-level field encryption at rest (platform-wide, reusable).
+
+Generalizes the proven signals token-cipher to any domain that must encrypt a
+sensitive value before it touches the database — e.g. Identity's SSO client secrets.
+Living in `platform.security` lets Identity use it WITHOUT importing a business
+domain (signals), preserving the layer law.
+
+  * Fernet (AES-128-CBC + HMAC) via `cryptography`, MultiFernet for key rotation.
+  * Keys from env `FIELD_ENCRYPTION_KEYS` = comma-separated Fernet keys, newest first.
+  * Ciphertext tagged `fenc:1:`. Untagged values are treated as legacy plaintext and
+    returned as-is (and re-encrypted on next write) — backward compatible.
+  * No keys configured -> passthrough + loud warning (dev works; prod MUST set keys).
+
+Generate a key:  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+"""
+from __future__ import annotations
+
+import os
+
+from navis.platform.monitoring import get_logger
+
+logger = get_logger("platform.crypto")
+
+_PREFIX = "fenc:1:"
+_ENV_VAR = "FIELD_ENCRYPTION_KEYS"
+
+
+class FieldDecryptError(Exception):
+    """Ciphertext could not be decrypted with any configured key (tampered/rotated out)."""
+
+
+class FieldCipher:
+    def __init__(self, keys: list[str]) -> None:
+        self._multifernet = None
+        if keys:
+            try:
+                from cryptography.fernet import Fernet, MultiFernet
+
+                self._multifernet = MultiFernet([Fernet(k.encode()) for k in keys])
+            except Exception as exc:  # invalid key material
+                logger.error("invalid %s; field encryption DISABLED: %r", _ENV_VAR, exc)
+                self._multifernet = None
+
+    @classmethod
+    def from_env(cls) -> "FieldCipher":
+        raw = os.environ.get(_ENV_VAR, "")
+        keys = [k.strip() for k in raw.split(",") if k.strip()]
+        if not keys:
+            logger.warning("%s not set; sensitive fields (e.g. SSO secrets) stored UNENCRYPTED", _ENV_VAR)
+        return cls(keys)
+
+    @property
+    def enabled(self) -> bool:
+        return self._multifernet is not None
+
+    def encrypt(self, plaintext: str | None) -> str | None:
+        if plaintext is None or not self.enabled:
+            return plaintext
+        return f"{_PREFIX}{self._multifernet.encrypt(plaintext.encode()).decode()}"
+
+    def decrypt(self, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.startswith(_PREFIX):
+            return value  # legacy plaintext (or cipher disabled when written)
+        if not self.enabled:
+            raise FieldDecryptError("encrypted value present but no keys configured")
+        from cryptography.fernet import InvalidToken
+
+        try:
+            return self._multifernet.decrypt(value[len(_PREFIX):].encode()).decode()
+        except InvalidToken as exc:
+            raise FieldDecryptError("value failed decryption (rotated out or tampered)") from exc
+
+    def is_encrypted(self, value: str | None) -> bool:
+        return bool(value) and value.startswith(_PREFIX)
+
+
+field_cipher = FieldCipher.from_env()

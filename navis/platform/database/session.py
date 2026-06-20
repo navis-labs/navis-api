@@ -31,6 +31,11 @@ if settings.db_is_pooled:
     # PgBouncer transaction pooling: no server-side prepared statements.
     _connect_args["statement_cache_size"] = 0
     _connect_args["prepared_statement_cache_size"] = 0
+# Hard cap on how long any single statement may run, enforced by asyncpg. A runaway
+# query is cancelled instead of pinning a pooled connection forever — bounding the
+# blast radius of a bad query under load. Tune via DB_STATEMENT_TIMEOUT_SECONDS.
+if settings.db_statement_timeout_seconds and settings.db_statement_timeout_seconds > 0:
+    _connect_args["command_timeout"] = settings.db_statement_timeout_seconds
 
 engine = create_async_engine(
     settings.async_database_url,

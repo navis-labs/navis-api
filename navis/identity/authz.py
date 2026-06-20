@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -22,14 +23,27 @@ from navis.identity.models import Membership, User
 from navis.identity.permissions import effective_permissions
 from navis.identity.tokens import TokenRevocationService, token_predates_bulk_revoke
 from navis.platform.database import get_session
+from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import metrics
 from navis.platform.security import TokenError, decode_token
 
+logger = get_logger("identity.authz")
 _bearer = HTTPBearer(auto_error=False)
+
+
+class PrincipalKind(StrEnum):
+    """Closed set of actor kinds. StrEnum members ARE strings, so existing
+    comparisons/serialization (`principal.kind == "user"`) keep working while
+    callers get typo safety and a single source of truth."""
+
+    USER = "user"
+    API_KEY = "api_key"
+    SERVICE_ACCOUNT = "service_account"
 
 
 @dataclass(slots=True)
 class Principal:
-    kind: str                      # "user" | "api_key" | "service_account"
+    kind: PrincipalKind            # user | api_key | service_account
     org_id: uuid.UUID
     subject_id: uuid.UUID          # user id, or api-key/service-account id
     permissions: frozenset[str]
@@ -82,12 +96,17 @@ async def _principal_from_jwt(db: AsyncSession, token: str) -> Principal:
             )
         )
     if membership is None:
+        # Enterprise forensics: who tried to reach which org with a valid token but
+        # no membership (a probe / stale access). Cheap log + metric — never a DB row
+        # (an audit row per forged request would be a DoS-amplification vector).
+        logger.warning("auth denied: user=%s no membership in org=%s", user_id, org_id)
+        metrics.incr("auth.rejected", labels={"reason": "no_membership"})
         raise HTTPException(status.HTTP_403_FORBIDDEN, "no active org membership")
 
     role = membership.role.value if membership.role else None
     grants = await _grants_for(db, membership.organization_id, role or "")
     return Principal(
-        kind="user",
+        kind=PrincipalKind.USER,
         org_id=membership.organization_id,
         subject_id=user.id,
         permissions=effective_permissions(role, grants),
@@ -103,12 +122,12 @@ async def _principal_from_api_key(db: AsyncSession, plaintext: str) -> Principal
     key = await ApiKeyService(db).verify(plaintext)
     if key is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid api key")
-    kind = "api_key"
+    kind = PrincipalKind.API_KEY
     if key.service_account_id is not None:
         sa = await db.get(ServiceAccount, key.service_account_id)
         if sa is None or sa.revoked_at is not None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "service account revoked")
-        kind = "service_account"
+        kind = PrincipalKind.SERVICE_ACCOUNT
     scopes = list(key.scopes or [])
     return Principal(
         kind=kind,
@@ -124,14 +143,27 @@ async def get_principal(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     db: AsyncSession = Depends(get_session),
 ) -> Principal:
-    if x_api_key:
-        return await _principal_from_api_key(db, x_api_key)
-    if creds and creds.scheme.lower() == "bearer":
-        # A navis_ prefixed bearer is an API key; otherwise a JWT.
-        if creds.credentials.startswith("navis_"):
-            return await _principal_from_api_key(db, creds.credentials)
-        return await _principal_from_jwt(db, creds.credentials)
-    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing credentials")
+    try:
+        # Ambiguous intent: an X-API-Key AND a bearer token in the same request. We
+        # refuse to silently pick one credential to authenticate as — reject so the
+        # caller fixes the request rather than getting a surprising identity.
+        if x_api_key and creds:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "provide either an API key or a bearer token, not both",
+            )
+        if x_api_key:
+            return await _principal_from_api_key(db, x_api_key)
+        if creds and creds.scheme.lower() == "bearer":
+            # A navis_ prefixed bearer is an API key; otherwise a JWT.
+            if creds.credentials.startswith("navis_"):
+                return await _principal_from_api_key(db, creds.credentials)
+            return await _principal_from_jwt(db, creds.credentials)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing credentials")
+    except HTTPException as exc:
+        # One place that counts every auth rejection (401 invalid/revoked vs 403).
+        metrics.incr("auth.rejected", labels={"status": str(exc.status_code)})
+        raise
 
 
 def require_permission(permission: str):
@@ -139,6 +171,14 @@ def require_permission(permission: str):
 
     async def _dep(principal: Principal = Depends(get_principal)) -> Principal:
         if not principal.has(permission):
+            # Cheap SOC signal: an authenticated principal hitting a wall. A metric
+            # (not a DB audit row) — one row per forged request would be a DoS-
+            # amplification vector, same reasoning as the no-membership path above.
+            logger.warning(
+                "permission denied: principal=%s kind=%s org=%s perm=%s",
+                principal.subject_id, principal.kind, principal.org_id, permission,
+            )
+            metrics.incr("auth.permission_denied", labels={"permission": permission})
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, f"missing permission: {permission}"
             )

@@ -21,6 +21,7 @@ from navis.identity.schemas import (
     UserOut,
 )
 from navis.identity.service import AuthError, IdentityService
+from navis.identity.tokens import TokenRevocationService, token_predates_bulk_revoke
 from navis.platform.database import get_session
 from navis.platform.events import DomainEvent, EventType, event_bus
 from navis.platform.security import TokenError, decode_token
@@ -68,8 +69,15 @@ async def refresh(data: RefreshRequest, db: AsyncSession = Depends(get_session))
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
 
     user = await db.get(User, uuid.UUID(payload["sub"]))
-    if not user:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
+    # Refresh MUST honor revocation too — otherwise a deactivated/removed user (or a
+    # future "revoke my sessions" event) could mint a fresh access token whose new iat
+    # sails past the watermark. Mirrors the checks in authz.get_principal.
+    if not user or not user.is_active:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found or inactive")
+    if await TokenRevocationService(db).is_jti_revoked(payload.get("jti")):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token revoked")
+    if token_predates_bulk_revoke(payload, user):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token revoked")
     org_id = uuid.UUID(payload["org"]) if payload.get("org") else None
     try:
         access, new_refresh = await svc.rotate_refresh(data.refresh_token, user, org_id)
@@ -93,7 +101,8 @@ async def logout(
     exp = payload.get("exp")
     expires_at = datetime.fromtimestamp(int(exp), tz=timezone.utc) if exp else None
     await IdentityService(db).logout(
-        jti=payload.get("jti"), user_id=uuid.UUID(payload["sub"]), expires_at=expires_at
+        jti=payload.get("jti"), user_id=uuid.UUID(payload["sub"]),
+        expires_at=expires_at, sid=payload.get("sid"),
     )
     return {"status": "logged_out"}
 

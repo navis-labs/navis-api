@@ -11,9 +11,17 @@ from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import Mapped, mapped_column
 
 from navis.platform.database.base import Base, Timestamped, UUIDPrimaryKey
+
+# SQLAlchemy does NOT detect in-place mutation of a plain JSONB dict/list
+# (`row.config["x"] = y` silently won't persist). Wrapping the type registers a
+# change listener so in-place edits flush correctly. Today every write reassigns,
+# so this is defense-in-depth against a real future foot-gun — no schema change.
+_JSONB_DICT = MutableDict.as_mutable(JSONB)
+_JSONB_LIST = MutableList.as_mutable(JSONB)
 
 
 class RolePermission(Base):
@@ -47,7 +55,7 @@ class ApiKey(UUIDPrimaryKey, Timestamped, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     prefix: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     hashed_secret: Mapped[str] = mapped_column(String(128), nullable=False)
-    scopes: Mapped[list] = mapped_column(JSONB, default=list)
+    scopes: Mapped[list] = mapped_column(_JSONB_LIST, default=list)
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     # When set, this key authenticates a machine identity rather than a person.
     service_account_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -66,7 +74,7 @@ class ServiceAccount(UUIDPrimaryKey, Timestamped, Base):
         UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    scopes: Mapped[list] = mapped_column(JSONB, default=list)
+    scopes: Mapped[list] = mapped_column(_JSONB_LIST, default=list)
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -96,7 +104,7 @@ class AuditLog(Base):
     actor_kind: Mapped[str] = mapped_column(String(24), default="user")  # user|api_key|service_account|system
     action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     target_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    audit_metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    audit_metadata: Mapped[dict] = mapped_column(_JSONB_DICT, default=dict)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
@@ -112,7 +120,7 @@ class SsoConnection(Base):
         UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
     provider: Mapped[str] = mapped_column(String(24), nullable=False)  # google|oidc|saml
-    config: Mapped[dict] = mapped_column(JSONB, default=dict)
+    config: Mapped[dict] = mapped_column(_JSONB_DICT, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -129,5 +137,5 @@ class ScimGroup(Base):
     )
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     external_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    members: Mapped[list] = mapped_column(JSONB, default=list)  # user ids
+    members: Mapped[list] = mapped_column(_JSONB_LIST, default=list)  # user ids
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

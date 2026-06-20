@@ -35,11 +35,22 @@ class Settings(BaseSettings):
 
     # ---- Redis ----
     redis_url: str = "redis://localhost:6379/0"
+    # Failure-domain separation (Phase 6): cache and the event stream can be split
+    # onto independent Redis instances later WITHOUT code change — each defaults to
+    # `redis_url`. A cache outage then can't take down event mirroring, and vice versa.
+    redis_cache_url: str | None = None
+    redis_events_url: str | None = None
 
     # ---- Security / JWT ----
     access_token_expire_minutes: int = 60
     refresh_token_expire_days: int = 30
+    # HS256 (shared secret) by default. Set algorithm to RS256/ES256 + provide PEM
+    # keys to migrate to asymmetric signing (public-key verification, key rotation)
+    # without changing any call site. See platform/security/jwt.py.
     algorithm: str = "HS256"
+    jwt_private_key: str | None = None  # PEM — signing key for RS256/ES256
+    jwt_public_key: str | None = None   # PEM — verification key for RS256/ES256
+    jwt_key_id: str | None = None       # `kid` header for key rotation / JWKS
 
     # ---- AI / ML ----
     openai_api_key: str | None = None
@@ -80,6 +91,9 @@ class Settings(BaseSettings):
     db_max_overflow: int = 20
     db_pool_recycle_seconds: int = 300  # Neon drops idle conns ~5m; recycle below that
     db_pool_timeout_seconds: int = 30
+    # Server-side cap: a single statement may not run longer than this. Prevents a
+    # runaway query from pinning a pooled connection forever (reliability at scale).
+    db_statement_timeout_seconds: float = 30.0
 
     # ---- Redis pool ----
     redis_max_connections: int = 50
@@ -98,6 +112,43 @@ class Settings(BaseSettings):
 
     # ---- Event bus ----
     event_handler_timeout_seconds: float = 15.0
+    # Redis stream is a best-effort MIRROR for out-of-process consumers + recent
+    # audit — NOT the replay source of truth (that is the append-only domain tables
+    # in Postgres). Bounded so it can never grow unbounded.
+    event_stream_maxlen: int = 10000
+
+    # ---- Metrics ----
+    metrics_enabled: bool = True
+
+    @property
+    def effective_redis_cache_url(self) -> str:
+        return self.redis_cache_url or self.redis_url
+
+    @property
+    def effective_redis_events_url(self) -> str:
+        return self.redis_events_url or self.redis_url
+
+    @property
+    def jwt_is_asymmetric(self) -> bool:
+        return self.algorithm.upper().startswith(("RS", "ES", "PS"))
+
+    @property
+    def jwt_signing_key(self) -> str:
+        """Private key for asymmetric algorithms; the shared secret for HS*."""
+        if self.jwt_is_asymmetric:
+            if not self.jwt_private_key:
+                raise ValueError(f"{self.algorithm} requires JWT_PRIVATE_KEY")
+            return self.jwt_private_key
+        return self.secret_key
+
+    @property
+    def jwt_verify_key(self) -> str:
+        """Public key for asymmetric algorithms; the shared secret for HS*."""
+        if self.jwt_is_asymmetric:
+            if not self.jwt_public_key:
+                raise ValueError(f"{self.algorithm} requires JWT_PUBLIC_KEY")
+            return self.jwt_public_key
+        return self.secret_key
 
     @property
     def is_production(self) -> bool:

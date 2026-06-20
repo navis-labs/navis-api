@@ -5,6 +5,7 @@ from navis.platform.security.jwt import (
     decode_token,
     TokenError,
 )
+from navis.platform.security.crypto import FieldCipher, FieldDecryptError, field_cipher
 
 __all__ = [
     "hash_password",
@@ -13,4 +14,7 @@ __all__ = [
     "create_refresh_token",
     "decode_token",
     "TokenError",
+    "FieldCipher",
+    "FieldDecryptError",
+    "field_cipher",
 ]

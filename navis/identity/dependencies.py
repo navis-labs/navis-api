@@ -1,24 +1,24 @@
-"""FastAPI auth dependencies. Every protected route resolves a CurrentContext.
+"""Legacy auth dependency: `CurrentContext` is a thin USER-ONLY adapter over the
+single auth engine (`authz.get_principal`).
 
-`CurrentContext` is the tenancy boundary the rest of the system relies on:
-it carries the authenticated user AND the active org_id.
+There is exactly ONE place that decodes/validates a token and resolves a principal:
+`authz.get_principal`. This module used to duplicate that logic — token decode,
+jti-denylist + bulk-revoke checks, user load, membership lookup — which is how auth
+bugs are born (fix one path, forget the other; the same token then works on one
+route and fails on another). That duplication is gone.
+
+New routes should depend on `Principal` directly (it carries permissions/kind/
+subject_id). `CurrentContext` remains only for routes that predate `Principal`.
 """
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
 
-from fastapi import Depends, Header, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import Depends, HTTPException, status
 
-from navis.identity.models import Membership, User
-from navis.identity.tokens import TokenRevocationService, token_predates_bulk_revoke
-from navis.platform.database import get_session
-from navis.platform.security import TokenError, decode_token
-from sqlalchemy import select
-
-_bearer = HTTPBearer(auto_error=True)
+from navis.identity.authz import Principal, get_principal
+from navis.identity.models import User
 
 
 @dataclass(slots=True)
@@ -29,39 +29,18 @@ class CurrentContext:
 
 
 async def get_current_context(
-    credentials: HTTPAuthorizationCredentials = Depends(_bearer),
-    db: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(get_principal),
 ) -> CurrentContext:
-    try:
-        payload = decode_token(credentials.credentials, expected_type="access")
-    except TokenError as exc:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
+    """Resolve the active human (JWT) context via the single auth engine.
 
-    user_id = payload.get("sub")
-    org_id = payload.get("org")
-    if not user_id:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "malformed token")
-
-    # Revocation is enforced on EVERY authenticated route (parity with get_principal):
-    # logout (jti denylist) and deactivation/membership-removal (bulk-revoke watermark).
-    if await TokenRevocationService(db).is_jti_revoked(payload.get("jti")):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token revoked")
-
-    user = await db.get(User, uuid.UUID(user_id))
-    if not user or not user.is_active:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
-    if token_predates_bulk_revoke(payload, user):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token revoked")
-
-    membership = None
-    if org_id:
-        membership = await db.scalar(
-            select(Membership).where(
-                Membership.user_id == user.id,
-                Membership.organization_id == uuid.UUID(org_id),
-            )
-        )
-    if membership is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "no active org membership")
-
-    return CurrentContext(user=user, org_id=membership.organization_id, role=membership.role.value)
+    Machine principals (API key / service account) are rejected here — legacy
+    `CurrentContext` routes are human-only; machine callers must use `Principal`.
+    Revocation, membership, and tenant checks all happen inside `get_principal`.
+    """
+    if principal.kind != "user" or principal.user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user credentials required")
+    return CurrentContext(
+        user=principal.user,
+        org_id=principal.org_id,
+        role=principal.role or "",  # never assume role is non-null
+    )

@@ -28,12 +28,31 @@ class Permission:
     MANAGE_ROLES = "manage_roles"
     MANAGE_API_KEYS = "manage_api_keys"
     MANAGE_SERVICE_ACCOUNTS = "manage_service_accounts"
+    MANAGE_SSO = "manage_sso"  # SSO/IdP config — distinct from role management
     MANAGE_BILLING = "manage_billing"  # owned by Organization later; vocab lives here
 
 
 ALL_PERMISSIONS: frozenset[str] = frozenset(
     v for k, v in vars(Permission).items() if not k.startswith("_") and isinstance(v, str)
 )
+# Canonical vocabulary for validation (a persisted grant/scope must be one of these).
+VALID_PERMISSIONS: frozenset[str] = ALL_PERMISSIONS
+
+# Founder's powers are ENUMERATED explicitly, NOT `ALL_PERMISSIONS`. A wildcard would
+# auto-grant any future permission (e.g. a later DELETE_ALL_MEMORY) to founders with
+# no review — the classic RBAC wildcard anti-pattern. Every new permission must be a
+# DELIBERATE choice: added to FOUNDER_PERMISSIONS or FOUNDER_EXCLUDED. A CI test
+# (test_every_permission_has_a_founder_decision) fails until that choice is made.
+FOUNDER_PERMISSIONS: frozenset[str] = frozenset({
+    Permission.VIEW_SIGNALS, Permission.VIEW_MEMORY, Permission.VIEW_STATE,
+    Permission.VIEW_REASONING, Permission.VIEW_DECISIONS, Permission.VIEW_INTELLIGENCE,
+    Permission.VIEW_AUDIT,
+    Permission.EXECUTE_ACTIONS, Permission.MANAGE_INTEGRATIONS, Permission.MANAGE_POLICIES,
+    Permission.MANAGE_MEMBERS, Permission.MANAGE_ROLES, Permission.MANAGE_API_KEYS,
+    Permission.MANAGE_SERVICE_ACCOUNTS, Permission.MANAGE_SSO, Permission.MANAGE_BILLING,
+})
+# Permissions deliberately WITHHELD from founder (empty today — founder is the owner).
+FOUNDER_EXCLUDED: frozenset[str] = frozenset()
 
 _VIEW = frozenset({
     Permission.VIEW_SIGNALS, Permission.VIEW_MEMORY, Permission.VIEW_STATE,
@@ -42,7 +61,7 @@ _VIEW = frozenset({
 
 # Default mapping. `role_permissions` rows (per org) augment these at runtime.
 DEFAULT_ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
-    "founder": ALL_PERMISSIONS,
+    "founder": FOUNDER_PERMISSIONS,
     "ceo": _VIEW | {
         Permission.EXECUTE_ACTIONS, Permission.MANAGE_MEMBERS,
         Permission.MANAGE_POLICIES, Permission.MANAGE_INTEGRATIONS, Permission.VIEW_AUDIT,
@@ -54,10 +73,18 @@ DEFAULT_ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
     # IT/admin: delegated administration, but not business operations by default.
     "admin": _VIEW | {
         Permission.MANAGE_MEMBERS, Permission.MANAGE_ROLES, Permission.MANAGE_INTEGRATIONS,
-        Permission.MANAGE_API_KEYS, Permission.MANAGE_SERVICE_ACCOUNTS, Permission.VIEW_AUDIT,
+        Permission.MANAGE_API_KEYS, Permission.MANAGE_SERVICE_ACCOUNTS, Permission.MANAGE_SSO,
+        Permission.VIEW_AUDIT,
     },
     "employee": frozenset({Permission.VIEW_DECISIONS, Permission.VIEW_SIGNALS}),
 }
+
+
+def validate_permission(permission: str) -> None:
+    """Reject typo/invalid permission strings before they're persisted (grants/scopes).
+    Keeps `role_permissions` rows and API-key/service-account scopes free of garbage."""
+    if permission not in VALID_PERMISSIONS:
+        raise ValueError(f"unknown permission: {permission!r}")
 
 
 def default_permissions_for_role(role: str | None) -> frozenset[str]:

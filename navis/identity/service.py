@@ -6,10 +6,12 @@ import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.audit import AuditAction, AuditService
+from navis.identity.members import normalize_email
 from navis.identity.models import Membership, Organization, Role, Session, User
 from navis.identity.org_service import OrganizationService
 from navis.identity.schemas import SignupRequest
@@ -36,17 +38,26 @@ class IdentityService:
         self.db = db
 
     async def signup(self, data: SignupRequest) -> tuple[User, Organization, Membership]:
-        existing = await self.db.scalar(select(User).where(User.email == data.email))
+        email = normalize_email(data.email)  # canonical identity key (see members.normalize_email)
+        existing = await self.db.scalar(select(User).where(User.email == email))
         if existing:
-            raise AuthError("email already registered")
+            raise AuthError("email already registered")  # fast path; not authoritative
 
         user = User(
-            email=data.email,
+            email=email,
             full_name=data.full_name,
             hashed_password=hash_password(data.password),
             is_verified=False,
         )
-        self.db.add(user)
+        # Race-safe: the pre-check above can lose a race; the UNIQUE(email)/lower(email)
+        # constraint is the authority. Insert inside a SAVEPOINT so a concurrent
+        # duplicate rolls back ONLY the user insert and surfaces as a clean 400.
+        try:
+            async with self.db.begin_nested():
+                self.db.add(user)
+                await self.db.flush()
+        except IntegrityError:
+            raise AuthError("email already registered")
         # Org lifecycle goes through the seam (P2 extraction prep), not inline here.
         org = await OrganizationService(self.db).create(name=data.organization_name)
         await self.db.flush()
@@ -61,7 +72,7 @@ class IdentityService:
         return user, org, membership
 
     async def authenticate(self, email: str, password: str) -> User:
-        user = await self.db.scalar(select(User).where(User.email == email))
+        user = await self.db.scalar(select(User).where(User.email == normalize_email(email)))
         if not user or not user.hashed_password:
             raise AuthError("invalid credentials")
         if not verify_password(password, user.hashed_password):
@@ -79,39 +90,87 @@ class IdentityService:
             .limit(1)
         )
 
-    async def logout(self, *, jti: str | None, user_id: uuid.UUID, expires_at: datetime | None) -> None:
-        """Revoke the presented access token and audit the logout."""
+    async def logout(
+        self, *, jti: str | None, user_id: uuid.UUID, expires_at: datetime | None, sid: str | None = None
+    ) -> None:
+        """End the session: deny the access jti AND revoke the bound refresh Session
+        (so /refresh can't mint a new token after logout). `sid` ties the access token
+        to its session; tokens issued before sid existed fall back to jti-only revoke."""
         revocation = TokenRevocationService(self.db)
         if jti:
             await revocation.revoke_jti(jti, user_id=user_id, expires_at=expires_at)
+        if sid:
+            session = await self.db.get(Session, uuid.UUID(sid))
+            if session is not None and session.user_id == user_id:
+                session.revoked = True
         await AuditService(self.db).record(
             AuditAction.LOGOUT, actor_id=user_id, target_id=str(user_id)
         )
 
     async def issue_tokens(self, user: User, org_id: uuid.UUID | None) -> tuple[str, str]:
         org_str = str(org_id) if org_id else None
-        access = create_access_token(str(user.id), org_str)
-        refresh = create_refresh_token(str(user.id), org_str)
-
+        # Assign the session id up front (Python-side) so its sid can be embedded in
+        # both tokens BEFORE the single insert — no empty-hash placeholder is ever
+        # persisted, so the UNIQUE(refresh_token_hash) constraint is safe.
         session = Session(
+            id=uuid.uuid4(),
             user_id=user.id,
-            refresh_token_hash=_hash_token(refresh),
+            refresh_token_hash="",
+            revoked=False,
             expires_at=datetime.now(timezone.utc)
             + timedelta(days=settings.refresh_token_expire_days),
         )
+        sid = str(session.id)
+        access = create_access_token(str(user.id), org_str, sid=sid)
+        refresh = create_refresh_token(str(user.id), org_str, sid=sid)
+        session.refresh_token_hash = _hash_token(refresh)  # real hash before insert
         self.db.add(session)
         await self.db.flush()
         return access, refresh
 
     async def rotate_refresh(self, refresh_token: str, user: User, org_id: uuid.UUID | None) -> tuple[str, str]:
         token_hash = _hash_token(refresh_token)
+        # `FOR UPDATE` makes rotation a one-time-use atomic claim: two concurrent
+        # refreshes of the same token serialize — the second re-reads the row (now
+        # revoked) and is filtered out, so it can't mint a parallel refresh chain
+        # (classic refresh-token replay race).
         session = await self.db.scalar(
-            select(Session).where(
+            select(Session)
+            .where(
                 Session.refresh_token_hash == token_hash,
                 Session.revoked.is_(False),
             )
+            .with_for_update()
         )
-        if not session:
+        if session is None:
+            # Reuse detection: a hash that maps to an ALREADY-revoked session means an
+            # already-rotated (likely stolen) refresh token is being replayed. Treat as
+            # compromise — kill the user's whole session family + record a security event.
+            reused = await self.db.scalar(
+                select(Session).where(
+                    Session.refresh_token_hash == token_hash, Session.revoked.is_(True)
+                )
+            )
+            if reused is not None:
+                await TokenRevocationService(self.db).revoke_all_for_user(reused.user_id)
+                await AuditService(self.db).record(
+                    AuditAction.REFRESH_REUSE_DETECTED,
+                    actor_id=reused.user_id, target_id=str(reused.id),
+                )
             raise AuthError("refresh token revoked or unknown")
+        # Defense in depth at the trust boundary: the session MUST belong to the
+        # presented user — never trust the router to have bound them correctly.
+        if session.user_id != user.id:
+            raise AuthError("refresh token does not belong to this user")
+        # Service-layer expiry enforcement — never rely solely on the JWT exp check.
+        if session.expires_at <= datetime.now(timezone.utc):
+            raise AuthError("refresh token expired")
         session.revoked = True
         return await self.issue_tokens(user, org_id)
+
+    async def purge_expired_sessions(self, *, now: datetime | None = None) -> int:
+        """Reaper for the sessions table (served by ix_sessions_expires_at). Deletes
+        sessions past expiry; a refresh token can't be used after expiry anyway."""
+        cutoff = now or datetime.now(timezone.utc)
+        result = await self.db.execute(delete(Session).where(Session.expires_at < cutoff))
+        return result.rowcount or 0

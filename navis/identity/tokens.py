@@ -11,11 +11,12 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.enterprise_models import RevokedToken
 from navis.identity.models import User
+from navis.platform.monitoring.metrics import metrics
 
 
 class TokenRevocationService:
@@ -31,7 +32,12 @@ class TokenRevocationService:
     async def is_jti_revoked(self, jti: str | None) -> bool:
         if not jti:
             return False
-        return await self.db.get(RevokedToken, jti) is not None
+        revoked = await self.db.get(RevokedToken, jti) is not None
+        if revoked:
+            # A revoked token was actively presented — a stale/replay attempt. Cheap
+            # SOC signal (no DB write); anomalies in this counter are worth alerting on.
+            metrics.incr("auth.revoked_token_presented")
+        return revoked
 
     async def revoke_all_for_user(self, user_id: uuid.UUID, *, at: datetime | None = None) -> None:
         user = await self.db.get(User, user_id)
@@ -40,19 +46,25 @@ class TokenRevocationService:
             await self.db.flush()
 
     async def purge_expired(self, *, now: datetime | None = None) -> int:
+        # Single bulk DELETE (served by ix_rt_expires) — no N-row ORM load/delete loop.
         now = now or datetime.now(timezone.utc)
-        rows = (
-            await self.db.scalars(
-                select(RevokedToken).where(RevokedToken.expires_at.is_not(None), RevokedToken.expires_at < now)
+        result = await self.db.execute(
+            delete(RevokedToken).where(
+                RevokedToken.expires_at.is_not(None), RevokedToken.expires_at < now
             )
-        ).all()
-        for r in rows:
-            await self.db.delete(r)
-        return len(rows)
+        )
+        return result.rowcount or 0
 
 
 def token_predates_bulk_revoke(payload: dict, user: User) -> bool:
-    """True if this access token was issued before the user's bulk-revoke watermark."""
+    """True if this access token was issued before the user's bulk-revoke watermark.
+
+    Sub-second boundary: `iat` is integer seconds, so we floor it to the second — which
+    makes `issued` EARLIER than the real issuance and thus biases toward `True` (reject).
+    That is deliberate and fail-safe: a token issued in the same second as a bulk-revoke
+    may be re-rejected (the user re-logs in), but a token issued just before the revoke
+    can NEVER slip through. Truncating the watermark instead would risk under-rejection.
+    """
     if user.tokens_valid_from is None:
         return False
     iat = payload.get("iat")
