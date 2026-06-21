@@ -43,7 +43,12 @@ class FieldCipher:
 
     @classmethod
     def from_env(cls) -> "FieldCipher":
-        raw = os.environ.get(_ENV_VAR, "")
+        # Real exported env var wins (prod secret managers); else fall back to settings,
+        # which loads .env like the rest of config.
+        raw = os.environ.get(_ENV_VAR) or ""
+        if not raw:
+            from navis.platform.config import settings
+            raw = settings.field_encryption_keys or ""
         keys = [k.strip() for k in raw.split(",") if k.strip()]
         if not keys:
             logger.warning("%s not set; sensitive fields (e.g. SSO secrets) stored UNENCRYPTED", _ENV_VAR)

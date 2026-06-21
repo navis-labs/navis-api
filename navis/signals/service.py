@@ -33,6 +33,7 @@ _BUS_EVENT_FOR_SOURCE = {
 
 class SignalIngestionService:
     def __init__(self, db: AsyncSession) -> None:
+        self.db = db
         self.repo = SignalRepository(db)
 
     async def ingest(self, event: SignalEvent) -> bool:
@@ -42,6 +43,11 @@ class SignalIngestionService:
             logger.debug("duplicate signal %s skipped", event.dedupe_key)
             return False
 
+        # Commit BEFORE announcing: the pointer event tells consumers to fetch the
+        # signal by id from the log, so the row must be durably visible to their
+        # (separate) session first. Mirrors the signup commit-then-publish pattern;
+        # session-level advisory locks survive COMMIT, so single-flight sync is safe.
+        await self.db.commit()
         await self._enqueue(event)
         logger.info(
             "ingested %s/%s ext=%s v=%s org=%s",

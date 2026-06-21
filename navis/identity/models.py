@@ -96,7 +96,11 @@ class Membership(UUIDPrimaryKey, Timestamped, Base):
     organization_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True
     )
-    role: Mapped[Role] = mapped_column(SAEnum(Role), default=Role.FOUNDER)
+    # Bind the enum VALUE ('founder'), not the member NAME ('FOUNDER'): the PG `role`
+    # enum type is defined with the lowercase values.
+    role: Mapped[Role] = mapped_column(
+        SAEnum(Role, values_callable=lambda e: [m.value for m in e]), default=Role.FOUNDER
+    )
 
     user: Mapped["User"] = relationship(back_populates="memberships")
     organization: Mapped["Organization"] = relationship(back_populates="memberships")
@@ -133,7 +137,10 @@ class Integration(UUIDPrimaryKey, Timestamped, Base):
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
-    provider: Mapped[IntegrationProvider] = mapped_column(SAEnum(IntegrationProvider))
+    # Same value-vs-name binding fix as Membership.role (PG enum holds lowercase values).
+    provider: Mapped[IntegrationProvider] = mapped_column(
+        SAEnum(IntegrationProvider, values_callable=lambda e: [m.value for m in e])
+    )
     external_account: Mapped[str | None] = mapped_column(String(320), nullable=True)
     access_token: Mapped[str | None] = mapped_column(String, nullable=True)
     refresh_token: Mapped[str | None] = mapped_column(String, nullable=True)

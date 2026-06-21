@@ -38,7 +38,9 @@ class SignalRepository:
                 external_version=event.external_version,
                 occurred_at=event.timestamp,
                 payload=event.payload,
-                metadata=event.metadata,
+                # ORM attribute is `extra` (DB column "metadata"); using `metadata=`
+                # here collides with the declarative Base.metadata object.
+                extra=event.metadata,
             )
             .on_conflict_do_nothing(constraint="uq_signal_dedupe")
         )

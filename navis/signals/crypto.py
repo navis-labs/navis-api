@@ -42,7 +42,12 @@ class TokenCipher:
 
     @classmethod
     def from_env(cls) -> "TokenCipher":
-        raw = os.environ.get(_ENV_VAR, "")
+        # Real exported env var wins (prod secret managers); else fall back to settings,
+        # which loads .env like the rest of config.
+        raw = os.environ.get(_ENV_VAR) or ""
+        if not raw:
+            from navis.platform.config import settings
+            raw = settings.signals_token_keys or ""
         keys = [k.strip() for k in raw.split(",") if k.strip()]
         if not keys:
             logger.warning("%s not set; integration tokens stored UNENCRYPTED", _ENV_VAR)

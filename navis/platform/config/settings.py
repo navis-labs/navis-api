@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     jwt_private_key: str | None = None  # PEM — signing key for RS256/ES256
     jwt_public_key: str | None = None   # PEM — verification key for RS256/ES256
     jwt_key_id: str | None = None       # `kid` header for key rotation / JWKS
+    # Fernet keys (comma-separated, newest first) for at-rest encryption. Defined here
+    # so they load from .env like the rest of config; the ciphers still honor a real
+    # exported env var first (prod secret managers / tests). Empty => passthrough.
+    field_encryption_keys: str | None = None  # FieldCipher — SSO secrets, sensitive fields
+    signals_token_keys: str | None = None     # TokenCipher — integration OAuth tokens
 
     # ---- AI / ML ----
     openai_api_key: str | None = None

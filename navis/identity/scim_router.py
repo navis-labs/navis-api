@@ -120,6 +120,10 @@ async def provision_user(
     except MemberError as exc:
         raise _scim_error(status.HTTP_409_CONFLICT, str(exc))
     user = await db.get(User, m.user_id)
+    if user is None:  # invariant: invite just flushed this user into the session
+        raise _scim_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, "user not found after provisioning"
+        )
     return _user_resource(user, m)
 
 
