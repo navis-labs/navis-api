@@ -47,7 +47,10 @@ class OnboardingService:
         memory_count: int | None = None,
         actor_id=None,
     ) -> OrganizationOnboarding:
-        row = await self.repo.ensure_onboarding(org_id)
+        # Lock the row: advance read-modify-writes stage_timestamps, so concurrent
+        # advances (independent domain events, possibly on separate workers) must
+        # serialize or one stamp is lost. The lock is held until this txn commits below.
+        row = await self.repo.ensure_onboarding(org_id, for_update=True)
         current = OnboardingStage(row.stage)
 
         if signals_count is not None:
@@ -55,9 +58,10 @@ class OnboardingService:
         if memory_count is not None:
             row.memory_count = memory_count
 
-        # Monotonic: never move backwards. Re-asserting the current stage is a no-op
-        # for the stage clock but still persists any count updates.
-        if stage_index(stage) <= stage_index(current) and stage is not current:
+        # Monotonic: never move backwards, and re-asserting the CURRENT stage is a no-op
+        # (idempotent) — counts above are still persisted, but we do NOT re-publish /
+        # re-audit / re-activate. Only a strictly-forward stage runs the full transition.
+        if stage_index(stage) <= stage_index(current):
             await self.repo.flush()
             return row
 
@@ -69,12 +73,16 @@ class OnboardingService:
             row.completed_at = utcnow()
         await self.repo.flush()
 
-        await self.publisher(STAGE_EVENT[stage], {"organization_id": str(org_id), "stage": stage.value})
+        # Do ALL DB work (audit, lifecycle activation, activation metrics) and COMMIT
+        # before announcing — the event must never reference a stage the DB hasn't
+        # durably committed (commit-before-publish; mirrors the signals ingest fix).
+        # All writes share one transaction, so the commit is atomic.
         if self.audit is not None:
             await self.audit.record(STAGE_EVENT[stage], org_id=org_id, actor_id=actor_id, target_id=str(org_id))
-
         # The brief is first intelligence — the org becomes ACTIVE then.
         if stage in (OnboardingStage.FIRST_BRIEF, OnboardingStage.ACTIVATED):
             await self.lifecycle.activate(org_id, actor_id=actor_id)
         await self.activation.recompute(org_id)
+        await self.repo.commit()
+        await self.publisher(STAGE_EVENT[stage], {"organization_id": str(org_id), "stage": stage.value})
         return row

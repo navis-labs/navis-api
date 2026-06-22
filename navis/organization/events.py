@@ -11,6 +11,10 @@ import uuid
 
 from navis.organization.contract import OnboardingEvent
 from navis.platform.events import DomainEvent, EventType, event_bus
+from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import metrics
+
+logger = get_logger("organization.events")
 
 _EVENT_TYPE: dict[str, EventType] = {
     OnboardingEvent.ORG_CREATED: EventType.ORG_CREATED,
@@ -26,9 +30,16 @@ _EVENT_TYPE: dict[str, EventType] = {
 
 
 async def bus_publisher(event_name: str, payload: dict) -> None:
-    """OnboardingService publisher → platform bus. Unknown names are no-ops."""
+    """OnboardingService publisher → platform bus.
+
+    An unmapped event name would otherwise vanish silently and break the funnel, so it
+    is logged + metered. A parity test guards completeness, so this is a misconfiguration
+    alarm (must never fire in production), not a normal code path.
+    """
     event_type = _EVENT_TYPE.get(event_name)
     if event_type is None:
+        logger.error("unmapped onboarding event %r dropped — add it to _EVENT_TYPE", event_name)
+        metrics.incr("organization.events.unmapped", labels={"event": str(event_name)})
         return
     org = payload.get("organization_id")
     await event_bus.publish(

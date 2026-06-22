@@ -13,15 +13,15 @@ class MetricsService:
         self.repo = repo
 
     async def rollup(self, org_id: uuid.UUID) -> dict[str, Any]:
-        onboarding = await self.repo.get_onboarding(org_id)
-        lifecycle = await self.repo.get_lifecycle(org_id)
-        metrics = await self.repo.get_metrics(org_id)
+        # Single anchored LEFT JOIN (1 round-trip) instead of 3 sequential PK reads.
+        # An absent table yields NULL columns — same defaulting as the independent reads.
+        r = await self.repo.rollup_row(org_id)
         return {
-            "status": lifecycle.status if lifecycle else LifecycleStatus.TRIAL.value,
-            "plan": lifecycle.plan if lifecycle else Plan.FREE.value,
-            "stage": onboarding.stage if onboarding else None,
-            "signals_count": onboarding.signals_count if onboarding else 0,
-            "memory_count": onboarding.memory_count if onboarding else 0,
-            "ttfi_seconds": metrics.ttfi_seconds if metrics else None,
-            "activation_score": metrics.activation_score if metrics else 0.0,
+            "status": r["status"] or LifecycleStatus.TRIAL.value,
+            "plan": r["plan"] or Plan.FREE.value,
+            "stage": r["stage"],
+            "signals_count": r["signals_count"] if r["signals_count"] is not None else 0,
+            "memory_count": r["memory_count"] if r["memory_count"] is not None else 0,
+            "ttfi_seconds": r["ttfi_seconds"],
+            "activation_score": r["activation_score"] if r["activation_score"] is not None else 0.0,
         }

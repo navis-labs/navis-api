@@ -1,10 +1,10 @@
 """Organization HTTP surface: profile, onboarding, entitlements, flags, plan, metrics."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.authz import Principal, get_principal, require_permission
@@ -19,11 +19,14 @@ router = APIRouter(prefix="/organization", tags=["organization"])
 
 
 class ProfileBody(BaseModel):
-    company_name: str | None = None
-    website: str | None = None
-    industry: str | None = None
-    employee_count: int | None = None
-    hq_country: str | None = None
+    company_name: str | None = Field(None, max_length=255)
+    website: str | None = Field(None, max_length=255)
+    industry: str | None = Field(None, max_length=128)
+    # Non-negative; an org cannot have a negative headcount.
+    employee_count: int | None = Field(None, ge=0)
+    # ISO 3166-1 alpha-2. The column is varchar(2); without this a 3+ char value
+    # overflows the column and surfaces as an unhandled 500 instead of a clean 422.
+    hq_country: str | None = Field(None, min_length=2, max_length=2)
 
 
 class PlanBody(BaseModel):
@@ -32,7 +35,8 @@ class PlanBody(BaseModel):
 
 class FlagBody(BaseModel):
     enabled: bool
-    kind: str = "release"
+    # Closed vocabulary (matches OrganizationFeatureFlag.kind); rejects typos with 422.
+    kind: Literal["release", "permission", "kill_switch"] = "release"
 
 
 @router.get("/profile")

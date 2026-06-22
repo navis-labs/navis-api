@@ -16,7 +16,7 @@ from navis.organization.contract import (
     Plan,
     capabilities_for_plan,
 )
-from navis.organization.feature_flags import FeatureFlagService
+from navis.organization.feature_flags import FeatureFlagService, kill_switch_flag
 from navis.organization.repository import OrganizationRepository
 
 
@@ -28,26 +28,34 @@ class EntitlementService:
     async def can_use(self, org_id: uuid.UUID, capability: Capability | str) -> bool:
         cap = capability.value if isinstance(capability, Capability) else capability
 
-        lifecycle = await self.repo.get_lifecycle(org_id)
-        status = lifecycle.status if lifecycle else LifecycleStatus.TRIAL.value
+        # ONE round-trip for all decision inputs (was 3 sequential reads — the hot path).
+        # Resolution order is unchanged: lifecycle gate -> kill switch -> explicit -> plan.
+        r = await self.repo.resolve_capability(org_id, cap, kill_flag=kill_switch_flag(cap))
+
+        status = r["status"] or LifecycleStatus.TRIAL.value
         if status in (LifecycleStatus.SUSPENDED.value, LifecycleStatus.CHURNED.value):
             return False
 
-        if await self.flags.is_killed(org_id, cap):
+        if r["killed"]:
             return False
 
-        explicit = await self.repo.get_entitlement(org_id, cap)
-        if explicit is not None:
-            return bool(explicit.enabled)
+        if r["explicit"] is not None:
+            return bool(r["explicit"])
 
-        plan = Plan(lifecycle.plan) if lifecycle else Plan.FREE
-        return Capability(cap) in capabilities_for_plan(plan)
+        plan = Plan(r["plan"]) if r["plan"] else Plan.FREE
+        # Compare by VALUE (not Capability(cap)) so an unknown/garbage capability
+        # string denies (False) instead of raising ValueError -> 500. Identical result
+        # for valid capabilities; deny-by-default for anything outside the enum.
+        return cap in {c.value for c in capabilities_for_plan(plan)}
 
     async def seed_for_plan(self, org_id: uuid.UUID, plan: Plan) -> None:
-        """Write an explicit entitlement row per capability for the plan (idempotent)."""
+        """Write an explicit entitlement row per capability for the plan (idempotent).
+
+        One batched upsert (not N sequential writes) so provisioning stays within the
+        event-handler timeout regardless of how many capabilities exist.
+        """
         granted = capabilities_for_plan(plan)
-        for cap in Capability:
-            await self.repo.set_entitlement(org_id, cap.value, cap in granted)
+        await self.repo.set_entitlements(org_id, {cap.value: cap in granted for cap in Capability})
         await self.repo.flush()
 
     async def set(self, org_id: uuid.UUID, capability: Capability | str, enabled: bool) -> None:

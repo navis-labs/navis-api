@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -75,7 +75,17 @@ class OrganizationEntitlement(Base):
 
 class OrganizationFeatureFlag(Base):
     __tablename__ = "organization_feature_flags"
-    __table_args__ = (UniqueConstraint("organization_id", "flag", name="uq_org_flag"),)
+    __table_args__ = (
+        # Per-org rows: (org_id, flag) is unique. This does NOT cover global rows:
+        # Postgres treats NULLs as DISTINCT, so UNIQUE(org_id, flag) lets duplicate
+        # (NULL, flag) globals coexist (proven). The partial index below closes that
+        # hole — at most one global default per flag.
+        UniqueConstraint("organization_id", "flag", name="uq_org_flag"),
+        Index(
+            "uq_org_flag_global", "flag", unique=True,
+            postgresql_where=text("organization_id IS NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # org_id NULL = a global default flag (applies to every org unless overridden).

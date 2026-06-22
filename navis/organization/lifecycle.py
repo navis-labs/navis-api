@@ -1,5 +1,11 @@
 """Organization lifecycle transitions: TRIAL → ACTIVE → SUSPENDED/CHURNED.
 
+ACTIVE is a BUSINESS status (the org reached its first brief), NOT an intelligence-
+health signal: an ACTIVE org does not imply MEMORY_READY/STATE_READY or a healthy
+pipeline. What an org may *run* is governed by capability gating (EntitlementService),
+never by this status. Onboarding drives lifecycle (FIRST_BRIEF → ACTIVE); the reverse
+is not enforced.
+
 A suspended/churned org's capabilities are all gated off by EntitlementService.
 Every transition is audited via Identity's append-only audit log.
 """
@@ -34,7 +40,9 @@ class LifecycleService:
     async def _transition(self, org_id: uuid.UUID, target: LifecycleStatus, *, actor_id=None) -> OrganizationLifecycle:
         row = await self.repo.ensure_lifecycle(org_id)
         current = LifecycleStatus(row.status)
-        if target != current and target not in _ALLOWED[current]:
+        if target == current:
+            return row  # idempotent: re-asserting the current status writes nothing and audits nothing
+        if target not in _ALLOWED[current]:
             raise LifecycleError(f"illegal transition {current.value} -> {target.value}")
         row.status = target.value
         now = utcnow()

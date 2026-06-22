@@ -57,7 +57,10 @@ async def test_onboarding_is_monotonic_no_backwards():
 async def test_ttfi_and_activation_score():
     repo = FakeOrgRepo()
     svc = OnboardingService(repo)
-    await svc.advance(ORG_A, OnboardingStage.CREATED)
+    # CREATED is stamped by bootstrap in production (advance() is a no-op when
+    # re-asserting the current stage), so set the CREATED clock the same way here.
+    row = await repo.ensure_onboarding(ORG_A)
+    row.stage_timestamps = {OnboardingStage.CREATED.value: "2026-06-01T00:00:00+00:00"}
     await svc.advance(ORG_A, OnboardingStage.FIRST_BRIEF)
     metrics = await repo.get_metrics(ORG_A)
     assert metrics.ttfi_seconds is not None and metrics.ttfi_seconds >= 0
@@ -91,6 +94,15 @@ async def test_plan_defaults_gate_capabilities():
 
     await BillingService(repo, ent).set_plan(ORG_A, Plan.ENTERPRISE)
     assert await ent.can_use(ORG_A, Capability.ADAPTIVE) is True       # ENTERPRISE has all
+
+
+async def test_can_use_unknown_capability_denies_not_raises():
+    # can_use resolves by value, so a capability outside the enum must deny (False),
+    # never raise ValueError -> 500. Guards the single-query resolution path.
+    repo = FakeOrgRepo()
+    ent = EntitlementService(repo)
+    await BillingService(repo, ent).set_plan(ORG_A, Plan.ENTERPRISE)
+    assert await ent.can_use(ORG_A, "not_a_real_capability") is False
 
 
 async def test_explicit_entitlement_overrides_plan():

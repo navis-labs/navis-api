@@ -52,7 +52,7 @@ class FakeOrgRepo:
     async def get_onboarding(self, org_id):
         return self.onboarding.get(org_id)
 
-    async def ensure_onboarding(self, org_id):
+    async def ensure_onboarding(self, org_id, *, for_update=False):
         row = self.onboarding.get(org_id)
         if row is None:
             row = SimpleNamespace(
@@ -73,6 +73,11 @@ class FakeOrgRepo:
         self.entitlements[(org_id, capability)] = SimpleNamespace(
             organization_id=org_id, capability=capability, enabled=enabled
         )
+
+    async def set_entitlements(self, org_id, caps):
+        # Mirror the real repository's batched upsert (one call, many caps).
+        for capability, enabled in caps.items():
+            await self.set_entitlement(org_id, capability, enabled)
 
     # flags
     async def get_flag(self, org_id, flag):
@@ -100,7 +105,40 @@ class FakeOrgRepo:
         self.metrics[org_id] = row
         return row
 
+    # capability resolution (mirrors the real single-query: lifecycle + explicit + kill OR)
+    async def resolve_capability(self, org_id, capability, *, kill_flag):
+        lc = self.lifecycles.get(org_id)
+        ent = self.entitlements.get((org_id, capability))
+        killed = any(
+            f.enabled for f in self.flags
+            if f.flag == kill_flag and f.organization_id in (org_id, None)
+        )
+        return {
+            "status": lc.status if lc else None,
+            "plan": lc.plan if lc else None,
+            "explicit": ent.enabled if ent else None,
+            "killed": killed,
+        }
+
+    # read-side rollup (mirrors the real single-JOIN query: NULLs for absent tables)
+    async def rollup_row(self, org_id):
+        lc = self.lifecycles.get(org_id)
+        ob = self.onboarding.get(org_id)
+        mt = self.metrics.get(org_id)
+        return {
+            "status": lc.status if lc else None,
+            "plan": lc.plan if lc else None,
+            "stage": ob.stage if ob else None,
+            "signals_count": ob.signals_count if ob else None,
+            "memory_count": ob.memory_count if ob else None,
+            "ttfi_seconds": mt.ttfi_seconds if mt else None,
+            "activation_score": mt.activation_score if mt else None,
+        }
+
     async def flush(self):
+        pass
+
+    async def commit(self):
         pass
 
 

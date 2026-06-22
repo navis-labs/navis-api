@@ -35,8 +35,11 @@ class Capability(str, enum.Enum):
     REASONING = "reasoning"
     DECISION = "decision"
     EXECUTION = "execution"
+    OBSERVATION = "observation"
+    LEARNING = "learning"
     INTELLIGENCE = "intelligence"
     ADAPTIVE = "adaptive"
+    ML = "ml"
 
 
 class OnboardingStage(str, enum.Enum):
@@ -69,7 +72,7 @@ def stage_index(stage: OnboardingStage) -> int:
     return STAGE_ORDER.index(stage)
 
 
-class OnboardingEvent:
+class OnboardingEvent(str, enum.Enum):
     ORG_CREATED = "org.created"
     PROFILE_COMPLETED = "org.profile_completed"
     GMAIL_CONNECTED = "org.gmail_connected"

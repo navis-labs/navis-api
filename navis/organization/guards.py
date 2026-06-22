@@ -21,6 +21,13 @@ def require_capability(capability: Capability):
         principal: Principal = Depends(get_principal),
         db: AsyncSession = Depends(get_session),
     ) -> Principal:
+        # Fail closed at the capability boundary. principal.org_id is non-null today
+        # (get_principal rejects org-less JWTs with 403; api_keys.organization_id is NOT
+        # NULL), but can_use() defaults a None/unprovisioned org to TRIAL/Plan.FREE — i.e.
+        # it would fail OPEN. Asserting presence here keeps the gate fail-closed even if a
+        # future principal kind introduces a null org, instead of silently granting FREE.
+        if getattr(principal, "org_id", None) is None:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "principal has no organization")
         if not await OrganizationService(db).can_use(principal.org_id, capability):
             raise HTTPException(
                 status.HTTP_402_PAYMENT_REQUIRED,

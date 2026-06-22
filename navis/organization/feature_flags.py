@@ -29,7 +29,14 @@ class FeatureFlagService:
         return bool(chosen.enabled)
 
     async def is_killed(self, org_id: uuid.UUID, capability: str) -> bool:
-        return await self.evaluate(org_id, kill_switch_flag(capability))
+        """A kill switch FORCES the capability off (per the module contract) — so unlike a
+        release flag it is fail-safe / most-restrictive, NOT override-based. Killed if the
+        global emergency kill OR an org-specific kill is enabled. Routing this through
+        evaluate() would let a pre-existing org row (kill:<cap>=False) silently exempt the
+        org from a later global emergency kill — fail-open on a safety control. An org row
+        may ADD a kill, never remove a global one."""
+        rows = await self.repo.flags_for(org_id, kill_switch_flag(capability))
+        return any(bool(r.enabled) for r in rows)
 
     async def set(self, org_id: uuid.UUID | None, flag: str, *, kind: str = "release", enabled: bool) -> None:
         await self.repo.set_flag(org_id, flag, kind=kind, enabled=enabled)
