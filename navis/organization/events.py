@@ -29,6 +29,29 @@ _EVENT_TYPE: dict[str, EventType] = {
 }
 
 
+async def publish_plan_changed(
+    *, org_id: uuid.UUID, old_plan: str, new_plan: str, actor_id, changed_at: str
+) -> None:
+    """Announce a COMMITTED plan change on the bus (ORG-003). The payload is
+    self-contained (old + new plan), so consumers react without a DB read. Fully
+    decoupled: any domain subscribes via `@subscribe(EventType.ORG_PLAN_CHANGED)` without
+    touching BillingService."""
+    await event_bus.publish(
+        DomainEvent(
+            type=EventType.ORG_PLAN_CHANGED,
+            org_id=org_id,
+            payload={
+                "organization_id": str(org_id),
+                "old_plan": old_plan,
+                "new_plan": new_plan,
+                "actor_id": str(actor_id) if actor_id else None,
+                "changed_at": changed_at,
+            },
+            source="organization",
+        )
+    )
+
+
 async def bus_publisher(event_name: str, payload: dict) -> None:
     """OnboardingService publisher → platform bus.
 

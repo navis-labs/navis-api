@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,12 +21,27 @@ from navis.identity.schemas import (
     UserOut,
 )
 from navis.identity.service import AuthError, IdentityService
+from navis.identity.throttle import LoginThrottle
 from navis.identity.tokens import TokenRevocationService, token_predates_bulk_revoke
+from navis.platform.cache import redis_client
 from navis.platform.database import get_session
 from navis.platform.events import DomainEvent, EventType, event_bus
 from navis.platform.security import TokenError, decode_token
 
 router = APIRouter(prefix="/auth", tags=["identity"])
+
+# One opaque message for EVERY auth failure (bad password / unknown email / disabled /
+# locked) so the endpoint never enables account enumeration.
+_GENERIC_AUTH_ERROR = "invalid email or password"
+
+
+def _client_ip(request: Request) -> str:
+    # Behind a trusted proxy/LB the first X-Forwarded-For hop is the client; fall back to
+    # the direct peer. The per-email counter is the primary defense if XFF is spoofable.
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 @router.post("/signup", response_model=TokenPair, status_code=status.HTTP_201_CREATED)
@@ -48,15 +63,27 @@ async def signup(data: SignupRequest, db: AsyncSession = Depends(get_session)) -
 
 
 @router.post("/login", response_model=TokenPair)
-async def login(data: LoginRequest, db: AsyncSession = Depends(get_session)) -> TokenPair:
+async def login(data: LoginRequest, request: Request, db: AsyncSession = Depends(get_session)) -> TokenPair:
     svc = IdentityService(db)
+    throttle = LoginThrottle(redis_client)
+    ip = _client_ip(request)
+
+    # IDENTITY-003: brute-force gate BEFORE any password work. Locked -> generic 401.
+    if await throttle.is_locked(data.email, ip):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, _GENERIC_AUTH_ERROR)
+
     try:
         user = await svc.authenticate(data.email, data.password)
-    except AuthError as exc:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
+    except AuthError:
+        await throttle.record_failure(data.email, ip)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, _GENERIC_AUTH_ERROR)
+
+    # Success: clear strike counters, resolve org, issue tokens, audit exactly once.
+    await throttle.reset(data.email, ip)
     membership = await svc.primary_membership(user)
     org_id = membership.organization_id if membership else None
     access, refresh = await svc.issue_tokens(user, org_id)
+    await svc.record_login(user, org_id)  # IDENTITY-002 — login route only; refresh never calls this
     return TokenPair(access_token=access, refresh_token=refresh)
 
 

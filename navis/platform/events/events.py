@@ -66,6 +66,7 @@ class EventType(str, Enum):
     ORG_STATE_READY = "OrgStateReady"
     ORG_FIRST_BRIEF = "OrgFirstBrief"
     ORG_ACTIVATED = "OrgActivated"
+    ORG_PLAN_CHANGED = "OrgPlanChanged"
 
     # Identity administration (delegated-admin mutations; consumed by security
     # analytics / learning / intelligence — none of which Identity imports).

@@ -15,7 +15,7 @@ from navis.organization.activation import ActivationService
 from navis.organization.billing import BillingService
 from navis.organization.contract import Capability, OnboardingStage, Plan
 from navis.organization.entitlements import EntitlementService
-from navis.organization.events import bus_publisher
+from navis.organization.events import bus_publisher, publish_plan_changed
 from navis.organization.feature_flags import FeatureFlagService
 from navis.organization.lifecycle import LifecycleService
 from navis.organization.metrics import MetricsService
@@ -33,7 +33,7 @@ class OrganizationService:
         self.audit = AuditService(db)
         self.flags = FeatureFlagService(self.repo)
         self.entitlements = EntitlementService(self.repo, self.flags)
-        self.billing = BillingService(self.repo, self.entitlements, self.audit)
+        self.billing = BillingService(self.repo, self.entitlements, self.audit, publisher=publish_plan_changed)
         self.lifecycle = LifecycleService(self.repo, self.audit)
         self.onboarding = OnboardingService(self.repo, audit=self.audit, publisher=bus_publisher)
         self.activation = ActivationService(self.repo)

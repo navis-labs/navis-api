@@ -10,12 +10,32 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, UniqueConstraint, func, text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from navis.organization.contract import LifecycleStatus, OnboardingStage, Plan
 from navis.platform.database.base import Base
+
+
+def _enum_in(column: str, enum) -> str:
+    """`col IN ('a','b',...)` built from the enum's values — DB CHECK that mirrors the
+    application enum (ORG-001). Defined from the enum so the model constraint tracks the
+    enum; a new value still needs a migration to ALTER the live DB constraint."""
+    values = ", ".join(f"'{m.value}'" for m in enum)
+    return f"{column} IN ({values})"
 
 
 class OrganizationProfile(Base):
@@ -34,6 +54,10 @@ class OrganizationProfile(Base):
 
 class OrganizationLifecycle(Base):
     __tablename__ = "organization_lifecycles"
+    __table_args__ = (
+        CheckConstraint(_enum_in("status", LifecycleStatus), name="ck_org_lifecycle_status"),
+        CheckConstraint(_enum_in("plan", Plan), name="ck_org_lifecycle_plan"),
+    )
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), primary_key=True
@@ -48,6 +72,9 @@ class OrganizationLifecycle(Base):
 
 class OrganizationOnboarding(Base):
     __tablename__ = "organization_onboarding"
+    __table_args__ = (
+        CheckConstraint(_enum_in("stage", OnboardingStage), name="ck_org_onboarding_stage"),
+    )
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), primary_key=True

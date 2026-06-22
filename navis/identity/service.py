@@ -17,6 +17,7 @@ from navis.identity.org_service import OrganizationService
 from navis.identity.schemas import SignupRequest
 from navis.identity.tokens import TokenRevocationService
 from navis.platform.config import settings
+from navis.platform.monitoring import get_request_id
 from navis.platform.security import (
     create_access_token,
     create_refresh_token,
@@ -80,6 +81,19 @@ class IdentityService:
         if not user.is_active:
             raise AuthError("account disabled")
         return user
+
+    async def record_login(self, user: User, org_id: uuid.UUID | None, *, method: str = "password") -> None:
+        """Audit a SUCCESSFUL login exactly once (IDENTITY-002). Called only from the
+        login route after authentication succeeds — never on failure, and never from the
+        refresh flow (which mints tokens without re-authenticating). Carries user_id,
+        org_id, the request_id (if any), the auth method, and an auto timestamp."""
+        await AuditService(self.db).record(
+            AuditAction.LOGIN,
+            org_id=org_id,
+            actor_id=user.id,
+            target_id=str(user.id),
+            metadata={"method": method, "request_id": get_request_id()},
+        )
 
     async def primary_membership(self, user: User) -> Membership | None:
         # Deterministic: oldest membership wins (stable across requests).

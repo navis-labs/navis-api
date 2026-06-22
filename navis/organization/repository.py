@@ -12,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from navis.organization.contract import LifecycleStatus, OnboardingStage, Plan
 from navis.organization.models import (
     OrganizationEntitlement,
     OrganizationFeatureFlag,
@@ -54,11 +55,22 @@ class OrganizationRepository:
         return await self.db.get(OrganizationLifecycle, org_id)
 
     async def ensure_lifecycle(self, org_id: uuid.UUID) -> OrganizationLifecycle:
-        row = await self.get_lifecycle(org_id)
-        if row is None:
-            row = OrganizationLifecycle(organization_id=org_id)
-            self.db.add(row)
-            await self.db.flush()
+        """Idempotent create (ORG-002). INSERT ... ON CONFLICT DO NOTHING removes the
+        read-then-insert race: concurrent first-touch (duplicate ORG_CREATED / retries)
+        can no longer raise IntegrityError — the loser no-ops and both read the same row.
+        Defaults are set explicitly because a core insert bypasses ORM column defaults."""
+        stmt = (
+            pg_insert(OrganizationLifecycle)
+            .values(
+                organization_id=org_id,
+                status=LifecycleStatus.TRIAL.value,
+                plan=Plan.FREE.value,
+            )
+            .on_conflict_do_nothing(index_elements=["organization_id"])
+        )
+        await self.db.execute(stmt)
+        row = await self.db.get(OrganizationLifecycle, org_id)
+        assert row is not None  # just upserted by PK
         return row
 
     # ---- onboarding ----
@@ -72,13 +84,25 @@ class OrganizationRepository:
         events on separate workers) both read the old map and the later commit drops the
         other's stamp — a proven lost update. The lock makes the 2nd advance block, then
         re-read the committed map and merge. Per-org only; advances are infrequent."""
+        # Idempotent create (ORG-002): ON CONFLICT DO NOTHING closes the first-touch race.
+        # Defaults set explicitly (core insert bypasses ORM defaults). The FOR UPDATE on the
+        # subsequent read still serializes concurrent advances against the lost-update.
+        stmt = (
+            pg_insert(OrganizationOnboarding)
+            .values(
+                organization_id=org_id,
+                stage=OnboardingStage.CREATED.value,
+                signals_count=0,
+                memory_count=0,
+                stage_timestamps={},
+            )
+            .on_conflict_do_nothing(index_elements=["organization_id"])
+        )
+        await self.db.execute(stmt)
         row = await self.db.get(
             OrganizationOnboarding, org_id, with_for_update=True if for_update else False
         )
-        if row is None:
-            row = OrganizationOnboarding(organization_id=org_id)
-            self.db.add(row)
-            await self.db.flush()
+        assert row is not None  # just upserted by PK
         return row
 
     # ---- entitlements ----

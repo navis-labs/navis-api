@@ -104,6 +104,12 @@ class Settings(BaseSettings):
     redis_max_connections: int = 50
     redis_socket_timeout_seconds: float = 5.0
 
+    # ---- Login brute-force throttle (IDENTITY-003) ----
+    # Lock an email/IP after N failed attempts; the lock clears after the window (sliding
+    # — extended on each new failure). Redis-backed; fails OPEN if Redis is unavailable.
+    login_max_attempts: int = 5
+    login_lockout_seconds: int = 15 * 60
+
     # ---- Storage (S3) ----
     aws_region: str = "us-east-1"
     aws_access_key_id: str | None = None
