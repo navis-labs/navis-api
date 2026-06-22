@@ -69,4 +69,15 @@ celery_app.conf.beat_schedule = {
         "task": "navis.execution.worker.recover_stale_executions",
         "schedule": 60,
     },
+    # Identity hygiene: reap expired sessions + expired revoked-token rows. Hourly is
+    # ample — expiry is already enforced at auth time; this only reclaims storage. Both
+    # are idempotent index-served bulk DELETEs, so overlap/re-run is harmless.
+    "purge-expired-sessions": {
+        "task": "navis.identity.maintenance.purge_expired_sessions",
+        "schedule": 60 * 60,
+    },
+    "purge-expired-tokens": {
+        "task": "navis.identity.maintenance.purge_expired_tokens",
+        "schedule": 60 * 60,
+    },
 }

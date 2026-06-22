@@ -23,7 +23,7 @@ from navis.identity.models import Membership, User
 from navis.identity.permissions import effective_permissions
 from navis.identity.tokens import TokenRevocationService, token_predates_bulk_revoke
 from navis.platform.database import get_session
-from navis.platform.monitoring import get_logger
+from navis.platform.monitoring import get_logger, set_org_id
 from navis.platform.monitoring.metrics import metrics
 from navis.platform.security import TokenError, decode_token
 
@@ -153,13 +153,20 @@ async def get_principal(
                 "provide either an API key or a bearer token, not both",
             )
         if x_api_key:
-            return await _principal_from_api_key(db, x_api_key)
-        if creds and creds.scheme.lower() == "bearer":
+            principal = await _principal_from_api_key(db, x_api_key)
+        elif creds and creds.scheme.lower() == "bearer":
             # A navis_ prefixed bearer is an API key; otherwise a JWT.
             if creds.credentials.startswith("navis_"):
-                return await _principal_from_api_key(db, creds.credentials)
-            return await _principal_from_jwt(db, creds.credentials)
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing credentials")
+                principal = await _principal_from_api_key(db, creds.credentials)
+            else:
+                principal = await _principal_from_jwt(db, creds.credentials)
+        else:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing credentials")
+        # Single choke point: bind the authenticated org to the logging context so EVERY
+        # log line emitted for the rest of this request (and any sync work on this task)
+        # carries org_id. Runs only after auth succeeds; rejections never set it.
+        set_org_id(str(principal.org_id))
+        return principal
     except HTTPException as exc:
         # One place that counts every auth rejection (401 invalid/revoked vs 403).
         metrics.incr("auth.rejected", labels={"status": str(exc.status_code)})

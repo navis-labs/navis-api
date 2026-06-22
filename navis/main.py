@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 
 import navis.registry  # noqa: F401  (model + event-handler registration side effects)
 from navis.api import api_router
@@ -17,6 +18,7 @@ from navis.platform.config import settings
 from navis.platform.database import dispose_engine
 from navis.platform.monitoring import configure_logging, get_logger
 from navis.platform.monitoring.health import liveness, readiness
+from navis.platform.monitoring.metrics import PROMETHEUS_CONTENT_TYPE, render_prometheus
 from navis.platform.monitoring.middleware import RequestContextMiddleware
 from navis.platform.monitoring.sentry import init_sentry
 
@@ -70,6 +72,13 @@ def create_app() -> FastAPI:
     async def ready() -> dict:
         """Readiness: Postgres + Redis reachable. For LB/k8s gating."""
         return await readiness()
+
+    @app.get("/metrics", tags=["platform"], include_in_schema=False)
+    async def metrics_endpoint() -> PlainTextResponse:
+        """Prometheus scrape target. Renders the in-process counters/histograms as
+        text exposition — operational counts only, no secrets. Lightweight (a locked
+        dict copy + string render). Restrict at the network/ingress layer as usual."""
+        return PlainTextResponse(render_prometheus(), media_type=PROMETHEUS_CONTENT_TYPE)
 
     @app.get("/", tags=["platform"])
     async def root() -> dict[str, str]:

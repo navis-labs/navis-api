@@ -15,6 +15,7 @@ Histograms record fixed buckets (ms) so percentiles can be approximated cheaply.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from collections import defaultdict
@@ -92,3 +93,75 @@ def timed(name: str, labels: dict[str, str] | None = None) -> Iterator[None]:
         yield
     finally:
         metrics.observe_ms(name, (time.perf_counter() - start) * 1000.0, labels)
+
+
+# --- Prometheus text exposition (render-only; no new collection, no deps) ---
+
+# Prometheus metric/label names: [a-zA-Z_:][a-zA-Z0-9_:]* — sanitize everything else.
+_PROM_NAME_RE = re.compile(r"[^a-zA-Z0-9_:]")
+PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+
+
+def _prom_name(name: str) -> str:
+    safe = _PROM_NAME_RE.sub("_", name)
+    if safe and safe[0].isdigit():
+        safe = "_" + safe
+    return safe or "_"
+
+
+def _split_key(key: str) -> tuple[str, dict[str, str]]:
+    """Reverse of _key(): 'name' or 'name{k=v,k2=v2}' -> (name, {k: v})."""
+    if key.endswith("}") and "{" in key:
+        name, rest = key.split("{", 1)
+        labels: dict[str, str] = {}
+        for pair in rest[:-1].split(","):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                labels[k] = v
+        return name, labels
+    return key, {}
+
+
+def _esc(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _labels(labels: dict[str, str]) -> str:
+    if not labels:
+        return ""
+    body = ",".join(f'{_prom_name(k)}="{_esc(v)}"' for k, v in sorted(labels.items()))
+    return "{" + body + "}"
+
+
+def render_prometheus(snap: dict | None = None) -> str:
+    """Render metrics.snapshot() as Prometheus text exposition (v0.0.4).
+
+    Pure function of the snapshot — no I/O and no secrets (only metric names, the
+    low-cardinality labels callers pass, and integer counts). Names are sanitized to the
+    Prometheus charset; the in-process per-bucket histogram counts are accumulated into
+    the cumulative `le` buckets Prometheus expects. Scrapeable by Prometheus & Grafana."""
+    snap = snap if snap is not None else metrics.snapshot()
+    out: list[str] = []
+    typed: set[str] = set()
+    counters = snap.get("counters", {})
+    for key in sorted(counters):
+        name, labels = _split_key(key)
+        pname = _prom_name(name)
+        if pname not in typed:
+            out.append(f"# TYPE {pname} counter")
+            typed.add(pname)
+        out.append(f"{pname}{_labels(labels)} {counters[key]}")
+    histograms = snap.get("histograms", {})
+    for key in sorted(histograms):
+        h = histograms[key]
+        name, labels = _split_key(key)
+        pname = _prom_name(name)
+        out.append(f"# TYPE {pname} histogram")
+        cumulative = 0
+        for edge, cnt in h["buckets_ms"].items():
+            cumulative += cnt
+            out.append(f'{pname}_bucket{_labels({**labels, "le": str(edge)})} {cumulative}')
+        out.append(f'{pname}_bucket{_labels({**labels, "le": "+Inf"})} {h["count"]}')
+        out.append(f"{pname}_sum{_labels(labels)} {h['sum_ms']}")
+        out.append(f"{pname}_count{_labels(labels)} {h['count']}")
+    return "\n".join(out) + "\n"

@@ -1,3 +1,8 @@
+# pyright: reportArgumentType=false, reportOptionalMemberAccess=false
+# ^ Test-double typing: services are annotated for the real OrganizationRepository, but
+#   these tests inject the in-memory FakeOrgRepo (structural, not a nominal subclass), and
+#   intentionally access getter results they know are present. Both are inherent to the
+#   fake-based unit style; suppressed file-wide rather than threading asserts/Protocols.
 """Organization V1: onboarding funnel, entitlements, feature flags, lifecycle,
 activation/TTFI, plan gating, multi-tenancy, and the import guard.
 """
