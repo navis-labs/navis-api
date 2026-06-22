@@ -1,17 +1,21 @@
 """MeetDeriver — turn Calendar signals into Meet signals.
 
-A Meet meeting is a Calendar event that carries conferenceData / a hangoutLink.
-We derive MEETING_CREATED / MEETING_UPDATED / MEETING_COMPLETED from the Calendar
-events the Calendar connector already captured — no separate Google call.
+A Meet meeting is a Calendar event that carries conferenceData / a hangoutLink. We derive
+the SCHEDULING facts (MEETING_CREATED / MEETING_UPDATED) from the Calendar events the
+Calendar connector already captured — no separate Google call.
 
-Attendance (who actually joined, duration) is NOT derivable from Calendar and is
-explicitly out of scope for phase 1. The `attendance_provider` extension point is
-where the Google Meet API (conferenceRecords/participants) or the Admin SDK
-Reports API would plug in later, without changing this contract.
+We do NOT derive MEETING_COMPLETED. Calendar is *scheduling* truth; completion is
+*participation* truth (did anyone actually join?), which is ONLY knowable from the Google
+Meet API (conferenceRecords/participants). Inferring "completed" from "scheduled end has
+passed" (a) fabricated reality — a no-show meeting is not completed — and (b) was
+non-deterministic: a re-sync/replay AFTER the end time flipped the same calendar event from
+CREATED to COMPLETED, violating determinism + replay. MEETING_COMPLETED is reserved for the
+future `attendance_provider` (Meet API), which joins by conference_id and APPENDS a new fact
+— no rewrite/migration of historical signals.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Protocol
 
 from navis.signals.base import (
@@ -23,30 +27,26 @@ from navis.signals.base import (
 
 
 class AttendanceProvider(Protocol):  # pragma: no cover - extension point only
-    """Future: resolve real attendance for a finished meeting."""
+    """Future: resolve real attendance for a finished meeting (Meet conferenceRecords)."""
 
-    async def attendance_for(self, external_id: str) -> dict[str, Any]: ...
+    async def attendance_for(self, conference_id: str) -> dict[str, Any]: ...
 
 
 def _has_conference(payload: dict[str, Any]) -> bool:
     return bool(payload.get("conference_data") or payload.get("hangout_link"))
 
 
-def _meeting_end(payload: dict[str, Any]) -> datetime | None:
-    end = (payload.get("end") or {}).get("dateTime")
-    if not end:
-        return None
-    try:
-        dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except (TypeError, ValueError):
-        return None
+def _conference_id(payload: dict[str, Any]) -> str | None:
+    conf = payload.get("conference_data")
+    return conf.get("conference_id") if isinstance(conf, dict) else None
 
 
 def derive_meeting_events(
     calendar_events: list[SignalEvent], *, now: datetime | None = None
 ) -> list[SignalEvent]:
-    now = now or datetime.now(timezone.utc)
+    """Derive Meet scheduling signals from Calendar signals. Pure + deterministic: the
+    `now` parameter is accepted for backward compatibility but UNUSED (completion is no
+    longer time-derived), so the output depends only on the input events."""
     out: list[SignalEvent] = []
     for ev in calendar_events:
         if ev.source != SignalSource.CALENDAR:
@@ -57,17 +57,15 @@ def derive_meeting_events(
             continue
 
         ctx = SignalContext(ev.org_id, ev.user_id, ev.integration_id)
-        end = _meeting_end(ev.payload)
-        completed = end is not None and end < now
-
-        if completed:
-            meeting_type = SignalEventType.MEETING_COMPLETED
-        elif ev.event_type == SignalEventType.CALENDAR_EVENT_CREATED:
-            meeting_type = SignalEventType.MEETING_CREATED
-        else:
-            meeting_type = SignalEventType.MEETING_UPDATED
-
-        # Distinct version per phase so created/updated/completed are separate facts.
+        # Scheduling facts only — deterministic in the calendar event_type, never in `now`.
+        meeting_type = (
+            SignalEventType.MEETING_CREATED
+            if ev.event_type == SignalEventType.CALENDAR_EVENT_CREATED
+            else SignalEventType.MEETING_UPDATED
+        )
+        conference_id = _conference_id(ev.payload)
+        # Distinct version per phase so created/updated are separate facts and never dedupe
+        # against the source calendar event.
         version = f"{ev.external_version}:{meeting_type.value}"
         out.append(
             SignalEvent.create(
@@ -82,10 +80,21 @@ def derive_meeting_events(
                     "start": ev.payload.get("start"),
                     "end": ev.payload.get("end"),
                     "attendees": ev.payload.get("attendees", []),
-                    "conference_data": ev.payload.get("conference_data"),
-                    "hangout_link": ev.payload.get("hangout_link"),
+                    # Stable conference identity — the join key future Meet-API signals
+                    # (participants/recordings/transcripts) use to attach to THIS meeting.
+                    "conference_id": conference_id,
+                    "conference_data": ev.payload.get("conference_data"),  # minimized upstream
+                    # hangout_link DROPPED — a join/access URL must not persist forever.
+                    "has_conference": True,
                 },
-                metadata={"derived_from": "calendar", "attendance_tracked": False},
+                metadata={
+                    "derived_from": "calendar",
+                    "attendance_tracked": False,
+                    "conference_id": conference_id,
+                    # Propagate capture lineage from the source calendar event.
+                    "calendar_id": ev.metadata.get("calendar_id"),
+                    "capture_mode": ev.metadata.get("capture_mode"),
+                },
             )
         )
     return out

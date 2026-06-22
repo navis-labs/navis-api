@@ -26,6 +26,7 @@ from navis.ml.embeddings import models as _ml_embedding_models  # noqa: F401
 from navis.memory import service as _memory_service  # noqa: F401
 from navis.learning import subscribers as _learning_subscribers  # noqa: F401  (OUTCOME_OBSERVED)
 from navis.execution import worker as _execution_worker  # noqa: F401  (registers tasks)
+from navis.signals import outbox as _signal_outbox  # noqa: F401  (registers the outbox relay task)
 from navis.identity import maintenance as _identity_maintenance  # noqa: F401  (registers purge tasks)
 from navis.observation import subscribers as _observation_subscribers  # noqa: F401  (closes the loop)
 from navis.orchestration import wiring as _wiring  # noqa: F401

@@ -37,13 +37,20 @@ def maybe_doc_event(
     drive_event_type: SignalEventType,
     external_version: str,
     timestamp: datetime | None = None,
+    *,
+    capture_mode: str = "incremental",
 ) -> SignalEvent | None:
-    """Return a Docs SignalEvent if the changed file is a Google Doc, else None."""
+    """Return a Docs SignalEvent if the changed file is a Google Doc, else None.
+
+    A parallel Docs-scoped fact (source=DOCS, so its dedupe key differs from the Drive
+    event's — no duplicate reality, no inflation). Payload is data-minimized: owner EMAILS
+    only (no displayName), no web_view_link (sensitive URL, re-fetchable by id)."""
     if not is_google_doc(file_raw):
         return None
     doc_type = _DRIVE_TO_DOC.get(drive_event_type)
     if doc_type is None:
         return None
+    owners = [{"email": o.get("emailAddress")} for o in file_raw.get("owners", []) if o.get("emailAddress")]
     return SignalEvent.create(
         ctx,
         source=SignalSource.DOCS,
@@ -53,9 +60,13 @@ def maybe_doc_event(
         timestamp=timestamp or datetime.now(timezone.utc),
         payload={
             "name": file_raw.get("name"),
-            "owners": file_raw.get("owners", []),
+            "owners": owners,
             "parents": file_raw.get("parents", []),
-            "web_view_link": file_raw.get("webViewLink"),
+            "drive_id": file_raw.get("driveId"),
         },
-        metadata={"derived_from": "drive"},
+        metadata={
+            "derived_from": "drive",
+            "drive_id": file_raw.get("driveId"),
+            "capture_mode": capture_mode,
+        },
     )

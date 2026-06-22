@@ -20,9 +20,32 @@ from navis.memory.repository import MemoryRepository
 from navis.platform.database import session_scope
 from navis.platform.events import DomainEvent, EventType, subscribe
 from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import metrics
+from navis.platform.security import FieldDecryptError, field_cipher
 from navis.signals.base import SignalEventType, SignalSource
 
 logger = get_logger("memory")
+
+
+def _decrypt_content(payload: dict) -> dict:
+    """Decrypt the content fields a producer sealed at rest (self-described via
+    `_content_fields`). Returns a NEW dict — the stored record is never mutated. A field that
+    can't be decrypted (key rotated out / tampered) degrades to empty + a loud metric, so one
+    unreadable body can't crash ingestion or poison the rest of the extracted facts."""
+    fields = payload.get("_content_fields")
+    if not fields:
+        return payload
+    out = dict(payload)
+    for f in fields:
+        val = out.get(f)
+        if isinstance(val, str):
+            try:
+                out[f] = field_cipher.decrypt(val)
+            except FieldDecryptError:
+                metrics.incr("memory.content_decrypt_failed")
+                logger.error("content field %s failed decryption; degrading to empty", f)
+                out[f] = ""
+    return out
 
 
 def build_memory_records(view: SignalView) -> list[MemoryRecord]:
@@ -73,7 +96,7 @@ class SignalViewFactory:
             external_id=rec.external_id,
             external_version=rec.external_version,
             event_timestamp=rec.occurred_at,
-            payload=rec.payload or {},
+            payload=_decrypt_content(rec.payload or {}),
         )
 
 

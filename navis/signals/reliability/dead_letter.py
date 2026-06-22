@@ -41,6 +41,8 @@ class DeadLetterQueue:
         integration_id = _as_uuid(context.get("integration_id"))
         source = context.get("source")
         event_id = _as_uuid(item.get("event_id")) if isinstance(item, dict) else None
+        # user_id rides along (from the failed event) so the DLQ's PII copy is GDPR-targetable.
+        user_id = _as_uuid(item.get("user_id")) if isinstance(item, dict) else None
         dedupe = _dedupe_from(item)
 
         logger.error("DLQ stage=%s source=%s org=%s err=%s", stage, source, org_id, error_str)
@@ -53,6 +55,7 @@ class DeadLetterQueue:
                 error=error_str,
                 org_id=org_id,
                 integration_id=integration_id,
+                user_id=user_id,
                 source=source,
                 event_id=event_id,
                 dedupe_key=dedupe,
@@ -103,16 +106,19 @@ def _as_uuid(value: Any) -> uuid.UUID | None:
 
 
 def _dedupe_from(item: Any) -> str | None:
+    # Format MUST match SignalEvent.make_dedupe_key (org, integration_id, source, external_id,
+    # external_version) so a dead-lettered item's key lines up with the live signal's.
     if not isinstance(item, dict):
         return None
-    org, src, ext, ver = (
+    org, integ, src, ext, ver = (
         item.get("org_id"),
+        item.get("integration_id"),
         item.get("source"),
         item.get("external_id"),
         item.get("external_version"),
     )
-    if org and src and ext is not None and ver is not None:
-        return f"{org}:{src}:{ext}:{ver}"
+    if org and integ and src and ext is not None and ver is not None:
+        return f"{org}:{integ}:{src}:{ext}:{ver}"
     return None
 
 

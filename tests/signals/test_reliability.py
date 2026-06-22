@@ -74,6 +74,61 @@ async def test_transport_retries_429_then_succeeds():
     assert calls["n"] == 2
 
 
+async def test_transport_self_heals_on_401():
+    # 401 -> force a token refresh (on_auth_failure) and retry ONCE with the fresh token.
+    calls = {"n": 0, "invalidated": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(401, text="unauthorized")
+        return httpx.Response(200, json={"ok": True})
+
+    tokens = iter(["stale", "fresh"])
+
+    async def token() -> str:
+        return next(tokens)
+
+    def on_auth_failure() -> None:
+        calls["invalidated"] += 1
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = GoogleTransport(token, on_auth_failure=on_auth_failure, policy=FAST, client=client)
+    result = await transport.request("GET", "https://example.test/x")
+    await transport.aclose()
+
+    assert result == {"ok": True}
+    assert calls["n"] == 2 and calls["invalidated"] == 1  # refreshed + retried exactly once
+
+
+async def test_transport_401_without_hook_raises():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="no")
+
+    async def token() -> str:
+        return "t"
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = GoogleTransport(token, policy=FAST, client=client)
+    with pytest.raises(GoogleAPIError) as e:
+        await transport.request("GET", "https://example.test/x")
+    await transport.aclose()
+    assert e.value.status == 401
+
+
+def test_parse_retry_after_handles_seconds_and_http_date():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    from navis.signals.google.transport import _parse_retry_after
+
+    assert _parse_retry_after("30") == 30.0
+    assert _parse_retry_after(None) is None
+    future = datetime.now(timezone.utc) + timedelta(seconds=120)
+    secs = _parse_retry_after(format_datetime(future))  # RFC 7231 HTTP-date form
+    assert secs is not None and 100 <= secs <= 121
+
+
 # ---- Token refresh ----
 
 async def test_token_refreshes_when_expired():
@@ -155,3 +210,42 @@ async def test_idempotent_resync_yields_duplicates_not_dupes():
     assert first.ingested == 2
     assert second.ingested == 0  # replaying the same facts ingests nothing new
     assert second.duplicates == 2
+
+
+async def test_batch_path_ingests_whole_chunk_in_one_call():
+    # No poison -> the fast batch path handles the whole chunk (one ingest_many call).
+    ctx = make_ctx()
+    events = [_ev(ctx, f"e{i}") for i in range(5)]
+    ingestion = FakeIngestion()
+    calls = {"many": 0, "one": 0}
+    orig_many, orig_one = ingestion.ingest_many, ingestion.ingest
+
+    async def many(evs):
+        calls["many"] += 1
+        return await orig_many(evs)
+
+    async def one(ev):
+        calls["one"] += 1
+        return await orig_one(ev)
+
+    ingestion.ingest_many, ingestion.ingest = many, one  # type: ignore[method-assign]
+    outcome = await SignalSyncService(ingestion=ingestion).sync(
+        ctx, _StubConnector(events), client=None, cursor=None
+    )
+    assert outcome.ingested == 5
+    assert calls["many"] == 1 and calls["one"] == 0  # single batch call, no per-event path
+
+
+async def test_batch_failure_falls_back_per_event_and_isolates_poison():
+    # A poison row aborts the batch -> fall back to per-event; good events still flow,
+    # poison is dead-lettered. (FakeIngestion.ingest_many raises if any external_id poisons.)
+    ctx = make_ctx()
+    events = [_ev(ctx, "good1"), _ev(ctx, "poison"), _ev(ctx, "good2")]
+    ingestion = FakeIngestion(fail_on={"poison"})
+    dlq = FakeDLQ()
+    outcome = await SignalSyncService(ingestion=ingestion, dlq=dlq).sync(
+        ctx, _StubConnector(events), client=None, cursor=None
+    )
+    assert outcome.ingested == 2
+    assert outcome.dead_lettered == 1
+    assert {e.external_id for e in ingestion.ingested} == {"good1", "good2"}

@@ -1,10 +1,12 @@
-"""P0-2: Gmail watch state — fields, expiry math, and restart recovery."""
+"""P0-2: Gmail watch state — fields, expiry math, malformed-response guard, restart recovery."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from navis.signals.base import SignalSource, SyncResult, WorkspaceConnector
-from navis.signals.gmail.watch import build_watch_state, is_watch_expiring
+from navis.signals.gmail.watch import WatchStateError, build_watch_state, is_watch_expiring
 from navis.signals.reliability.watch_recovery import WatchRecoveryService
 from tests.signals.fakes import make_ctx
 
@@ -18,6 +20,14 @@ def test_build_watch_state_captures_all_fields():
     assert state["expires_at"] is not None  # parsed expiration
     assert state["renewed_at"] == NOW.isoformat()
     assert state["topic"] == "projects/x/topics/gmail"
+
+
+def test_build_watch_state_rejects_missing_history_id():
+    # A malformed watch response must fail LOUD, not persist a watch that can never sync.
+    with pytest.raises(WatchStateError):
+        build_watch_state({"expiration": "1781000000000"}, topic="t", now=NOW)
+    with pytest.raises(WatchStateError):
+        build_watch_state({"historyId": None, "expiration": "1781000000000"}, topic="t", now=NOW)
 
 
 def test_is_watch_expiring():

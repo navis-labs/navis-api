@@ -101,11 +101,109 @@ async def test_dead_letter_table_and_replay(db):
     assert all(r.id != row.id for r in await dlq.list_unresolved(org_id))
 
 
+def _ev(ctx, *, ext, ts=None):
+    from datetime import datetime, timezone
+
+    from navis.signals.base import SignalEvent, SignalEventType, SignalSource
+
+    return SignalEvent.create(
+        ctx, source=SignalSource.GMAIL, event_type=SignalEventType.EMAIL_RECEIVED,
+        external_id=ext, external_version="1",
+        timestamp=ts or datetime(2026, 6, 1, 10, 0, 0, tzinfo=timezone.utc),
+    )
+
+
+async def test_batch_insert_is_idempotent_and_dedupes_intra_batch(db):
+    from navis.signals.base import SignalContext
+    from navis.signals.repository import SignalRepository
+
+    org_id, user_id, integ_id = await _seed_tenant(db)
+    ctx = SignalContext(org_id=org_id, user_id=user_id, integration_id=integ_id)
+    evs = [_ev(ctx, ext=f"b{i}") for i in range(3)]
+    repo = SignalRepository(db)
+    assert await repo.insert_many_idempotent(evs + [evs[0]]) == 3  # intra-batch dup ignored
+    assert await repo.insert_many_idempotent(evs) == 0             # fully idempotent re-run
+
+
+async def test_replay_order_is_stable_and_keyset_resumable(db):
+    from datetime import datetime, timezone
+
+    from navis.signals.base import SignalContext
+    from navis.signals.repository import SignalRepository
+
+    org_id, user_id, integ_id = await _seed_tenant(db)
+    ctx = SignalContext(org_id=org_id, user_id=user_id, integration_id=integ_id)
+    t = datetime(2026, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
+    repo = SignalRepository(db)
+    # two events share the SAME occurred_at — the (occurred_at, id) order must be stable.
+    await repo.insert_many_idempotent([_ev(ctx, ext="s0", ts=t), _ev(ctx, ext="s1", ts=t),
+                                       _ev(ctx, ext="s2")])
+    first = [r.id for r in await repo.for_replay(org_id)]
+    second = [r.id for r in await repo.for_replay(org_id)]
+    assert first == second                      # deterministic across reads
+    # keyset cursor: page 2 resumes after page 1 with no overlap.
+    p1 = await repo.for_replay(org_id, limit=2)
+    p2 = await repo.for_replay(org_id, after=(p1[-1].occurred_at, p1[-1].id), limit=2)
+    assert not ({r.id for r in p1} & {r.id for r in p2})
+    streamed = [r.id async for r in repo.stream_replay(org_id, batch_size=2)]
+    assert streamed == first                     # streaming yields the same total order
+
+
+async def test_dlq_purge_resolved_keeps_unresolved(db):
+    from datetime import datetime, timedelta, timezone
+
+    from navis.signals.repository import DeadLetterRepository
+
+    org_id, _, _ = await _seed_tenant(db)
+    dlq = DeadLetterRepository(db)
+    r1 = await dlq.record(stage="ingest", error="e", org_id=org_id)
+    r2 = await dlq.record(stage="ingest", error="e", org_id=org_id)
+    await db.flush()
+    r1_id, r2_id = r1.id, r2.id
+    await dlq.mark_replayed([r1_id], resolved=True)   # r1 resolved, r2 not
+    purged = await dlq.purge_resolved(before=datetime.now(timezone.utc) + timedelta(minutes=1))
+    assert purged == 1
+    remaining = {r.id for r in await dlq.list_unresolved(org_id)}
+    assert r2_id in remaining and r1_id not in remaining
+
+
+async def test_outbox_staged_in_txn_then_relay_publishes(db):
+    from sqlalchemy import select
+
+    from navis.signals.base import SignalContext, SignalEvent, SignalEventType, SignalSource
+    from navis.signals.models import SignalOutbox
+    from navis.signals.outbox import relay_signals_pass
+    from navis.signals.repository import SignalRepository
+    from navis.signals.service import SignalIngestionService
+
+    org_id, user_id, integ_id = await _seed_tenant(db)
+    ctx = SignalContext(org_id=org_id, user_id=user_id, integration_id=integ_id)
+    ev = SignalEvent.create(
+        ctx, source=SignalSource.CALENDAR,
+        event_type=SignalEventType.CALENDAR_EVENT_CANCELLED, external_id="cx", external_version="1",
+    )
+    await SignalIngestionService(db).ingest(ev)
+
+    # Outbox row staged (same txn) — unpublished, routed by event_type, carries lineage.
+    row = (await db.scalars(select(SignalOutbox).where(SignalOutbox.aggregate_id == ev.event_id))).one()
+    assert row.published_at is None
+    assert row.event_type == "CalendarEventCancelled"   # NOT CalendarEventCreated (Issue A)
+    assert row.payload["schema_version"] == ev.schema_version
+    assert row.payload["captured_at"]                   # lineage (Issue E)
+
+    # Relay publishes pending rows and marks them published (at-least-once).
+    assert await relay_signals_pass(SignalRepository(db)) >= 1
+    published_at = await db.scalar(
+        select(SignalOutbox.published_at).where(SignalOutbox.id == row.id)
+    )
+    assert published_at is not None
+
+
 async def test_advisory_lock_blocks_second_holder(db):
-    from navis.signals.locking import integration_lock_key, try_advisory_lock
+    from navis.signals.locking import integration_lock_key, try_advisory_xact_lock
 
     _, _, integ_id = await _seed_tenant(db)
     key = integration_lock_key(integ_id)
-    assert await try_advisory_lock(db, key) is True
+    assert await try_advisory_xact_lock(db, key) is True
     # Same connection re-acquires (advisory locks are re-entrant per session);
     # a true cross-session test would need a second connection — exercised in CI.

@@ -28,6 +28,14 @@ class FakeDLQRepo:
     async def mark_replayed(self, ids, *, resolved):
         self.replayed.extend(ids)
 
+    async def record_replay_failure(self, dlq_id, *, error, max_attempts):
+        for row in self._unresolved:
+            if row.id == dlq_id:
+                row.attempts = getattr(row, "attempts", 0) + 1
+                row.last_error = error
+                return row.attempts >= max_attempts
+        return False
+
 
 def _event(ctx, ext="m1"):
     return SignalEvent.create(

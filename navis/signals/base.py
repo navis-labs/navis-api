@@ -6,9 +6,16 @@ reality and nothing else — no Memory/State/Reasoning/LLM/business logic here.
 
 Idempotency model
 -----------------
-Dedup identity is ``(org_id, source, external_id, external_version)``. The
-``event_id`` is a deterministic UUIDv5 of that tuple, so re-capturing the same
+Dedup identity is ``(org_id, integration_id, source, external_id, external_version)``.
+The ``event_id`` is a deterministic UUIDv5 of that tuple, so re-capturing the same
 fact yields the same id — safe to replay, safe to retry.
+
+``integration_id`` is in the identity because a provider's ``external_id`` is only
+unique WITHIN one connected account, not across an org. Google Drive file ids and
+Calendar event ids are global — a file/meeting shared between two colleagues has the
+SAME external_id in both accounts — so an org-only identity would collapse the two
+observations into one and silently drop the second person's edge from the graph. Keying
+on the observing integration makes each account's capture its own fact.
 """
 from __future__ import annotations
 
@@ -21,6 +28,11 @@ from typing import Any
 
 # Fixed namespace so event_id is stable across processes/replays.
 _EVENT_NAMESPACE = uuid.UUID("6f3c2d1a-9b4e-5c7a-8d2f-1e0a3b6c9d22")
+
+# Bump on a NON-additive change to the SignalEvent wire/storage shape. Stamped on every
+# event so consumers and from_dict() can branch by version for safe long-horizon replay
+# (a 3-year-old DLQ row may predate fields added later). Additive fields don't need a bump.
+SIGNAL_SCHEMA_VERSION = 1
 
 
 class SignalSource(str, enum.Enum):
@@ -97,17 +109,28 @@ class SignalEvent:
     timestamp: datetime
     payload: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # When the fact was OBSERVED/captured — distinct from `timestamp` (when it happened)
+    # and from the row's created_at (when it was persisted). Defaults to capture time in
+    # create(); for legacy events it falls back to `timestamp`. NOT part of the dedupe key.
+    captured_at: datetime | None = None
+    # Event-schema version (see SIGNAL_SCHEMA_VERSION). NOT part of the dedupe key, so the
+    # deterministic event_id is unaffected by schema evolution.
+    schema_version: int = SIGNAL_SCHEMA_VERSION
 
     @staticmethod
     def make_dedupe_key(
-        org_id: uuid.UUID, source: SignalSource, external_id: str, external_version: str
+        org_id: uuid.UUID,
+        integration_id: uuid.UUID,
+        source: SignalSource,
+        external_id: str,
+        external_version: str,
     ) -> str:
-        return f"{org_id}:{source.value}:{external_id}:{external_version}"
+        return f"{org_id}:{integration_id}:{source.value}:{external_id}:{external_version}"
 
     @property
     def dedupe_key(self) -> str:
         return self.make_dedupe_key(
-            self.org_id, self.source, self.external_id, self.external_version
+            self.org_id, self.integration_id, self.source, self.external_id, self.external_version
         )
 
     @classmethod
@@ -129,7 +152,9 @@ class SignalEvent:
         if external_version in (None, ""):
             raise SignalValidationError("signal missing external_version (version-aware)")
 
-        dedupe = cls.make_dedupe_key(ctx.org_id, source, external_id, str(external_version))
+        dedupe = cls.make_dedupe_key(
+            ctx.org_id, ctx.integration_id, source, external_id, str(external_version)
+        )
         return cls(
             event_id=uuid.uuid5(_EVENT_NAMESPACE, dedupe),
             org_id=ctx.org_id,
@@ -142,6 +167,8 @@ class SignalEvent:
             timestamp=timestamp or datetime.now(timezone.utc),
             payload=payload or {},
             metadata=metadata or {},
+            captured_at=datetime.now(timezone.utc),
+            schema_version=SIGNAL_SCHEMA_VERSION,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -155,6 +182,8 @@ class SignalEvent:
             "external_id": self.external_id,
             "external_version": self.external_version,
             "timestamp": self.timestamp.isoformat(),
+            "captured_at": (self.captured_at or self.timestamp).isoformat(),
+            "schema_version": self.schema_version,
             "payload": self.payload,
             "metadata": self.metadata,
         }
@@ -172,6 +201,14 @@ class SignalEvent:
             external_id=data["external_id"],
             external_version=data["external_version"],
             timestamp=datetime.fromisoformat(data["timestamp"]),
+            # Backward compatible: legacy rows have neither field. captured_at falls back to
+            # the occurrence time (closest available); schema_version defaults to v1.
+            captured_at=(
+                datetime.fromisoformat(data["captured_at"])
+                if data.get("captured_at")
+                else datetime.fromisoformat(data["timestamp"])
+            ),
+            schema_version=int(data.get("schema_version", SIGNAL_SCHEMA_VERSION)),
             payload=data.get("payload") or {},
             metadata=data.get("metadata") or {},
         )

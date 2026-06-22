@@ -9,7 +9,11 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from navis.signals.google.transport import GoogleTransport
+from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import metrics
+from navis.signals.google.transport import GoogleAPIError, GoogleTransport
+
+logger = get_logger("signals.gmail.client")
 
 _BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 
@@ -49,14 +53,28 @@ class GmailClient:
         )
 
     async def get_messages(self, message_ids: list[str]) -> list[dict[str, Any]]:
-        """Fetch many messages with bounded concurrency."""
+        """Fetch many messages with bounded concurrency.
+
+        A message can be deleted between history.list and message.get; that 404 is
+        terminal for THAT message and is skipped so it can't sink the whole batch and
+        wedge the cursor (the pass would retry the same dead id forever). Any OTHER error
+        (transient 5xx, 429, auth) is re-raised so the pass fails + retries with no silent
+        loss — the cursor only advances when every live message was actually captured."""
         sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
 
-        async def _one(mid: str) -> dict[str, Any]:
+        async def _one(mid: str) -> dict[str, Any] | None:
             async with sem:
-                return await self.get_message(mid)
+                try:
+                    return await self.get_message(mid)
+                except GoogleAPIError as exc:
+                    if exc.is_not_found:
+                        metrics.incr("gmail.fetch.message_gone")
+                        logger.info("gmail message %s gone before fetch; skipping", mid)
+                        return None
+                    raise
 
-        return await asyncio.gather(*(_one(mid) for mid in message_ids))
+        results = await asyncio.gather(*(_one(mid) for mid in message_ids))
+        return [r for r in results if r is not None]
 
     async def watch(self, topic_name: str, label_ids: list[str] | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {"topicName": topic_name}

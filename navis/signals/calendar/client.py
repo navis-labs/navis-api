@@ -18,6 +18,10 @@ class CalendarClient:
         self._t = transport
         self._cal = calendar_id
 
+    @property
+    def calendar_id(self) -> str:
+        return self._cal
+
     async def list_events(
         self,
         *,

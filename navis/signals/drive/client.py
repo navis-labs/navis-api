@@ -12,12 +12,20 @@ from navis.signals.google.transport import GoogleTransport
 
 _BASE = "https://www.googleapis.com/drive/v3"
 
-# Fields kept deliberately rich so consumers never need a second round-trip.
+# Data-minimized fields: `version` (monotonic revision id — collision-free, unlike a
+# timestamp), `driveId` (shared-drive lineage), owner EMAIL only. We deliberately do NOT
+# fetch owner displayName or webViewLink — bulk PII / a sensitive URL that no consumer needs
+# and that must not live forever in the append-only log.
 _FILE_FIELDS = (
-    "id,name,mimeType,parents,trashed,createdTime,modifiedTime,"
-    "owners(emailAddress,displayName),shared,webViewLink"
+    "id,name,mimeType,parents,trashed,createdTime,modifiedTime,version,driveId,"
+    "owners(emailAddress),shared"
 )
-_CHANGE_FIELDS = f"newStartPageToken,nextPageToken,changes(changeType,removed,fileId,file({_FILE_FIELDS}))"
+_CHANGE_FIELDS = (
+    f"newStartPageToken,nextPageToken,changes(changeType,removed,fileId,driveId,file({_FILE_FIELDS}))"
+)
+# Shared-drive visibility (enterprise): without these, ONLY the user's My Drive is seen —
+# Team/Shared Drives (where org collaboration lives) would be invisible.
+_ALL_DRIVES = {"supportsAllDrives": True, "includeItemsFromAllDrives": True}
 
 
 class DriveClient:
@@ -25,7 +33,9 @@ class DriveClient:
         self._t = transport
 
     async def get_start_page_token(self) -> dict[str, Any]:
-        return await self._t.request("GET", f"{_BASE}/changes/startPageToken")
+        return await self._t.request(
+            "GET", f"{_BASE}/changes/startPageToken", params={"supportsAllDrives": True}
+        )
 
     async def list_changes(
         self, page_token: str, *, page_size: int = 100
@@ -38,6 +48,7 @@ class DriveClient:
                 "pageSize": page_size,
                 "includeRemoved": True,
                 "fields": _CHANGE_FIELDS,
+                **_ALL_DRIVES,
             },
         )
 
@@ -46,6 +57,7 @@ class DriveClient:
             "pageSize": page_size,
             "fields": f"nextPageToken,files({_FILE_FIELDS})",
             "q": "trashed = false",
+            **_ALL_DRIVES,
         }
         if page_token:
             params["pageToken"] = page_token
@@ -55,7 +67,7 @@ class DriveClient:
         return await self._t.request(
             "POST",
             f"{_BASE}/changes/watch",
-            params={"pageToken": page_token},
+            params={"pageToken": page_token, **_ALL_DRIVES},
             json={"id": channel_id, "type": "web_hook", "address": address},
         )
 

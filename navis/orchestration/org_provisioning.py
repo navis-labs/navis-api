@@ -37,8 +37,12 @@ async def _advance(org_id, stage: OnboardingStage) -> None:
 
 @subscribe(EventType.GMAIL_RECEIVED)
 @subscribe(EventType.CALENDAR_EVENT_CREATED)
+@subscribe(EventType.CALENDAR_EVENT_UPDATED)
+@subscribe(EventType.CALENDAR_EVENT_CANCELLED)
 @subscribe(EventType.SIGNAL_INGESTED)
 async def on_first_signal(event: DomainEvent) -> None:
+    # Any first signal advances the funnel — now that calendar events route to distinct
+    # types (event-type routing fix), subscribe to all of them so the milestone still fires.
     await _advance(event.org_id, OnboardingStage.FIRST_SIGNAL)
 
 

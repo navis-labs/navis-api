@@ -43,6 +43,21 @@ def test_unverified_email_rejected():
         verify_claims(c, audience=AUD, sa_email=SA)
 
 
+def test_subject_pinning():
+    # `sub` is Google's stable canonical identity — pin on it when configured.
+    c = _valid_claims() | {"sub": "100200300"}
+    verify_claims(c, audience=AUD, sa_email=SA, expected_sub="100200300")  # match -> ok
+    with pytest.raises(PubSubAuthError) as e:
+        verify_claims(c, audience=AUD, sa_email=SA, expected_sub="999")     # mismatch -> reject
+    assert e.value.reason == "bad_subject"
+
+
+def test_failure_carries_reason_for_metrics():
+    with pytest.raises(PubSubAuthError) as e:
+        verify_claims(_valid_claims() | {"iss": "evil.com"}, audience=AUD, sa_email=SA)
+    assert e.value.reason == "bad_issuer"
+
+
 def test_request_missing_bearer_rejected():
     with pytest.raises(PubSubAuthError):
         verify_pubsub_request(None, audience=AUD, sa_email=SA, decoder=lambda t, a: _valid_claims())

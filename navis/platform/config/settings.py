@@ -56,6 +56,33 @@ class Settings(BaseSettings):
     # exported env var first (prod secret managers / tests). Empty => passthrough.
     field_encryption_keys: str | None = None  # FieldCipher — SSO secrets, sensitive fields
     signals_token_keys: str | None = None     # TokenCipher — integration OAuth tokens
+    # Sunset switch (SIGNAL-CRYPTO-002): once every token is confirmed encrypted, flip this
+    # to reject untagged legacy-plaintext tokens on read instead of trusting them forever.
+    signals_reject_legacy_plaintext: bool = False
+    # Ingestion batching — one multi-row insert + one commit + one publish-fan-out per
+    # chunk (vs per-event). On a batch failure the sync engine falls back to per-event so a
+    # single poison event can't sink the chunk. sync_timeout bounds a hung connector.
+    signals_ingest_batch_size: int = 500
+    signals_sync_timeout_seconds: float = 120.0
+    # DLQ replay: after N failed re-ingestion attempts a poison item is permanently
+    # dead-lettered (resolved) instead of retried forever — the poison-loop guard.
+    signals_dlq_max_replay_attempts: int = 5
+    # Outbox retention: published pointer rows older than this are purged (bounds growth).
+    signals_outbox_retention_seconds: int = 7 * 24 * 60 * 60
+    # Calendar capture: how far back a full sync reaches (future events are unbounded), and
+    # the page-drain safety cap (exceeding it fails LOUD/retryable, never silently truncates).
+    calendar_full_sync_window_days: int = 60
+    calendar_max_sync_pages: int = 1000  # 1000 * 250 = 250k events/sync before a hard stop
+    # Drive capture: onboarding backfill cap (observable when hit — never silent) + the
+    # change-feed page-drain safety cap (exceeding it fails LOUD/retryable, never stalls).
+    drive_onboard_file_cap: int = 2000
+    drive_max_sync_pages: int = 1000
+    # Gmail capture: onboarding backfill cap (observable when hit) + the history-drain
+    # page-safety cap. Exceeding the history cap fails LOUD/retryable and does NOT advance
+    # the cursor — silently stopping mid-drain would skip messages forever (the cursor
+    # would jump past unread history pages).
+    gmail_onboard_message_cap: int = 500
+    gmail_max_history_pages: int = 200
 
     # ---- AI / ML ----
     openai_api_key: str | None = None

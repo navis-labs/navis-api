@@ -20,6 +20,8 @@ class EventType(str, Enum):
     # Layer 1 — Signals
     GMAIL_RECEIVED = "GmailReceived"
     CALENDAR_EVENT_CREATED = "CalendarEventCreated"
+    CALENDAR_EVENT_UPDATED = "CalendarEventUpdated"
+    CALENDAR_EVENT_CANCELLED = "CalendarEventCancelled"
     MEETING_COMPLETED = "MeetingCompleted"
     SLACK_MESSAGE_RECEIVED = "SlackMessageReceived"
     SIGNAL_INGESTED = "SignalIngested"

@@ -9,7 +9,7 @@ from navis.signals.locking import (
     LocalLockRegistry,
     integration_advisory_lock,
     integration_lock_key,
-    try_advisory_lock,
+    try_advisory_xact_lock,
 )
 
 
@@ -39,23 +39,24 @@ class _FakeSession:
 
     async def execute(self, stmt, params=None):
         text = str(stmt)
-        if "pg_try_advisory_lock" in text:
+        if "pg_try_advisory_xact_lock" in text:
             return _FakeResult(self.lock_result)
         if "pg_advisory_unlock" in text:
-            self.unlocked = True
+            self.unlocked = True  # should NEVER fire — xact locks auto-release
         return _FakeResult(None)
 
 
-async def test_try_advisory_lock_returns_acquisition_result():
-    assert await try_advisory_lock(_FakeSession(True), 123) is True
-    assert await try_advisory_lock(_FakeSession(False), 123) is False
+async def test_try_advisory_xact_lock_returns_acquisition_result():
+    assert await try_advisory_xact_lock(_FakeSession(True), 123) is True
+    assert await try_advisory_xact_lock(_FakeSession(False), 123) is False
 
 
-async def test_advisory_lock_context_unlocks_when_acquired():
+async def test_advisory_lock_context_acquires_without_explicit_unlock():
     db = _FakeSession(True)
     async with integration_advisory_lock(db, uuid.uuid4()) as acquired:
         assert acquired is True
-    assert db.unlocked is True  # lock released on exit
+    # Transaction-scoped: released by the enclosing txn commit/rollback, NOT an unlock call.
+    assert db.unlocked is False
 
 
 async def test_advisory_lock_context_skips_when_held_elsewhere():

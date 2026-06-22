@@ -31,9 +31,21 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/drive.metadata.readonly",
 ]
+# Bumped whenever GOOGLE_SCOPES changes. Persisted with the integration at consent so a
+# later feature that needs a NEW scope can detect "connected under an older scope set" and
+# trigger re-consent, instead of assuming access it doesn't actually have.
+GOOGLE_SCOPE_VERSION = "v1"
 
 # Refresh this many seconds before the token actually expires.
 _REFRESH_SKEW_SECONDS = 120
+
+
+class ReconsentRequired(PermissionError):
+    """The refresh token is gone or rejected (invalid_grant) — user revoked access, changed
+    password, admin revoked the app, or the token was rotated out. NOT retryable: the only
+    recovery is a fresh OAuth consent. Subclasses PermissionError for backward compatibility
+    with any caller already catching that; new callers catch this specifically to surface a
+    re-consent prompt / emit a TOKEN_REVOKED audit event."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +53,9 @@ class GoogleToken:
     access_token: str
     expires_at: datetime
     refreshed: bool  # True if this call obtained a new token (caller should persist)
+    # Google MAY rotate the refresh token on a refresh response; when it does this carries
+    # the NEW one so the caller persists it. None means "unchanged — keep the stored one".
+    refresh_token: str | None = None
 
 
 def authorization_url(state: str, redirect_uri: str | None = None) -> str:
@@ -90,6 +105,16 @@ async def refresh_access_token(refresh_token: str) -> dict:
                 "grant_type": "refresh_token",
             },
         )
+        # invalid_grant comes back as HTTP 400 with {"error":"invalid_grant"}. It is terminal
+        # (revoked/expired/rotated-out) — surface it as ReconsentRequired so the caller stops
+        # retrying and prompts re-consent, instead of treating it as a generic 4xx.
+        if resp.status_code == 400:
+            try:
+                err = resp.json().get("error")
+            except ValueError:
+                err = None
+            if err == "invalid_grant":
+                raise ReconsentRequired("google refresh rejected (invalid_grant)")
         resp.raise_for_status()
         return resp.json()
 
@@ -111,8 +136,19 @@ class TokenManager:
         self._refresher = refresher or refresh_access_token
         # Last token resolved this session — orchestration persists it if refreshed.
         self.last_token: GoogleToken | None = None
+        # Set by invalidate() (on a 401) to force the next get_token to refresh even if the
+        # local expiry says the token is still valid — the server rejected it anyway.
+        self._force_refresh = False
+
+    def invalidate(self) -> None:
+        """Mark the current access token as rejected; the next get_token will refresh. Called
+        by the transport on a 401 so a revoked/skewed token self-heals on retry."""
+        self._force_refresh = True
+        self.last_token = None
 
     def _is_expired(self) -> bool:
+        if self._force_refresh:
+            return True
         exp = getattr(self.integration, "token_expires_at", None)
         if exp is None:
             return True
@@ -125,7 +161,7 @@ class TokenManager:
 
         if not self._is_expired() and self.integration.access_token:
             token = GoogleToken(
-                access_token=token_cipher.decrypt(self.integration.access_token),
+                access_token=token_cipher.decrypt(self.integration.access_token) or "",
                 expires_at=self.integration.token_expires_at,
                 refreshed=False,
             )
@@ -134,13 +170,21 @@ class TokenManager:
 
         refresh_token = token_cipher.decrypt(getattr(self.integration, "refresh_token", None))
         if not refresh_token:
-            raise PermissionError("integration has no refresh_token; re-consent required")
+            raise ReconsentRequired("integration has no refresh_token")
 
         data = await self._refresher(refresh_token)
         access = data["access_token"]
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(data.get("expires_in", 3600)))
-        logger.info("refreshed google token for integration=%s", getattr(self.integration, "id", "?"))
-        token = GoogleToken(access_token=access, expires_at=expires_at, refreshed=True)
+        # Persist a rotated refresh token if Google returned one; otherwise keep the old one.
+        rotated = data.get("refresh_token") or None
+        logger.info(
+            "refreshed google token for integration=%s rotated=%s",
+            getattr(self.integration, "id", "?"), bool(rotated),
+        )
+        token = GoogleToken(
+            access_token=access, expires_at=expires_at, refreshed=True, refresh_token=rotated
+        )
+        self._force_refresh = False  # satisfied — the refreshed token is now current
         self.last_token = token
         return token
 

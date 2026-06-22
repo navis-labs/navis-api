@@ -10,16 +10,19 @@ cursors. The engine is the seam.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from navis.platform.config import settings
 from navis.platform.monitoring import get_logger
 from navis.signals.base import (
     SignalContext,
     SignalEvent,
     SignalSource,
+    SyncResult,
     WorkspaceConnector,
 )
 from navis.signals.meet.deriver import derive_meeting_events
@@ -47,8 +50,14 @@ class SignalSyncService:
         ingestion: Any = None,
         dlq: DeadLetterQueue | None = None,
     ) -> None:
-        # `ingestion` is injectable for tests; otherwise built from the session.
-        self.ingestion = ingestion or SignalIngestionService(db)
+        # `ingestion` is injectable for tests; otherwise built from the session. One of the
+        # two MUST be provided — a real ingestion service can't exist without a db session.
+        if ingestion is not None:
+            self.ingestion = ingestion
+        elif db is not None:
+            self.ingestion = SignalIngestionService(db)
+        else:
+            raise ValueError("SignalSyncService requires either `ingestion` or a `db` session")
         # Prefer a PostgreSQL-backed DLQ (source of truth) when we have a session.
         if dlq is not None:
             self.dlq = dlq
@@ -68,19 +77,23 @@ class SignalSyncService:
     ) -> SyncOutcome:
         """Run incremental if we have a cursor, else full. Recover to full on demand."""
         cursor = cursor or {}
-        try:
+
+        async def _fetch() -> tuple[SyncResult, bool]:
             if cursor:
-                result = await connector.incremental_sync(ctx, client, cursor)
-                if result.full_resync_required:
+                res = await connector.incremental_sync(ctx, client, cursor)
+                if res.full_resync_required:
                     logger.info("full resync for %s org=%s", connector.source.value, ctx.org_id)
-                    result = await connector.full_sync(ctx, client)
-                    full = True
-                else:
-                    full = False
-            else:
-                result = await connector.full_sync(ctx, client)
-                full = True
-        except Exception as exc:  # connector/transport already retried — this is terminal
+                    return await connector.full_sync(ctx, client), True
+                return res, False
+            return await connector.full_sync(ctx, client), True
+
+        try:
+            # Bound a hung/slow connector (SIGNAL-004) so it can't pin a worker forever; a
+            # timeout surfaces as a terminal fetch failure -> DLQ + cursor unchanged (retried).
+            result, full = await asyncio.wait_for(
+                _fetch(), timeout=settings.signals_sync_timeout_seconds
+            )
+        except Exception as exc:  # connector/transport already retried (or timed out) — terminal
             await self.dlq.send(
                 stage="fetch",
                 error=exc,
@@ -115,7 +128,34 @@ class SignalSyncService:
         self, ctx: SignalContext, source: SignalSource, events: list[SignalEvent]
     ) -> SyncOutcome:
         outcome = SyncOutcome()
-        for event in events:
+        # Deterministic total order (occurred_at, event_id) BEFORE persisting — connector
+        # events and derived Meet events can share a timestamp; a stable order makes the
+        # ingest sequence (and DLQ ordering) reproducible across re-runs (replay reads in
+        # the same order). The event_id tiebreak is deterministic but not causal — a true
+        # causal sequence would need a per-sync sequence number (future).
+        ordered = sorted(events, key=lambda e: (e.timestamp, e.event_id))
+        batch_size = max(1, settings.signals_ingest_batch_size)
+        for start in range(0, len(ordered), batch_size):
+            chunk = ordered[start : start + batch_size]
+            try:
+                # FAST PATH: one multi-row insert + one commit + publish only the new ones.
+                inserted, duplicates = await self.ingestion.ingest_many(chunk)
+                outcome.ingested += inserted
+                outcome.duplicates += duplicates
+            except Exception:
+                # A poison row aborts the whole batch — drop to per-event so one bad event
+                # can't sink the rest of the chunk (poison isolated to the DLQ).
+                logger.warning(
+                    "batch ingest failed source=%s org=%s; falling back per-event",
+                    source.value, ctx.org_id,
+                )
+                await self._ingest_one_by_one(ctx, source, chunk, outcome)
+        return outcome
+
+    async def _ingest_one_by_one(
+        self, ctx: SignalContext, source: SignalSource, chunk: list[SignalEvent], outcome: SyncOutcome
+    ) -> None:
+        for event in chunk:
             try:
                 inserted = await self.ingestion.ingest(event)
                 if inserted:
@@ -130,4 +170,3 @@ class SignalSyncService:
                     context={"source": source.value, "org_id": str(ctx.org_id)},
                     item=event.to_dict(),
                 )
-        return outcome

@@ -64,6 +64,16 @@ celery_app.conf.beat_schedule = {
         "task": "navis.execution.worker.relay_execution_outbox",
         "schedule": 15,
     },
+    # Signals: relay the transactional outbox (staged pointer events) to the bus.
+    "relay-signal-outbox": {
+        "task": "navis.signals.outbox.relay_signal_outbox",
+        "schedule": 5,
+    },
+    # Signals: purge published outbox rows past the retention window (bounds growth).
+    "purge-signal-outbox": {
+        "task": "navis.signals.outbox.purge_signal_outbox",
+        "schedule": 60 * 60,  # hourly
+    },
     # Recover orphaned EXECUTING requests (dead workers).
     "recover-stale-executions": {
         "task": "navis.execution.worker.recover_stale_executions",

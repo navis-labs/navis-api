@@ -30,6 +30,23 @@ class FakeIngestion:
         self.ingested.append(event)
         return True
 
+    async def ingest_many(self, events: list[SignalEvent]) -> tuple[int, int]:
+        # Mirror an atomic batch insert: a poison row aborts the WHOLE batch (nothing
+        # persisted) so the sync engine falls back to per-event isolation.
+        if any(e.external_id in self.fail_on for e in events):
+            raise RuntimeError("poison in batch")
+        inserted = duplicates = 0
+        batch_seen: set[str] = set()
+        for e in events:
+            if e.dedupe_key in self.seen or e.dedupe_key in batch_seen:
+                duplicates += 1
+                continue
+            batch_seen.add(e.dedupe_key)
+            self.seen.add(e.dedupe_key)
+            self.ingested.append(e)
+            inserted += 1
+        return inserted, duplicates
+
 
 class FakeDLQ:
     def __init__(self) -> None:

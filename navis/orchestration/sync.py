@@ -59,7 +59,9 @@ def _build_client(integration: Integration):
         return None, None, None
     connector, client_factory = entry
     token_manager = TokenManager(integration)
-    transport = GoogleTransport(token_manager.token_provider())
+    transport = GoogleTransport(
+        token_manager.token_provider(), on_auth_failure=token_manager.invalidate
+    )
     client = client_factory(transport)
     return connector, client, (transport, token_manager)
 
@@ -102,6 +104,12 @@ async def sync_integration(integration: Integration) -> dict:
                             token_manager.last_token.access_token
                         )
                         fresh.token_expires_at = token_manager.last_token.expires_at
+                        # Google rotated the refresh token -> persist the NEW one, else the
+                        # next refresh uses a dead token and the integration silently breaks.
+                        if token_manager.last_token.refresh_token:
+                            fresh.refresh_token = token_cipher.encrypt(
+                                token_manager.last_token.refresh_token
+                            )
     finally:
         await transport.aclose()
 
