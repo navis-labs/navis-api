@@ -11,7 +11,7 @@ degrades to the Redis-only alert (legacy fallback) and logs loudly.
 from __future__ import annotations
 
 import uuid
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, cast
 
 from navis.platform.monitoring import get_logger
 
@@ -89,7 +89,12 @@ class DeadLetterQueue:
         try:
             from navis.platform.cache import redis_client
 
-            await redis_client.xadd(self.STREAM, fields, maxlen=100000, approximate=True)
+            # cast: redis-py types `fields` as an INVARIANT Dict[FieldT, EncodableT], so a
+            # plain dict[str, str] (whose values are perfectly encodable) won't structurally
+            # match. The cast documents that and silences the stub-only friction.
+            await redis_client.xadd(
+                self.STREAM, cast("dict[Any, Any]", fields), maxlen=100000, approximate=True
+            )
         except Exception:  # pragma: no cover - redis optional; alert is best-effort
             logger.debug("DLQ redis alert skipped (redis unavailable)")
 

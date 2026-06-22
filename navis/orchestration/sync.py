@@ -68,7 +68,7 @@ def _build_client(integration: Integration):
 
 async def sync_integration(integration: Integration) -> dict:
     connector, client, handles = _build_client(integration)
-    if connector is None:
+    if connector is None or handles is None:
         return {"skipped": integration.provider.value}
     transport, token_manager = handles
 
@@ -86,6 +86,9 @@ async def sync_integration(integration: Integration) -> dict:
                 fresh = await db.get(Integration, integration.id)
                 if fresh is None or not fresh.is_active:
                     return {"skipped": "inactive"}
+                if fresh.user_id is None:  # checked on the freshly-read row, not the stale arg
+                    logger.error("integration %s has no user_id; cannot emit tenant-safe signals", fresh.id)
+                    return {"error": "missing user_id"}
 
                 ctx = SignalContext(
                     org_id=fresh.organization_id, user_id=fresh.user_id, integration_id=fresh.id
@@ -134,7 +137,7 @@ async def ensure_watch_for_integration(integration: Integration) -> dict:
     from navis.signals.reliability import WatchRecoveryService
 
     connector, client, handles = _build_client(integration)
-    if connector is None or not integration.user_id:
+    if connector is None or handles is None or not integration.user_id:
         return {"skipped": True}
     transport, _ = handles
     ctx = SignalContext(integration.organization_id, integration.user_id, integration.id)
@@ -171,7 +174,9 @@ async def _dispatch_all() -> int:
         if not ids:
             break
         for iid in ids:
-            sync_one_integration.delay(str(iid))
+            celery_app.send_task(
+                "navis.orchestration.sync.sync_one_integration", args=[str(iid)]
+            )
         dispatched += len(ids)
         after = ids[-1]
         if len(ids) < page:
