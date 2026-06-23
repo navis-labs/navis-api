@@ -71,6 +71,26 @@ class SignalEventType(str, enum.Enum):
     MEETING_CREATED = "meeting.created"
     MEETING_UPDATED = "meeting.updated"
     MEETING_COMPLETED = "meeting.completed"
+    # Slack (Events API + backfill — same shape from both paths). Reality only: the verb
+    # that happened in the workspace, never an interpretation of it.
+    MESSAGE_SENT = "slack.message.sent"
+    MESSAGE_EDITED = "slack.message.edited"
+    MESSAGE_DELETED = "slack.message.deleted"
+    THREAD_REPLY = "slack.thread.reply"
+    REACTION_ADDED = "slack.reaction.added"
+    REACTION_REMOVED = "slack.reaction.removed"
+    CHANNEL_CREATED = "slack.channel.created"
+    CHANNEL_ARCHIVED = "slack.channel.archived"
+    CHANNEL_UNARCHIVED = "slack.channel.unarchived"
+    CHANNEL_RENAMED = "slack.channel.renamed"
+    FILE_SHARED = "slack.file.shared"
+    USER_JOINED_CHANNEL = "slack.user.joined_channel"
+    USER_LEFT_CHANNEL = "slack.user.left_channel"
+    APP_MENTION = "slack.app.mention"
+    # Identity snapshots (periodic) — replayable, PII-minimized reality of who/what exists,
+    # so message signals never have to denormalize names/emails into every row.
+    SLACK_USER_SNAPSHOT = "slack.user.snapshot"
+    SLACK_CHANNEL_SNAPSHOT = "slack.channel.snapshot"
 
 
 class SignalValidationError(ValueError):

@@ -83,6 +83,17 @@ class Settings(BaseSettings):
     # would jump past unread history pages).
     gmail_onboard_message_cap: int = 500
     gmail_max_history_pages: int = 200
+    # Slack capture: the signing secret verifies inbound Events API webhooks (HMAC-SHA256);
+    # the timestamp window rejects replayed captures. Backfill caps bound onboarding REST
+    # polling. Scope version anchors re-consent when the read-only scope set changes.
+    slack_signing_secret: str | None = None
+    # Optional rotation: comma-separated secrets, NEWEST first. Any one validating accepts the
+    # request, so a secret can be rotated with zero downtime. Falls back to the single secret.
+    slack_signing_secrets: str | None = None
+    slack_webhook_max_age_seconds: int = 300  # 5-min replay window per Slack guidance
+    slack_scope_version: str = "v1"
+    slack_backfill_message_cap: int = 1000
+    slack_backfill_max_pages: int = 100
 
     # ---- AI / ML ----
     openai_api_key: str | None = None

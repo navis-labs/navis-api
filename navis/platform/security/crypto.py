@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 
 from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import metrics
 
 logger = get_logger("platform.crypto")
 
@@ -45,13 +46,24 @@ class FieldCipher:
     def from_env(cls) -> "FieldCipher":
         # Real exported env var wins (prod secret managers); else fall back to settings,
         # which loads .env like the rest of config.
-        raw = os.environ.get(_ENV_VAR) or ""
-        if not raw:
-            from navis.platform.config import settings
-            raw = settings.field_encryption_keys or ""
+        from navis.platform.config import settings
+
+        raw = os.environ.get(_ENV_VAR) or settings.field_encryption_keys or ""
         keys = [k.strip() for k in raw.split(",") if k.strip()]
         if not keys:
-            logger.warning("%s not set; sensitive fields (e.g. SSO secrets) stored UNENCRYPTED", _ENV_VAR)
+            # CR-1 / SIGNAL-CRYPTO-001 parity: production must never store CONTENT (Gmail
+            # bodies, Slack messages, attachment/channel/user names, SSO secrets) unencrypted.
+            # Fail fast at startup exactly like TokenCipher — a missing key is a hard stop, not
+            # a warning, so plaintext can never reach the DB, backups, or replicas.
+            if settings.is_production:
+                raise RuntimeError(
+                    f"{_ENV_VAR} is required in production — refusing to start with "
+                    f"sensitive content stored UNENCRYPTED. Set {_ENV_VAR} "
+                    f"(comma-separated Fernet keys, newest first)."
+                )
+            logger.warning(
+                "%s not set; sensitive content/fields stored UNENCRYPTED (non-production only)", _ENV_VAR
+            )
         return cls(keys)
 
     @property
@@ -59,7 +71,7 @@ class FieldCipher:
         return self._multifernet is not None
 
     def encrypt(self, plaintext: str | None) -> str | None:
-        if plaintext is None or not self.enabled:
+        if plaintext is None or self._multifernet is None:
             return plaintext
         return f"{_PREFIX}{self._multifernet.encrypt(plaintext.encode()).decode()}"
 
@@ -68,7 +80,7 @@ class FieldCipher:
             return None
         if not value.startswith(_PREFIX):
             return value  # legacy plaintext (or cipher disabled when written)
-        if not self.enabled:
+        if self._multifernet is None:
             raise FieldDecryptError("encrypted value present but no keys configured")
         from cryptography.fernet import InvalidToken
 
@@ -81,4 +93,16 @@ class FieldCipher:
         return bool(value) and value.startswith(_PREFIX)
 
 
+def field_encryption_healthy() -> bool:
+    """Liveness/readiness signal: content encryption must be ON in production. In dev it may
+    run passthrough (returns False there) — callers/health endpoints decide what to do with
+    that per environment."""
+    from navis.platform.config import settings
+
+    healthy = field_cipher.enabled or not settings.is_production
+    metrics.incr("crypto.field_cipher.health", labels={"enabled": str(field_cipher.enabled)})
+    return healthy
+
+
 field_cipher = FieldCipher.from_env()
+metrics.incr("crypto.field_cipher.init", labels={"enabled": str(field_cipher.enabled)})

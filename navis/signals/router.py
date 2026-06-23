@@ -19,6 +19,7 @@ import binascii
 import json
 import os
 import secrets
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -51,6 +52,8 @@ from navis.signals.google.pubsub_auth import (
     pubsub_auth_configured,
     verify_pubsub_request,
 )
+from navis.signals.reliability.slack_health import record_webhook_outcome
+from navis.signals.slack.signature import SlackSignatureError, verify_slack_signature
 from navis.signals.service import SignalIngestionService
 
 from navis.organization.contract import Capability
@@ -269,6 +272,70 @@ async def _is_duplicate_pubsub(email: str | None, history_id: str | None) -> boo
         metrics.incr("signals.pubsub.dedupe_redis_error")
         return False
     return not was_new  # already present within TTL -> duplicate
+
+
+@router.post("/webhooks/slack/events")
+async def slack_events_webhook(request: Request) -> Any:
+    """Slack Events API push. Verify HMAC + timestamp, dedupe the redelivery, enqueue, ACK —
+    NEVER process inline (Slack needs <3s; we target <500ms). The Celery processor does the
+    Integration lookup + mapping + ingest out of band."""
+    body = await request.body()
+    hour = int(time.time()) // 3600
+    # Best-effort team for health attribution ONLY (untrusted until verified; spoofing here can
+    # at worst cause a false ops alert, never a security or data effect).
+    team_hint = _best_effort_team(body)
+    try:
+        verify_slack_signature(
+            body=body,
+            timestamp=request.headers.get("X-Slack-Request-Timestamp"),
+            signature=request.headers.get("X-Slack-Signature"),
+        )
+    except SlackSignatureError as exc:
+        metrics.incr("slack.webhook.rejected", labels={"reason": exc.reason})
+        await record_webhook_outcome(team_hint, ok=False, hour=hour)  # a real-Slack 401 burst -> auto-disable risk
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"slack signature failed: {exc}")
+
+    try:
+        envelope = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        await record_webhook_outcome(team_hint, ok=True, hour=hour)  # verified Slack; we ack (2xx)
+        return {"status": "ignored"}  # ack so Slack stops retrying an undecodable body
+
+    await record_webhook_outcome(envelope.get("team_id"), ok=True, hour=hour)  # verified + ACKed
+
+    if envelope.get("type") == "url_verification":  # one-time endpoint handshake (also signed)
+        return {"challenge": envelope.get("challenge")}
+
+    # At-least-once: Slack resends the SAME event_id on its retries -> suppress before enqueue.
+    if await _is_duplicate_slack(envelope.get("team_id"), envelope.get("event_id")):
+        metrics.incr("slack.webhook.deduped")
+        return {"status": "duplicate"}
+
+    celery_app.send_task(
+        "navis.orchestration.sync.process_slack_event",
+        kwargs={"team_id": envelope.get("team_id"), "envelope": envelope},
+    )
+    metrics.incr("slack.webhook.accepted")
+    return {"status": "accepted"}
+
+
+def _best_effort_team(body: bytes) -> str | None:
+    try:
+        return (json.loads(body.decode("utf-8")) or {}).get("team_id")
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        return None
+
+
+async def _is_duplicate_slack(team_id: str | None, event_id: str | None) -> bool:
+    if not team_id or not event_id:
+        return False  # nothing to key on -> process (mapping is idempotent anyway)
+    key = f"slack:dedupe:{team_id}:{event_id}"
+    try:
+        was_new = await redis_client.set(key, "1", nx=True, ex=_PUBSUB_DEDUPE_TTL)
+    except RedisError:  # fail OPEN: process rather than drop a webhook (ingest is idempotent)
+        metrics.incr("slack.webhook.dedupe_redis_error")
+        return False
+    return not was_new
 
 
 class SeedSignal(BaseModel):

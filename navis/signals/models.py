@@ -33,6 +33,10 @@ class SignalEventRecord(Timestamped, Base):
         # Replay/consumer scans are by tenant + source + time.
         Index("ix_signal_org_source_time", "organization_id", "source", "occurred_at"),
         Index("ix_signal_integration", "integration_id"),
+        # Channel-scoped retrieval (Slack et al.): Memory/State/KG/Reasoning query "this
+        # channel over time" constantly. channel_id is denormalized from metadata into a real
+        # column (NULL for non-channel sources) so this never JSONB-scans 100B rows.
+        Index("ix_signal_org_channel_time", "organization_id", "channel_id", "occurred_at"),
         # NOTE: a bare external_id index was intentionally removed — no query looks up by
         # external_id alone (dedup uses uq_signal_dedupe; reads are by PK or org+time). At
         # 100B rows a 512-char-key B-tree on a never-queried column is pure write
@@ -57,6 +61,9 @@ class SignalEventRecord(Timestamped, Base):
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     external_id: Mapped[str] = mapped_column(String(512), nullable=False)
     external_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Denormalized from metadata["channel_id"] for channel-scoped indexing. NULL for sources
+    # without a channel (and for identity snapshots that describe a user, not a channel).
+    channel_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     # When the connector OBSERVED the fact (capture time), distinct from occurred_at (when

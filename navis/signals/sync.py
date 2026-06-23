@@ -68,6 +68,13 @@ class SignalSyncService:
         else:
             self.dlq = dead_letter_queue
 
+    async def ingest_events(
+        self, ctx: SignalContext, source: SignalSource, events: list[SignalEvent]
+    ) -> SyncOutcome:
+        """Ingest already-mapped events (push sources like the Slack Events API webhook) through
+        the SAME batch+fallback+DLQ path as connector sync — no separate ingestion machinery."""
+        return await self._ingest_all(ctx, source, events)
+
     async def sync(
         self,
         ctx: SignalContext,

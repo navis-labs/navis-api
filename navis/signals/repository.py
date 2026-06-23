@@ -44,6 +44,9 @@ class SignalRepository:
             "event_type": event.event_type.value,
             "external_id": event.external_id,
             "external_version": event.external_version,
+            # Denormalize the channel for channel-scoped retrieval (NULL when absent). Derived
+            # from metadata, never part of identity — the deterministic event_id is unchanged.
+            "channel_id": event.metadata.get("channel_id"),
             "occurred_at": event.timestamp,
             "captured_at": event.captured_at or event.timestamp,
             "schema_version": event.schema_version,
@@ -114,6 +117,51 @@ class SignalRepository:
             .where(SignalOutbox.id.in_(list(ids)))
             .values(published_at=datetime.now(timezone.utc))
         )
+
+    async def scrub_payload(self, event_id: uuid.UUID, payload: dict[str, Any]) -> None:
+        """Governance-only in-place rewrite of a single signal's payload (retention/erasure
+        tombstone). The append-only log's IMMUTABILITY is intentionally overridden ONLY here —
+        retention + the legal right-to-erasure are the sanctioned exceptions; identity,
+        occurred_at, and lineage are never touched, so replay + audit stay coherent. Also
+        denormalize a tombstoned channel_id stays as-is (channel is not personal data)."""
+        await self.db.execute(
+            update(SignalEventRecord)
+            .where(SignalEventRecord.id == event_id)
+            .values(payload=payload)
+        )
+
+    async def scan_expired_content(
+        self, *, before: datetime, limit: int = 500, after_id: uuid.UUID | None = None
+    ) -> Sequence[SignalEventRecord]:
+        """Page (keyset by id) signals older than `before` whose content is not yet scrubbed.
+        Retention filters per-row by policy in the caller (retention_class lives in JSONB)."""
+        stmt = (
+            select(SignalEventRecord)
+            .where(
+                SignalEventRecord.occurred_at < before,
+                SignalEventRecord.payload["_scrubbed"].astext.is_distinct_from("true"),
+            )
+            .order_by(SignalEventRecord.id)
+            .limit(limit)
+        )
+        if after_id is not None:
+            stmt = stmt.where(SignalEventRecord.id > after_id)
+        return (await self.db.scalars(stmt)).all()
+
+    async def scan_org_signals(
+        self, org_id: uuid.UUID, *, limit: int = 500, after_id: uuid.UUID | None = None
+    ) -> Sequence[SignalEventRecord]:
+        """Page (keyset by id) all of an org's signals — erasure filters per-row by subject
+        (identifiers are plaintext, so no decryption needed to find a person)."""
+        stmt = (
+            select(SignalEventRecord)
+            .where(SignalEventRecord.organization_id == org_id)
+            .order_by(SignalEventRecord.id)
+            .limit(limit)
+        )
+        if after_id is not None:
+            stmt = stmt.where(SignalEventRecord.id > after_id)
+        return (await self.db.scalars(stmt)).all()
 
     async def purge_published_outbox(self, *, before: datetime) -> int:
         """Delete PUBLISHED outbox rows older than `before` (retention — bounds outbox

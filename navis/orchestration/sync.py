@@ -228,6 +228,65 @@ async def _sync_account(provider: str, email: str | None, history_id: str | None
     return await sync_integration(integration)
 
 
+async def _process_slack_event(team_id: str | None, envelope: dict) -> dict:
+    """Webhook-triggered: resolve the Slack install, map the event, ingest. Runs out of band
+    (the webhook already ACKed). Reuses the connector ingestion path (batch+fallback+DLQ)."""
+    from navis.signals.base import SignalSource
+    from navis.signals.slack.events import events_from_envelope
+
+    if not team_id:
+        return {"matched": False}
+    inner_type = (envelope.get("event") or {}).get("type") or envelope.get("type")
+    async with session_scope() as db:
+        integration = await db.scalar(
+            select(Integration).where(
+                Integration.provider == IntegrationProvider.SLACK,
+                Integration.external_account == team_id,
+                Integration.is_active.is_(True),
+            )
+        )
+        if integration is None or not integration.user_id:
+            logger.warning("slack event: no active integration for team=%s", team_id)
+            return {"matched": False}
+
+        # M-1: workspace disconnect / token revocation -> deactivate (don't keep hitting Slack
+        # with a dead token; that failure rate is what trips Slack's 95% auto-disable).
+        if inner_type in ("app_uninstalled", "tokens_revoked"):
+            integration.is_active = False
+            logger.warning("slack %s for team=%s; integration deactivated", inner_type, team_id)
+            return {"matched": True, "deactivated": True}
+
+        ctx = SignalContext(integration.organization_id, integration.user_id, integration.id)
+        slack_state = (integration.sync_state or {}).get("slack") or {}
+        events = events_from_envelope(
+            ctx, envelope,
+            our_bot_id=slack_state.get("bot_id"), our_bot_user_id=slack_state.get("bot_user_id"),
+        )
+        if not events:
+            return {"matched": True, "captured": 0}  # unmapped verb — captured nothing, by design
+        outcome = await SignalSyncService(db).ingest_events(ctx, SignalSource.SLACK, events)
+    return {"matched": True, "captured": outcome.ingested, "duplicates": outcome.duplicates,
+            "dead_lettered": outcome.dead_lettered}
+
+
+@celery_app.task(name="navis.orchestration.sync.process_slack_event")
+def process_slack_event(team_id: str | None = None, envelope: dict | None = None) -> dict:
+    return asyncio.run(_process_slack_event(team_id, envelope or {}))
+
+
+async def _run_retention_purge() -> dict:
+    from navis.signals.governance import run_retention_purge
+
+    async with session_scope() as db:
+        return await run_retention_purge(db)
+
+
+@celery_app.task(name="navis.orchestration.sync.retention_purge")
+def retention_purge() -> dict:
+    """Periodic content-retention enforcement (M-1) — tombstone expired content, keep skeleton."""
+    return asyncio.run(_run_retention_purge())
+
+
 @celery_app.task(name="navis.orchestration.sync.sync_one_integration")
 def sync_one_integration(integration_id: str) -> dict:
     return asyncio.run(_sync_by_id(uuid.UUID(integration_id)))
