@@ -49,18 +49,85 @@ GmailReceived → PersonDetected / CommitmentDetected → StateUpdated
   → OutcomeObserved → LearningUpdated
 ```
 
+## Core invariants
+
+These hold across the whole pipeline and are enforced (and tested) in the Signal layer today:
+
+- **Capture is reality only** — `signals/` never summarizes, classifies, infers, or runs LLM
+  logic. Interpretation lives downstream.
+- **Deterministic identity** — `event_id = uuid5(org : integration : source : external_id : version)`.
+  Re-capture and replay are idempotent; integration-scoping prevents cross-org / cross-user /
+  shared-channel collisions.
+- **Event-sourced & replay-safe** — append-only log; retention and GDPR erasure *tombstone*
+  content, never delete the event skeleton.
+- **Privacy by design** — sensitive content (email bodies, Slack messages, file/channel names)
+  is encrypted at rest; identity PII is minimized; external/third-party PII is dropped.
+- **Untrusted by default** — captured external content is tagged `content_trust_level=untrusted`
+  / `trusted_for_execution=false`; future agents must never execute instructions found in it.
+
+## Signal Layer (Layer 1) — production-ready
+
+The most mature layer. The Signal → Memory contract is **frozen**.
+
+| Capability | Where |
+|---|---|
+| Immutable, version-aware `SignalEvent` + integration-scoped dedupe | `signals/base.py`, `signals/models.py` |
+| Transactional **outbox** + relay (crash-safe at-least-once delivery) | `signals/outbox.py` |
+| **DLQ** with replay accounting + poison-loop guard | `signals/reliability/` |
+| Content **encryption at rest** (Fernet; prod-mandatory keys) | `platform/security/crypto.py`, `signals/crypto.py` |
+| **Governance**: retention enforcement + GDPR per-subject erasure (tombstone, audited) | `signals/governance.py` |
+| Google connectors — Gmail / Calendar / Drive / Docs / Meet | `signals/{gmail,calendar,drive,meet,google}/` |
+| Slack connector — Events API webhook (HMAC-verified) + REST backfill, one mapper | `signals/slack/` |
+| Resilient Google transport + OAuth lifecycle (refresh, rotation, re-consent) | `signals/google/` |
+| Per-integration advisory locking | `signals/locking.py` |
+
+Memory and the layers above are in progress.
+
 ## Quickstart
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env        # fill in real values
-python init_db.py           # create tables
+cp .env.example .env        # fill in real values (see below)
+alembic upgrade head        # apply migrations  (or: python init_db.py)
 uvicorn navis.main:app --reload
 ```
 
 Open http://localhost:8000/docs
+
+### Configuration (`.env`)
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Postgres (Neon pooled URLs supported) |
+| `REDIS_URL` | cache · event stream · webhook dedupe |
+| `SECRET_KEY` | JWT signing + keyed governance handles (≥32 chars in prod) |
+| `FIELD_ENCRYPTION_KEYS` | **content** encryption at rest — *production boot fails if missing* |
+| `SIGNALS_TOKEN_KEYS` | OAuth **token** encryption at rest (prod-mandatory) |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth |
+| `GOOGLE_PUBSUB_AUDIENCE` | Gmail push (Pub/Sub) verification |
+| `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` / `SLACK_SIGNING_SECRET` | Slack OAuth + webhook HMAC |
+
+Generate a Fernet key for the encryption vars:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+## Development
+
+```bash
+PYTHONPATH=. .venv/bin/pytest -q        # tests (in-memory fakes; no live services needed)
+npx pyright                             # type checking (target: 0 errors)
+alembic revision -m "describe change"   # new migration
+```
+
+Conventions: **reuse existing infrastructure over building new**; the capture layer stays free
+of interpretation; every change keeps the test suite green and pyright clean.
+
+Stack: FastAPI · async SQLAlchemy 2.0 + asyncpg · PostgreSQL (Neon) · Alembic · Pydantic v2 ·
+Redis · Celery · pytest (`asyncio_mode=auto`) · pyright.
 
 ## Why State is a first-class domain
 
