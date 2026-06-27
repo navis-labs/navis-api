@@ -8,9 +8,9 @@ the same rows without duplicates or races.
 from __future__ import annotations
 
 import uuid
-from typing import Sequence
+from typing import Any, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -69,3 +69,28 @@ class MemoryRepository:
             MemoryRecordRow.source_signal_event_id == signal_event_id
         )
         return (await self.db.scalars(stmt)).all()
+
+    # --- governance (GDPR erasure cascade) -------------------------------------------------
+    async def scan_org(
+        self, org_id: uuid.UUID, *, limit: int = 500, after_id: uuid.UUID | None = None
+    ) -> Sequence[MemoryRecordRow]:
+        """Keyset-paged scan of an org's memory for the erasure cascade."""
+        stmt = (
+            select(MemoryRecordRow)
+            .where(MemoryRecordRow.organization_id == org_id)
+            .order_by(MemoryRecordRow.memory_id)
+            .limit(limit)
+        )
+        if after_id is not None:
+            stmt = stmt.where(MemoryRecordRow.memory_id > after_id)
+        return (await self.db.scalars(stmt)).all()
+
+    async def scrub_payload(self, memory_id: uuid.UUID, payload: dict[str, Any]) -> None:
+        """Governance-only in-place payload rewrite (erasure tombstone). The skeleton
+        (memory_id/entity_id/provenance) is preserved so replay + audit stay coherent; the
+        sanctioned exception to append-only, exactly like the signal-layer scrub."""
+        await self.db.execute(
+            update(MemoryRecordRow)
+            .where(MemoryRecordRow.memory_id == memory_id)
+            .values(payload=payload)
+        )

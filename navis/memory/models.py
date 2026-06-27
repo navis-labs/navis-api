@@ -52,8 +52,12 @@ class MemoryRecord(Base):
     __table_args__ = (
         # History of a single real-world entity (e.g. all facts about one person).
         Index("ix_mem_entity", "organization_id", "entity_type", "entity_id"),
-        # Time scans for State construction.
+        # Per-(entity_type) time scans.
         Index("ix_mem_org_type_time", "organization_id", "entity_type", "event_timestamp"),
+        # The State V2 projection streams ALL of an org's records in (event_timestamp,
+        # memory_id) fold order, regardless of entity_type — so it needs an org+time index
+        # WITHOUT entity_type in the lead (the type-led index above can't serve that order).
+        Index("ix_mem_org_time", "organization_id", "event_timestamp", "memory_id"),
         # Provenance / replay-by-signal.
         Index("ix_mem_signal", "source_signal_event_id"),
     )

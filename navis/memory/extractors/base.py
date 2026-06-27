@@ -32,6 +32,7 @@ class SignalView:
     external_version: str
     event_timestamp: datetime
     payload: dict[str, Any]
+    metadata: dict[str, Any] = field(default_factory=dict)  # signal provenance/visibility/trust
 
 
 @dataclass(frozen=True, slots=True)

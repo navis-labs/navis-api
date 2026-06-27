@@ -22,19 +22,28 @@ CURRENT_SCHEMA_VERSION: dict[EntityType, int] = {
     EntityType.RELATIONSHIP: 1,
     EntityType.COMMITMENT: 1,
     EntityType.DECISION: 1,
+    EntityType.CHANNEL: 1,
+    EntityType.DOCUMENT: 1,
 }
 
-# Human-readable payload contracts (v1). Kept here so State has one place to look.
+# Human-readable payload contracts. Fields beyond the original v1 set are ADDITIVE optional
+# keys (backward compatible — old records simply lack them; State reads via .get()), so they
+# do NOT bump the schema version. Breaking shape changes still bump + register an upcaster.
 PAYLOAD_FIELDS_V1: dict[EntityType, tuple[str, ...]] = {
-    EntityType.PERSON: ("email", "name", "role"),
+    EntityType.PERSON: ("email", "name", "role", "source", "slack_user_id"),
     EntityType.COMPANY: ("domain", "name"),
     EntityType.CUSTOMER: ("external_ref", "name"),  # populated from a CRM signal source
-    EntityType.PROJECT: ("folder_id", "name"),
-    EntityType.MEETING: ("title", "starts_at", "ends_at", "attendees", "status", "has_conference"),
-    EntityType.THREAD: ("thread_id", "subject", "message_id"),
-    EntityType.RELATIONSHIP: ("person_email", "direction", "via"),
-    EntityType.COMMITMENT: ("text", "speaker_email", "subject", "thread_id"),
-    EntityType.DECISION: ("text", "subject"),
+    EntityType.PROJECT: ("folder_id", "name", "owners", "shared", "mime_type", "drive_id"),
+    EntityType.MEETING: ("title", "starts_at", "ends_at", "attendees", "status",
+                         "has_conference", "organizer", "is_recurring", "conference_id"),
+    EntityType.THREAD: ("thread_id", "subject", "message_id",
+                        "rfc_message_id", "in_reply_to", "references", "channel_id"),
+    EntityType.RELATIONSHIP: ("person_email", "direction", "via", "slack_user_id", "channel_id"),
+    EntityType.COMMITMENT: ("text", "speaker_email", "speaker_slack_user_id", "subject",
+                            "thread_id", "channel_id", "via"),
+    EntityType.DECISION: ("text", "subject", "channel_id", "via"),
+    EntityType.CHANNEL: ("channel_id", "name", "visibility", "workspace_id"),
+    EntityType.DOCUMENT: ("document_id", "title", "owners", "parents", "drive_id", "source"),
 }
 
 

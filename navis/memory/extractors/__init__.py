@@ -24,6 +24,16 @@ from navis.memory.extractors.email import (
 )
 from navis.memory.extractors.calendar import CalendarAttendeeExtractor, MeetingExtractor
 from navis.memory.extractors.drive import DriveProjectExtractor
+from navis.memory.extractors.docs import DocumentExtractor
+from navis.memory.extractors.meet import MeetMeetingExtractor
+from navis.memory.extractors.slack import (
+    SlackChannelExtractor,
+    SlackCommitmentExtractor,
+    SlackDecisionExtractor,
+    SlackPersonExtractor,
+    SlackRelationshipExtractor,
+    SlackThreadExtractor,
+)
 
 # Order matters for deterministic output.
 for _ext in (
@@ -36,6 +46,14 @@ for _ext in (
     MeetingExtractor(),
     CalendarAttendeeExtractor(),
     DriveProjectExtractor(),
+    DocumentExtractor(),
+    MeetMeetingExtractor(),
+    SlackPersonExtractor(),
+    SlackChannelExtractor(),
+    SlackThreadExtractor(),
+    SlackRelationshipExtractor(),
+    SlackCommitmentExtractor(),
+    SlackDecisionExtractor(),
 ):
     register(_ext)
 

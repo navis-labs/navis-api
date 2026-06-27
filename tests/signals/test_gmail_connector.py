@@ -117,6 +117,7 @@ async def test_content_encrypted_at_rest_and_decrypted_for_memory(monkeypatch):
         integration_id=ev.integration_id, source=ev.source.value,
         event_type=ev.event_type.value, external_id=ev.external_id,
         external_version=ev.external_version, occurred_at=ev.timestamp, payload=ev.payload,
+        extra=ev.metadata,
     )
     view = mem.SignalViewFactory.from_record(rec)
     assert view.payload["body_text"] == "hello world"

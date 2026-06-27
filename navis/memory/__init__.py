@@ -9,5 +9,6 @@ Memory never reads State.
 """
 from navis.memory.envelope import EntityType, MemoryRecord
 from navis.memory.ids import entity_id, memory_record_id
+from navis.memory import governance as _governance  # noqa: F401  registers the erasure cascade
 
 __all__ = ["EntityType", "MemoryRecord", "entity_id", "memory_record_id"]

@@ -97,6 +97,7 @@ class SignalViewFactory:
             external_version=rec.external_version,
             event_timestamp=rec.occurred_at,
             payload=_decrypt_content(rec.payload or {}),
+            metadata=rec.extra or {},
         )
 
 

@@ -141,14 +141,25 @@ def test_unknown_source_is_loud_not_silent(monkeypatch):
 
 # ---- P1: cascade contract emission seam ----
 
-def test_subject_erasure_cascade_seam():
+async def test_subject_erasure_cascade_seam():
     import navis.signals.governance as gov
 
     received = []
-    gov.on_subject_erasure(received.append)
-    gov._notify_erasure(gov.SubjectErasureNotice(org_id=__import__("uuid").uuid4(), subject_handle="subj:x", erased=3))
-    assert received and received[0].erased == 3
-    gov._ERASURE_SUBSCRIBERS.clear()
+
+    async def _sub(notice, db):
+        received.append(notice)
+
+    saved = list(gov._ERASURE_SUBSCRIBERS)
+    gov._ERASURE_SUBSCRIBERS.clear()  # isolate from globally-registered subscribers
+    gov.on_subject_erasure(_sub)
+    try:
+        await gov._notify_erasure(
+            gov.SubjectErasureNotice(org_id=__import__("uuid").uuid4(), subject_handle="subj:x", erased=3),
+            None,  # type: ignore[arg-type]
+        )
+        assert received and received[0].erased == 3
+    finally:
+        gov._ERASURE_SUBSCRIBERS[:] = saved
 
 
 # ---- P2: audit handle is keyed (HMAC), non-reversible, deterministic ----

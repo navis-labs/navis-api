@@ -42,26 +42,33 @@ logger = get_logger("signals.governance")
 # their own projections — NO queue, NO bus, NO coupling; subscribers are optional + isolated.
 @dataclass(frozen=True, slots=True)
 class SubjectErasureNotice:
-    """SIGNAL_SUBJECT_ERASURE — a subject's data was tombstoned in the signal log."""
+    """SIGNAL_SUBJECT_ERASURE — a subject's data was tombstoned in the signal log. The
+    `email`/`slack_user_id` are carried ONLY to drive the in-process cascade (so downstream
+    layers can erase their projections in the SAME transaction); they are never persisted or
+    logged — the durable record uses `subject_handle` (the keyed, non-reversible hash)."""
 
     org_id: uuid.UUID
-    subject_handle: str  # non-reversible handle (never the raw email/slack_user_id)
+    subject_handle: str
     erased: int
+    email: str | None = None
+    slack_user_id: str | None = None
 
 
-_ERASURE_SUBSCRIBERS: list[Callable[[SubjectErasureNotice], None]] = []
+# Async subscribers get the notice + the live db session so they erase atomically with signals.
+ErasureSubscriber = Callable[["SubjectErasureNotice", AsyncSession], Any]
+_ERASURE_SUBSCRIBERS: list[ErasureSubscriber] = []
 
 
-def on_subject_erasure(fn: Callable[[SubjectErasureNotice], None]) -> Callable[[SubjectErasureNotice], None]:
-    """Register a subscriber (future Memory/State erasure). Usable as a decorator."""
+def on_subject_erasure(fn: ErasureSubscriber) -> ErasureSubscriber:
+    """Register a subscriber (e.g. Memory erasure). Usable as a decorator."""
     _ERASURE_SUBSCRIBERS.append(fn)
     return fn
 
 
-def _notify_erasure(notice: SubjectErasureNotice) -> None:
+async def _notify_erasure(notice: SubjectErasureNotice, db: AsyncSession) -> None:
     for fn in _ERASURE_SUBSCRIBERS:
         try:
-            fn(notice)
+            await fn(notice, db)
         except Exception:  # pragma: no cover - a subscriber must never break the erasure
             logger.exception("subject-erasure subscriber failed")
 
@@ -263,8 +270,12 @@ async def erase_subject(
             "signal_subject_erasure", org_id=org_id, actor_id=actor_id, actor_kind="system",
             target_id=handle, metadata=result,
         )
-        # Cascade seam: notify future Memory/State to erase their projections (decoupled).
-        _notify_erasure(SubjectErasureNotice(org_id=org_id, subject_handle=handle, erased=erased))
+        # Cascade seam: notify Memory/State to erase their projections in the SAME transaction.
+        await _notify_erasure(
+            SubjectErasureNotice(org_id=org_id, subject_handle=handle, erased=erased,
+                                 email=email, slack_user_id=slack_user_id),
+            db,
+        )
     logger.warning("subject erasure org=%s %s", org_id, result)
     return result
 

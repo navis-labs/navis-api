@@ -9,6 +9,7 @@ from __future__ import annotations
 from navis.memory.envelope import EntityType
 from navis.memory.extractors.base import Extractor, MemoryDraft, SignalView
 from navis.memory.schemas import current_version
+from navis.memory.confidence import HIGH, STRUCTURAL
 from navis.signals.base import SignalSource
 
 _CAL = {SignalSource.CALENDAR}
@@ -34,8 +35,11 @@ class MeetingExtractor(Extractor):
                     "attendees": attendees,
                     "status": p.get("status"),
                     "has_conference": bool(p.get("conference_data") or p.get("hangout_link")),
+                    # KEEP: organizer (who runs it) from payload; recurrence flag from metadata.
+                    "organizer": (p.get("organizer") or {}).get("email"),
+                    "is_recurring": bool(signal.metadata.get("is_recurring_master")),
                 },
-                confidence=0.98,
+                confidence=STRUCTURAL,
                 schema_version=current_version(EntityType.MEETING),
             )
         ]
@@ -61,7 +65,7 @@ class CalendarAttendeeExtractor(Extractor):
                     entity_natural_key=email,
                     dedup_key=f"attendee:{email}",
                     payload={"email": email, "name": a.get("displayName"), "role": "attendee"},
-                    confidence=0.9,
+                    confidence=HIGH,
                     schema_version=ver,
                 )
             )

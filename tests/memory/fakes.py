@@ -92,6 +92,59 @@ def drive_view(**overrides) -> SignalView:
     )
 
 
+def slack_message_view(**overrides) -> SignalView:
+    payload = {
+        "channel_id": "C123", "slack_user_id": "U777", "ts": "1700000000.001",
+        "thread_root_ts": None,
+        "text": "I'll send the report by Friday. We have decided to ship v2.",
+    }
+    payload.update(overrides.pop("payload", {}))
+    return make_view(
+        source=SignalSource.SLACK, event_type=SignalEventType.MESSAGE_SENT,
+        payload=payload, external_id="C123:1700000000.001", **overrides,
+    )
+
+
+def slack_user_snapshot_view(**overrides) -> SignalView:
+    payload = {"slack_user_id": "U777", "email": "alice@acme.com", "display_name": "Alice", "is_internal": True}
+    payload.update(overrides.pop("payload", {}))
+    return make_view(
+        source=SignalSource.SLACK, event_type=SignalEventType.SLACK_USER_SNAPSHOT,
+        payload=payload, external_id="U777", **overrides,
+    )
+
+
+def slack_channel_snapshot_view(**overrides) -> SignalView:
+    payload = {"channel_id": "C123", "name": "project-zeus", "visibility": "private"}
+    payload.update(overrides.pop("payload", {}))
+    return make_view(
+        source=SignalSource.SLACK, event_type=SignalEventType.SLACK_CHANNEL_SNAPSHOT,
+        payload=payload, external_id="C123", **overrides,
+    )
+
+
+def docs_view(**overrides) -> SignalView:
+    payload = {"name": "Strategy Doc", "owners": [{"email": "alice@acme.com"}], "parents": ["folder-9"], "drive_id": "D1"}
+    payload.update(overrides.pop("payload", {}))
+    return make_view(
+        source=SignalSource.DOCS, event_type=SignalEventType.DOC_UPDATED,
+        payload=payload, external_id="doc-1", external_version="v2", **overrides,
+    )
+
+
+def meet_view(**overrides) -> SignalView:
+    payload = {
+        "summary": "Standup", "start": {"dateTime": "2026-06-02T10:00:00Z"},
+        "end": {"dateTime": "2026-06-02T10:15:00Z"},
+        "attendees": [{"email": "alice@acme.com"}], "conference_id": "conf-xyz",
+    }
+    payload.update(overrides.pop("payload", {}))
+    return make_view(
+        source=SignalSource.MEET, event_type=SignalEventType.MEETING_CREATED,
+        payload=payload, external_id="evt-1", external_version="100:meeting.created", **overrides,
+    )
+
+
 class FakeMemoryRepo:
     """Append-only with idempotent dedup on memory_id (mimics ON CONFLICT)."""
 

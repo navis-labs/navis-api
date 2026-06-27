@@ -5,9 +5,11 @@ Gmail connector). Every extractor here is pure: same email → same facts.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from email.utils import parseaddr
 
+from navis.memory.confidence import HEURISTIC, HIGH, LOW, MEDIUM, STRUCTURAL
 from navis.memory.envelope import EntityType
 from navis.memory.extractors.base import Extractor, MemoryDraft, SignalView
 from navis.memory.schemas import current_version
@@ -59,6 +61,15 @@ def _sentences(body: str) -> list[str]:
     return [s.strip() for s in re.split(r"(?<=[.!?\n])\s+", body) if s.strip()]
 
 
+def _fact_key(text: str) -> str:
+    """CONTENT-derived key for a text fact (commitment/decision sentence). Stable across
+    sentence re-ordering and any change to the splitter — unlike a positional index, which
+    shifts and creates duplicate histories. Normalized (strip+lower+collapse-space) so trivial
+    formatting differences don't fork the id."""
+    norm = " ".join(text.strip().lower().split())
+    return hashlib.sha256(norm.encode()).hexdigest()[:16]
+
+
 class PersonExtractor(Extractor):
     name = "email_person"
     version = "1.0.0"
@@ -74,7 +85,7 @@ class PersonExtractor(Extractor):
                     entity_natural_key=email,
                     dedup_key=email,  # one PERSON fact per address per signal
                     payload={"email": email, "name": name or None, "role": role},
-                    confidence=0.9,
+                    confidence=HIGH,
                     schema_version=ver,
                 )
             )
@@ -99,7 +110,7 @@ class CompanyExtractor(Extractor):
                 entity_natural_key=domain,
                 dedup_key=domain,
                 payload={"domain": domain, "name": None},
-                confidence=0.8,
+                confidence=MEDIUM,
                 schema_version=ver,
             )
             for domain in domains
@@ -124,8 +135,13 @@ class ThreadExtractor(Extractor):
                     "thread_id": str(thread_id),
                     "subject": signal.payload.get("subject"),
                     "message_id": signal.external_id,
+                    # Reply graph (KEEP): lets State/Reasoning reconstruct replied_to /
+                    # references_message edges without re-parsing the raw email.
+                    "rfc_message_id": signal.payload.get("rfc_message_id"),
+                    "in_reply_to": signal.payload.get("in_reply_to"),
+                    "references": signal.payload.get("references"),
                 },
-                confidence=0.99,
+                confidence=STRUCTURAL,
                 schema_version=current_version(EntityType.THREAD),
             )
         ]
@@ -148,7 +164,7 @@ class RelationshipExtractor(Extractor):
                     dedup_key=f"{direction}:{email}",
                     # An OBSERVED interaction — no health, no score.
                     payload={"person_email": email, "direction": direction, "via": "email"},
-                    confidence=0.85,
+                    confidence=HIGH,
                     schema_version=ver,
                 )
             )
@@ -172,15 +188,15 @@ class CommitmentExtractor(Extractor):
                 drafts.append(
                     MemoryDraft(
                         entity_type=EntityType.COMMITMENT,
-                        entity_natural_key=f"{signal.external_id}:{idx}",
-                        dedup_key=str(idx),
+                        entity_natural_key=f"{signal.external_id}:{_fact_key(sentence)}",
+                        dedup_key=_fact_key(sentence),
                         payload={
                             "text": sentence,
                             "speaker_email": speaker.lower() or None,
                             "subject": signal.payload.get("subject"),
                             "thread_id": signal.payload.get("thread_id"),
                         },
-                        confidence=0.55,
+                        confidence=HEURISTIC,
                         schema_version=ver,
                     )
                 )
@@ -205,10 +221,10 @@ class DecisionExtractor(Extractor):
                 drafts.append(
                     MemoryDraft(
                         entity_type=EntityType.DECISION,
-                        entity_natural_key=f"{signal.external_id}:{idx}",
-                        dedup_key=f"d{idx}",
+                        entity_natural_key=f"{signal.external_id}:{_fact_key(sentence)}",
+                        dedup_key=f"d:{_fact_key(sentence)}",
                         payload={"text": sentence, "subject": signal.payload.get("subject")},
-                        confidence=0.5,
+                        confidence=LOW,
                         schema_version=ver,
                     )
                 )
