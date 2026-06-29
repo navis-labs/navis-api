@@ -1,8 +1,9 @@
-"""State — Layer 3. The most important moat.
+"""State — Layer 3. The only read model between Memory and Reasoning.
 
-`OrganizationalState` is a living model of the company computed from memory.
-Without this layer the decision engine becomes a god object that recomputes the
-world on every request. With it, reasoning reads a single coherent snapshot.
+The production implementation is `navis.state.v2`: a deterministic, disposable,
+versioned projection over `memory_records`. `OrganizationalState` is rebuilt from
+Memory at any time (snapshots are a cache, never a source of truth). Import from
+`navis.state.v2`:
 
-    build_organizational_state(org_id) -> OrganizationalState
+    from navis.state.v2 import StateService, OrganizationalState
 """

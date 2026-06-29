@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from navis.decisions.models import DailyBrief
 from navis.decisions.service import DecisionService
 from navis.platform.database import session_scope
+from navis.platform.events import DomainEvent, EventType, event_bus
 from navis.platform.monitoring import get_logger
 from navis.platform.queue import celery_app
 from navis.reasoning.v2 import REASONING_VERSION, run_reasoning_v2
@@ -34,6 +35,13 @@ async def build_brief(db: AsyncSession, org_id: uuid.UUID) -> DailyBrief:
     from navis.orchestration.runtime_policy import resolve_policy
 
     state = await StateService(db).get_state(org_id)
+    # Announce that State V2 is current for this org (re-homed from the retired V1
+    # state service). Drives the onboarding STATE_READY milestone; State itself stays
+    # a pure read model and never touches the event bus.
+    await event_bus.publish(
+        DomainEvent(type=EventType.STATE_UPDATED, org_id=org_id, source="state.v2",
+                    payload=state.counts())
+    )
     signals = run_reasoning_v2(state)
     watermark = state.watermark.last_memory_id
     policy = await resolve_policy(db, org_id)

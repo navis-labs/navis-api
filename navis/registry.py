@@ -12,7 +12,6 @@ from navis.identity import enterprise_models as _identity_enterprise_models  # n
 from navis.organization import models as _organization_models  # noqa: F401
 from navis.signals import models as _signal_models  # noqa: F401
 from navis.memory import models as _memory_models  # noqa: F401
-from navis.state import models as _state_models  # noqa: F401  (legacy snapshot table)
 from navis.state.v2 import snapshots as _state_v2_snapshots  # noqa: F401
 from navis.decisions import models as _decision_models  # noqa: F401
 from navis.execution import models as _execution_models  # noqa: F401
@@ -29,5 +28,4 @@ from navis.execution import worker as _execution_worker  # noqa: F401  (register
 from navis.signals import outbox as _signal_outbox  # noqa: F401  (registers the outbox relay task)
 from navis.identity import maintenance as _identity_maintenance  # noqa: F401  (registers purge tasks)
 from navis.observation import subscribers as _observation_subscribers  # noqa: F401  (closes the loop)
-from navis.orchestration import wiring as _wiring  # noqa: F401
 from navis.orchestration import org_provisioning as _org_provisioning  # noqa: F401  (ORG_CREATED + onboarding funnel)

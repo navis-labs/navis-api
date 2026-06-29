@@ -91,3 +91,11 @@ class FakeSnapshots:
 
     async def save(self, state: OrganizationalState) -> None:
         self.store[(state.org_id, state.projection_version)] = _Snap(state.to_dict())
+
+    async def delete(self, org_id, *, projection_version=None) -> None:
+        # Mirrors SnapshotRepository.delete: drop one version, or all versions for the org.
+        if projection_version is None:
+            for k in [k for k in self.store if k[0] == org_id]:
+                del self.store[k]
+        else:
+            self.store.pop((org_id, projection_version), None)

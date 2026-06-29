@@ -1,11 +1,7 @@
-"""Reasoning — Layer 4. Intelligence engines.
+"""Reasoning — Layer 4. Deterministic interpretation over State V2.
 
-Each engine reads the OrganizationalState and emits ReasoningSignals (risks,
-opportunities, priorities). Engines are pure: state in, signals out. They never
-touch the database or the outside world — that makes them cheap to test and
-compose. The decision layer ranks their output.
+The production implementation lives in `navis.reasoning.v2`: engines read the
+State V2 `OrganizationalState` and emit `ReasoningSignal`s. Import directly from
+`navis.reasoning.v2` (and `navis.reasoning.v2.contract`); this package no longer
+re-exports anything, so importing it pulls in no engine code.
 """
-from navis.reasoning.base import ReasoningSignal, SignalKind
-from navis.reasoning.service import run_reasoning
-
-__all__ = ["ReasoningSignal", "SignalKind", "run_reasoning"]

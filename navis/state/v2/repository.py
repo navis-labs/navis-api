@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from typing import AsyncIterator
 
-from sqlalchemy import select, tuple_
+from sqlalchemy import delete as sa_delete, literal, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -90,6 +90,19 @@ class SnapshotRepository:
             as_of=state.as_of,
             full_projection=state.to_dict(),
         )
+        # Monotonic upsert (stale-snapshot protection): overwrite ONLY if the incoming
+        # watermark is >= the stored one (or the stored snapshot is empty). Two writers
+        # racing on one org (e.g. a scheduled rebuild vs. an incremental update) can land
+        # out of order; without this guard a stale write could regress the cache to an
+        # older watermark, briefly serving Reasoning a backwards projection and re-folding
+        # already-folded records. The comparison mirrors `order_key` exactly — Postgres
+        # uuid ordering equals memory_id.int ordering — so it is replay-deterministic and
+        # never blocks a genuinely newer write. A no-conflict INSERT is unaffected.
+        not_stale = or_(
+            StateSnapshot.watermark_timestamp.is_(None),
+            tuple_(StateSnapshot.watermark_timestamp, StateSnapshot.watermark_memory_id)
+            <= tuple_(literal(wm.last_timestamp), literal(wm.last_memory_id)),
+        )
         stmt = pg_insert(StateSnapshot).values(**values).on_conflict_do_update(
             index_elements=["organization_id", "projection_version"],
             set_={
@@ -99,5 +112,21 @@ class SnapshotRepository:
                 "as_of": values["as_of"],
                 "full_projection": values["full_projection"],
             },
+            where=not_stale,
         )
+        await self.db.execute(stmt)
+
+    async def delete(
+        self, org_id: uuid.UUID, *, projection_version: int | None = None
+    ) -> None:
+        """Dispose the disposable cache for an org. The snapshot is never a source of
+        truth, so dropping it is always safe — the next read rebuilds deterministically
+        from Memory. This is the GDPR/erasure primitive: after a subject is erased in
+        Memory, drop the org's snapshot so the rebuilt projection no longer carries the
+        erased PII. `projection_version=None` drops every version for the org (full
+        cache disposal); a value drops just that version. Org *deletion* is already
+        handled by the snapshot's ON DELETE CASCADE to organizations."""
+        stmt = sa_delete(StateSnapshot).where(StateSnapshot.organization_id == org_id)
+        if projection_version is not None:
+            stmt = stmt.where(StateSnapshot.projection_version == projection_version)
         await self.db.execute(stmt)

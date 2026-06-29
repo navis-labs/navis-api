@@ -5,8 +5,8 @@ Determinism by construction:
   * the fold is a left-fold of a per-record reducer (`StateBuilder.apply`);
   * full build = fold ALL records from empty; incremental = continue the SAME
     fold from a prior projection with records strictly after its watermark.
-Because the reducer is monotone in fold order (latest-wins scalars, union lists,
-fixed first_seen), incremental output == full rebuild output, always.
+Because the reducer is monotone in fold order (latest-non-null-wins scalars, union
+lists, fixed first_seen), incremental output == full rebuild output, always.
 
 Cross-links are recomputed from scratch in `finalize` over the (identical) entity
 sets, so they match for full and incremental too.
@@ -84,9 +84,15 @@ class StateBuilder:
         else:
             raw["last_seen"] = ts_iso  # monotonic: applied in ascending order
 
-        # Latest-wins scalar/current fields.
+        # Latest NON-NULL wins. A sparser newer record (e.g. a Slack authorship event
+        # carrying email=None) must never null out a field a richer earlier record
+        # established. None is "unknown here", not "cleared" — Memory is additive, so a
+        # null carries no information and is skipped. Order-independent and replay-safe:
+        # the surviving value is always the latest non-null by (event_timestamp, memory_id),
+        # so incremental == full still holds (prev never stores a null-clobbered value).
         for k, v in rec.payload.items():
-            raw["fields"][k] = v
+            if v is not None:
+                raw["fields"][k] = v
 
         # Provenance (sorted-unique).
         _add_unique(raw["provenance"]["memory_ids"], str(rec.memory_id))

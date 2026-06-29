@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from navis.memory.envelope import EntityType
 
@@ -83,6 +83,10 @@ class PersonState(_BaseView):
     def role(self): return self.fields.get("role")
     @property
     def relationship_ids(self): return self.links.get("relationships", [])
+    @property
+    def channel_ids(self): return self.links.get("channels", [])
+    @property
+    def document_ids(self): return self.links.get("documents", [])
 
 
 class CompanyState(_BaseView):
@@ -102,6 +106,8 @@ class ProjectState(_BaseView):
     def folder_id(self): return self.fields.get("folder_id")
     @property
     def document_names(self): return self.lists.get("document_names", [])
+    @property
+    def document_ids(self): return self.links.get("documents", [])
     @property
     def commitment_ids(self): return self.links.get("commitments", [])
     @property
@@ -159,6 +165,30 @@ class DecisionState(_BaseView):
     def status(self): return self.fields.get("status", "open")
 
 
+class ChannelState(_BaseView):
+    @property
+    def name(self): return self.fields.get("name")
+    @property
+    def visibility(self): return self.fields.get("visibility")
+    @property
+    def workspace_id(self): return self.fields.get("workspace_id")
+    @property
+    def person_ids(self): return self.links.get("people", [])
+
+
+class DocumentState(_BaseView):
+    @property
+    def title(self): return self.fields.get("title")
+    @property
+    def owner_emails(self): return self.fields.get("owners", [])     # raw emails from the payload
+    @property
+    def drive_id(self): return self.fields.get("drive_id")
+    @property
+    def project_ids(self): return self.links.get("projects", [])
+    @property
+    def owner_ids(self): return self.links.get("owners", [])         # resolved Person entity_ids
+
+
 _VIEW_FOR = {
     EntityType.PERSON: PersonState,
     EntityType.COMPANY: CompanyState,
@@ -169,11 +199,15 @@ _VIEW_FOR = {
     EntityType.RELATIONSHIP: RelationshipState,
     EntityType.COMMITMENT: CommitmentState,
     EntityType.DECISION: DecisionState,
+    EntityType.CHANNEL: ChannelState,
+    EntityType.DOCUMENT: DocumentState,
 }
 
 
 def _view(entity_type: EntityType, raw: dict) -> _BaseView:
-    cls = _VIEW_FOR[entity_type]
+    # Fallback to the base view for any entity type without a typed class, so a new
+    # Memory entity can never crash a read (the completeness test forces a typed view).
+    cls = _VIEW_FOR.get(entity_type, _BaseView)
     return cls(
         entity_id=raw["entity_id"],
         first_seen=raw.get("first_seen"),
@@ -201,15 +235,17 @@ class OrganizationalState:
         bucket = self.entities.get(entity_type.value, {})
         return [_view(entity_type, bucket[k]) for k in sorted(bucket)]
 
-    def people(self): return self._by_type(EntityType.PERSON)
-    def companies(self): return self._by_type(EntityType.COMPANY)
-    def customers(self): return self._by_type(EntityType.CUSTOMER)
-    def projects(self): return self._by_type(EntityType.PROJECT)
-    def meetings(self): return self._by_type(EntityType.MEETING)
-    def threads(self): return self._by_type(EntityType.THREAD)
-    def relationships(self): return self._by_type(EntityType.RELATIONSHIP)
-    def commitments(self): return self._by_type(EntityType.COMMITMENT)
-    def decisions(self): return self._by_type(EntityType.DECISION)
+    def people(self) -> list[PersonState]: return cast("list[PersonState]", self._by_type(EntityType.PERSON))
+    def companies(self) -> list[CompanyState]: return cast("list[CompanyState]", self._by_type(EntityType.COMPANY))
+    def customers(self) -> list[CustomerState]: return cast("list[CustomerState]", self._by_type(EntityType.CUSTOMER))
+    def projects(self) -> list[ProjectState]: return cast("list[ProjectState]", self._by_type(EntityType.PROJECT))
+    def meetings(self) -> list[MeetingState]: return cast("list[MeetingState]", self._by_type(EntityType.MEETING))
+    def threads(self) -> list[ThreadState]: return cast("list[ThreadState]", self._by_type(EntityType.THREAD))
+    def relationships(self) -> list[RelationshipState]: return cast("list[RelationshipState]", self._by_type(EntityType.RELATIONSHIP))
+    def commitments(self) -> list[CommitmentState]: return cast("list[CommitmentState]", self._by_type(EntityType.COMMITMENT))
+    def decisions(self) -> list[DecisionState]: return cast("list[DecisionState]", self._by_type(EntityType.DECISION))
+    def channels(self) -> list[ChannelState]: return cast("list[ChannelState]", self._by_type(EntityType.CHANNEL))
+    def documents(self) -> list[DocumentState]: return cast("list[DocumentState]", self._by_type(EntityType.DOCUMENT))
 
     def counts(self) -> dict[str, int]:
         """Pure facts only — counts, never interpretations."""
