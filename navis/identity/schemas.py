@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from navis.identity.models import Role
 from navis.platform.config import settings
@@ -60,6 +60,27 @@ class LoginRequest(BaseModel):
         return _normalize_email(v)
 
 
+class GoogleAuthRequest(BaseModel):
+    """Body for POST /auth/google.
+
+    The frontend uses the OAuth2 authorization-code flow (preferred), which
+    returns a `code` from `google.accounts.oauth2.initCodeClient`. The legacy
+    id_token path is kept for backward compatibility.
+    Exactly one of `code` or `id_token` must be present.
+    """
+
+    code: str | None = Field(None, description="OAuth2 authorization code (preferred)")
+    id_token: str | None = Field(None, description="Google id_token (legacy fallback)")
+
+    @model_validator(mode="after")
+    def _require_exactly_one(self) -> "GoogleAuthRequest":
+        if not self.code and not self.id_token:
+            raise ValueError("provide either 'code' or 'id_token'")
+        if self.code and self.id_token:
+            raise ValueError("provide either 'code' or 'id_token', not both")
+        return self
+
+
 class TokenPair(BaseModel):
     access_token: str
     refresh_token: str
@@ -67,6 +88,12 @@ class TokenPair(BaseModel):
     # Access-token lifetime in seconds, so clients (web/mobile/agents) needn't decode
     # the JWT to schedule a refresh.
     expires_in: int = Field(default_factory=lambda: settings.access_token_expire_minutes * 60)
+    # Set by the Google SSO route so the frontend knows where to redirect:
+    #   is_new_user=True  → /onboarding  (first-time signup via Google)
+    #   is_new_user=False, onboarding_completed=False → /onboarding (started but not done)
+    #   is_new_user=False, onboarding_completed=True  → /dashboard
+    is_new_user: bool = False
+    onboarding_completed: bool = False
 
 
 class RefreshRequest(BaseModel):
@@ -96,3 +123,4 @@ class MeOut(BaseModel):
     user: UserOut
     organization: OrganizationOut
     role: Role
+    onboarding_completed: bool = False

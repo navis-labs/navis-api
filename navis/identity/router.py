@@ -10,8 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
 
 from navis.identity.dependencies import CurrentContext, get_current_context
+from navis.identity.google_auth import GoogleAuthError, GoogleAuthService
 from navis.identity.models import Organization, Role, User
 from navis.identity.schemas import (
+    GoogleAuthRequest,
     LoginRequest,
     MeOut,
     OrganizationOut,
@@ -27,6 +29,8 @@ from navis.platform.cache import redis_client
 from navis.platform.database import get_session
 from navis.platform.events import DomainEvent, EventType, event_bus
 from navis.platform.security import TokenError, decode_token
+from navis.organization.contract import OnboardingStage, stage_index
+from navis.organization.repository import OrganizationRepository
 
 router = APIRouter(prefix="/auth", tags=["identity"])
 
@@ -87,6 +91,67 @@ async def login(data: LoginRequest, request: Request, db: AsyncSession = Depends
     return TokenPair(access_token=access, refresh_token=refresh)
 
 
+@router.post("/google", response_model=TokenPair)
+async def google_login(
+    data: GoogleAuthRequest,
+    db: AsyncSession = Depends(get_session),
+) -> TokenPair:
+    """Google SSO login — accepts an OAuth2 authorization code OR a raw id_token.
+
+    Flow:
+      1. Verify the Google credential (code exchange or id_token verification).
+      2. Find-or-create the user + org (IdentityService.google_signin).
+      3. Issue a JWT access + refresh token pair.
+      4. Emit ORG_CREATED for new users so orchestration bootstraps the org.
+      5. Return TokenPair with is_new_user + onboarding_completed flags.
+
+    Frontend routing logic:
+      is_new_user=True or onboarding_completed=False  →  /onboarding
+      onboarding_completed=True                        →  /dashboard
+    """
+    google_svc = GoogleAuthService()
+    try:
+        if data.code:
+            identity = await google_svc.verify_code(data.code)
+        else:
+            identity = await google_svc.verify_id_token(data.id_token)  # type: ignore[arg-type]
+    except GoogleAuthError as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
+
+    svc = IdentityService(db)
+    try:
+        user, org_id, is_new_user, onboarding_completed = await svc.google_signin(
+            email=identity.email,
+            google_sub=identity.google_sub,
+            full_name=identity.full_name,
+        )
+    except AuthError as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
+
+    access, refresh = await svc.issue_tokens(user, org_id)
+    await db.commit()
+
+    # Emit ORG_CREATED for brand-new users so the orchestration layer bootstraps
+    # lifecycle/onboarding/entitlements. Emit AFTER commit — the org row must be
+    # durable before subscribers try to read it (commit-before-publish pattern).
+    if is_new_user and org_id is not None:
+        await event_bus.publish(
+            DomainEvent(
+                type=EventType.ORG_CREATED,
+                org_id=org_id,
+                source="identity",
+                payload={"organization_id": str(org_id), "user_id": str(user.id)},
+            )
+        )
+
+    return TokenPair(
+        access_token=access,
+        refresh_token=refresh,
+        is_new_user=is_new_user,
+        onboarding_completed=onboarding_completed,
+    )
+
+
 @router.post("/refresh", response_model=TokenPair)
 async def refresh(data: RefreshRequest, db: AsyncSession = Depends(get_session)) -> TokenPair:
     svc = IdentityService(db)
@@ -140,8 +205,18 @@ async def me(
     db: AsyncSession = Depends(get_session),
 ) -> MeOut:
     org = await db.get(Organization, ctx.org_id)
+    # Determine onboarding_completed from the org's onboarding stage.
+    onboarding_completed = False
+    if ctx.org_id is not None:
+        onboarding_row = await OrganizationRepository(db).get_onboarding(ctx.org_id)
+        if onboarding_row is not None:
+            current_stage = OnboardingStage(onboarding_row.stage)
+            onboarding_completed = (
+                stage_index(current_stage) >= stage_index(OnboardingStage.PROFILE_COMPLETE)
+            )
     return MeOut(
         user=UserOut.model_validate(ctx.user),
         organization=OrganizationOut.model_validate(org),
         role=Role(ctx.role),
+        onboarding_completed=onboarding_completed,
     )

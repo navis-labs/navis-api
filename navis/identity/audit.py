@@ -54,6 +54,7 @@ class AuditAction(StrEnum):
     SERVICE_ACCOUNT_ROTATE = "service_account_rotate"
     SERVICE_ACCOUNT_REVOKE = "service_account_revoke"
     SSO_UPDATED = "sso_updated"
+    SSO_LOGIN = "sso_login"            # successful SSO sign-in (google/oidc/saml)
     USER_DEACTIVATE = "user_deactivate"
 
 

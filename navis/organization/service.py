@@ -23,7 +23,9 @@ from navis.organization.onboarding import OnboardingService
 from navis.organization.repository import OrganizationRepository
 from navis.platform.database.base import utcnow
 
-_PROFILE_REQUIRED = ("company_name", "industry")
+# Minimum fields required to advance to PROFILE_COMPLETE.
+# These are the onboarding form fields the user must fill in.
+_PROFILE_REQUIRED = ("company_name", "industry", "team_size", "org_stage")
 
 
 class OrganizationService:

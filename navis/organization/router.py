@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.authz import Principal, get_principal, require_permission
 from navis.identity.permissions import Permission
-from navis.organization.contract import Capability, Plan
+from navis.organization.contract import Capability, OnboardingStage, Plan, stage_index
 from navis.organization.feature_flags import FeatureFlagService
 from navis.organization.repository import OrganizationRepository
 from navis.organization.service import OrganizationService
@@ -27,6 +27,10 @@ class ProfileBody(BaseModel):
     # ISO 3166-1 alpha-2. The column is varchar(2); without this a 3+ char value
     # overflows the column and surfaces as an unhandled 500 instead of a clean 422.
     hq_country: str | None = Field(None, min_length=2, max_length=2)
+    # Onboarding form fields (Phase 1)
+    team_size: str | None = Field(None, max_length=16)
+    org_stage: str | None = Field(None, max_length=32)
+    primary_goal: str | None = Field(None, max_length=500)
 
 
 class PlanBody(BaseModel):
@@ -50,6 +54,7 @@ async def get_profile(
     return {"profile": {
         "company_name": row.company_name, "website": row.website, "industry": row.industry,
         "employee_count": row.employee_count, "hq_country": row.hq_country,
+        "team_size": row.team_size, "org_stage": row.org_stage, "primary_goal": row.primary_goal,
     }}
 
 
@@ -61,6 +66,30 @@ async def update_profile(
 ) -> dict[str, Any]:
     await OrganizationService(db).update_profile(p.org_id, body.model_dump(), actor_id=p.subject_id)
     return {"status": "updated"}
+
+
+@router.get("/onboarding/status")
+async def onboarding_status(
+    p: Principal = Depends(get_principal),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Returns the current onboarding stage and whether profile onboarding is complete.
+
+    Used by the frontend AuthGuard to gate dashboard access without hitting /auth/me
+    (which requires a heavier principal resolution). Lightweight single-table read.
+    """
+    row = await OrganizationRepository(db).get_onboarding(p.org_id)
+    stage = row.stage if row else OnboardingStage.CREATED.value
+    onboarding_completed = False
+    if row is not None:
+        current = OnboardingStage(row.stage)
+        onboarding_completed = (
+            stage_index(current) >= stage_index(OnboardingStage.PROFILE_COMPLETE)
+        )
+    return {
+        "stage": stage,
+        "onboarding_completed": onboarding_completed,
+    }
 
 
 @router.get("/entitlements")

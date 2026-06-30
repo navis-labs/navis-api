@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +15,8 @@ from navis.identity.models import Membership, Organization, Role, Session, User
 from navis.identity.org_service import OrganizationService
 from navis.identity.schemas import SignupRequest
 from navis.identity.tokens import TokenRevocationService
+from navis.organization.contract import OnboardingStage, stage_index
+from navis.organization.repository import OrganizationRepository
 from navis.platform.config import settings
 from navis.platform.monitoring import get_request_id
 from navis.platform.security import (
@@ -81,6 +82,108 @@ class IdentityService:
         if not user.is_active:
             raise AuthError("account disabled")
         return user
+
+    async def google_signin(
+        self,
+        *,
+        email: str,
+        google_sub: str,
+        full_name: str | None,
+    ) -> tuple[User, uuid.UUID | None, bool, bool]:
+        """Find-or-create a user identified by their Google account.
+
+        Returns a 4-tuple:
+          (user, org_id, is_new_user, onboarding_completed)
+
+        Behavior:
+          • Existing user with google_sub match  → fast path, no writes.
+          • Existing user with email match        → backfill google_sub.
+          • Unknown email                         → create User + Org + Membership.
+
+        `onboarding_completed` is True when the org's onboarding stage is at
+        or beyond PROFILE_COMPLETE (i.e. the org form was already submitted).
+        """
+        email = normalize_email(email)
+        is_new_user = False
+
+        # 1. Look up by google_sub first (most specific — immutable Google identifier).
+        user = await self.db.scalar(
+            select(User).where(User.google_sub == google_sub)
+        )
+
+        # 2. Fall back to email lookup (covers pre-invited users + password-signup users).
+        if user is None:
+            user = await self.db.scalar(
+                select(User).where(User.email == email)
+            )
+
+        if user is not None:
+            # Backfill google_sub so future lookups hit the fast path.
+            if user.google_sub != google_sub:
+                user.google_sub = google_sub
+            if not user.is_active:
+                raise AuthError("account disabled")
+            # Backfill full_name if the user has none (e.g. pre-invited stub).
+            if not user.full_name and full_name:
+                user.full_name = full_name
+            await self.db.flush()
+        else:
+            # Brand-new user — create User + Org + Membership atomically.
+            is_new_user = True
+            try:
+                async with self.db.begin_nested():  # SAVEPOINT: rolls back only on conflict
+                    user = User(
+                        email=email,
+                        full_name=full_name,
+                        google_sub=google_sub,
+                        is_verified=True,   # Google already verified the email
+                        is_active=True,
+                    )
+                    self.db.add(user)
+                    await self.db.flush()
+            except IntegrityError:
+                raise AuthError("email already registered")
+
+            # Create the org. Slug collisions are handled by OrganizationService's retry loop.
+            org_name = full_name or email.split("@")[0]
+            org = await OrganizationService(self.db).create(name=org_name)
+            await self.db.flush()
+
+            membership = Membership(user_id=user.id, organization_id=org.id, role=Role.FOUNDER)
+            self.db.add(membership)
+            await self.db.flush()
+
+            await AuditService(self.db).record(
+                AuditAction.SIGNUP,
+                org_id=org.id,
+                actor_id=user.id,
+                target_id=str(org.id),
+                metadata={"method": "google_sso"},
+            )
+
+        # Resolve org membership for token issuance.
+        membership = await self.primary_membership(user)
+        org_id = membership.organization_id if membership else None
+
+        # Determine if onboarding has been completed (PROFILE_COMPLETE or beyond).
+        onboarding_completed = False
+        if org_id is not None:
+            onboarding_row = await OrganizationRepository(self.db).get_onboarding(org_id)
+            if onboarding_row is not None:
+                current_stage = OnboardingStage(onboarding_row.stage)
+                onboarding_completed = (
+                    stage_index(current_stage) >= stage_index(OnboardingStage.PROFILE_COMPLETE)
+                )
+
+        await AuditService(self.db).record(
+            AuditAction.SSO_LOGIN,
+            org_id=org_id,
+            actor_id=user.id,
+            target_id=str(user.id),
+            metadata={"method": "google", "request_id": get_request_id()},
+        )
+
+        return user, org_id, is_new_user, onboarding_completed
 
     async def record_login(self, user: User, org_id: uuid.UUID | None, *, method: str = "password") -> None:
         """Audit a SUCCESSFUL login exactly once (IDENTITY-002). Called only from the

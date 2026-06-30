@@ -49,6 +49,10 @@ class OrganizationProfile(Base):
     industry: Mapped[str | None] = mapped_column(String(128), nullable=True)
     employee_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     hq_country: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    # Onboarding form fields (Phase 1)
+    team_size: Mapped[str | None] = mapped_column(String(16), nullable=True)   # "1", "2-10", "11-50", etc.
+    org_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)   # "idea", "pre-seed", "seed", etc.
+    primary_goal: Mapped[str | None] = mapped_column(String(500), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
