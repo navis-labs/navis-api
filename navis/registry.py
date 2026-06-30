@@ -13,6 +13,7 @@ from navis.organization import models as _organization_models  # noqa: F401
 from navis.signals import models as _signal_models  # noqa: F401
 from navis.memory import models as _memory_models  # noqa: F401
 from navis.state.v2 import snapshots as _state_v2_snapshots  # noqa: F401
+from navis.context import repository as _context_repository  # noqa: F401  (context_bundles cache)
 from navis.decisions import models as _decision_models  # noqa: F401
 from navis.execution import models as _execution_models  # noqa: F401
 from navis.observation import models as _observation_models  # noqa: F401
