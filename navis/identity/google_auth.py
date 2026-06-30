@@ -19,6 +19,7 @@ Security notes:
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +34,29 @@ logger = get_logger("identity.google_auth")
 
 # Google's token endpoint — where we exchange an auth code for tokens.
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+# Module-level pooled httpx client. Created lazily so importing this module does
+# not allocate sockets, and closed by the FastAPI lifespan on shutdown. Reused
+# across requests so we don't re-do TLS to Google on every SSO login.
+_HTTP_CLIENT: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        _HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
+        )
+    return _HTTP_CLIENT
+
+
+async def aclose_http_client() -> None:
+    """Drain the pooled Google OAuth client. Called from the FastAPI lifespan."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is not None:
+        await _HTTP_CLIENT.aclose()
+        _HTTP_CLIENT = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,17 +110,19 @@ class GoogleAuthService:
         if not raw_id_token:
             raise GoogleAuthError("Google token endpoint did not return an id_token")
 
-        return self._verify_id_token_string(raw_id_token)
+        # google-auth's verify is synchronous (uses `requests` + does crypto). Off-load
+        # to a worker thread so we don't block the event loop on every SSO login.
+        return await asyncio.to_thread(self._verify_id_token_string, raw_id_token)
 
     async def verify_id_token(self, raw_id_token: str) -> GoogleIdentity:
         """Verify a raw Google id_token (e.g. from accounts.id one-tap).
 
-        Synchronous underneath (google-auth uses requests, not httpx), but
-        wrapped here so callers use a uniform async interface.
+        google-auth is sync (requests + crypto); we off-load via `to_thread` so the
+        async route is not blocked on signature verification.
         """
         if not self._client_id:
             raise GoogleAuthError("Google OAuth is not configured (missing GOOGLE_CLIENT_ID)")
-        return self._verify_id_token_string(raw_id_token)
+        return await asyncio.to_thread(self._verify_id_token_string, raw_id_token)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -112,8 +138,7 @@ class GoogleAuthService:
             "grant_type": "authorization_code",
         }
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(_GOOGLE_TOKEN_URL, data=payload)
+            resp = await _get_http_client().post(_GOOGLE_TOKEN_URL, data=payload)
         except httpx.RequestError as exc:
             logger.warning("google token exchange network error: %s", exc)
             raise GoogleAuthError("could not reach Google's token endpoint") from exc

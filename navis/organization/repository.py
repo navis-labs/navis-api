@@ -233,6 +233,32 @@ class OrganizationRepository:
             await self.db.execute(stmt, {"org": str(org_id), "cap": capability, "kill": kill_flag})
         ).mappings().one()
 
+    async def snapshot_capabilities(
+        self, org_id: uuid.UUID, capabilities: list[str]
+    ) -> list[RowMapping]:
+        """Bulk counterpart to `resolve_capability`: all decision inputs for N
+        capabilities in ONE round-trip — collapses the dashboard's /entitlements path
+        from N×RTT to 1×RTT. Returns one row per requested capability with the same
+        shape (status, plan, explicit, killed) so the same _decide() consumes either.
+        Decision logic stays in EntitlementService; this only fetches. The kill EXISTS
+        mirrors `is_killed`'s fail-safe OR (org-specific OR global)."""
+        stmt = text(
+            "WITH base AS (SELECT CAST(:org AS uuid) AS oid), "
+            "     caps AS (SELECT unnest(CAST(:caps AS text[])) AS cap) "
+            "SELECT c.cap AS capability, l.status AS status, l.plan AS plan, "
+            "       e.enabled AS explicit, "
+            "       EXISTS(SELECT 1 FROM organization_feature_flags f "
+            "              WHERE f.flag = 'kill:' || c.cap "
+            "                AND (f.organization_id = b.oid OR f.organization_id IS NULL) "
+            "                AND f.enabled) AS killed "
+            "FROM caps c CROSS JOIN base b "
+            "LEFT JOIN organization_lifecycles l ON l.organization_id = b.oid "
+            "LEFT JOIN organization_entitlements e "
+            "  ON e.organization_id = b.oid AND e.capability = c.cap"
+        )
+        result = await self.db.execute(stmt, {"org": str(org_id), "caps": capabilities})
+        return list(result.mappings().all())
+
     # ---- read-side rollup ----
     async def rollup_row(self, org_id: uuid.UUID) -> RowMapping:
         """One round-trip rollup of the three org tables (all PK=organization_id).

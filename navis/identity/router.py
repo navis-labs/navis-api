@@ -94,21 +94,32 @@ async def login(data: LoginRequest, request: Request, db: AsyncSession = Depends
 @router.post("/google", response_model=TokenPair)
 async def google_login(
     data: GoogleAuthRequest,
+    request: Request,
     db: AsyncSession = Depends(get_session),
 ) -> TokenPair:
     """Google SSO login — accepts an OAuth2 authorization code OR a raw id_token.
 
     Flow:
-      1. Verify the Google credential (code exchange or id_token verification).
-      2. Find-or-create the user + org (IdentityService.google_signin).
-      3. Issue a JWT access + refresh token pair.
-      4. Emit ORG_CREATED for new users so orchestration bootstraps the org.
-      5. Return TokenPair with is_new_user + onboarding_completed flags.
+      1. IP throttle gate (before any crypto / Google round-trip).
+      2. Verify the Google credential (code exchange or id_token verification).
+      3. Find-or-create the user + org (IdentityService.google_signin).
+      4. Issue a JWT access + refresh token pair.
+      5. Emit ORG_CREATED for new users so orchestration bootstraps the org.
+      6. Return TokenPair with is_new_user + onboarding_completed flags.
 
     Frontend routing logic:
       is_new_user=True or onboarding_completed=False  →  /onboarding
       onboarding_completed=True                        →  /dashboard
     """
+    throttle = LoginThrottle(redis_client)
+    ip = _client_ip(request)
+
+    # SSO gate: we don't know the email until AFTER Google verifies the credential,
+    # so the IP counter is the only thing we can check up front. Same generic 401
+    # the password path uses — no enumeration, no lock-state leak.
+    if await throttle.is_ip_locked(ip):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, _GENERIC_AUTH_ERROR)
+
     google_svc = GoogleAuthService()
     try:
         if data.code:
@@ -116,6 +127,9 @@ async def google_login(
         else:
             identity = await google_svc.verify_id_token(data.id_token)  # type: ignore[arg-type]
     except GoogleAuthError as exc:
+        # Bogus code / expired token / Google unreachable — count it as a failure so
+        # a flood can't burn Google's token-endpoint quota or our CPU on JWT verify.
+        await throttle.record_ip_failure(ip)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
 
     svc = IdentityService(db)

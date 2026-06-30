@@ -39,8 +39,16 @@ class LoginThrottle:
         self.lockout_seconds = lockout_seconds if lockout_seconds is not None else settings.login_lockout_seconds
 
     @staticmethod
-    def _keys(email: str, ip: str) -> tuple[str, str]:
-        return (f"login:fail:email:{email.strip().lower()}", f"login:fail:ip:{ip}")
+    def _email_key(email: str) -> str:
+        return f"login:fail:email:{email.strip().lower()}"
+
+    @staticmethod
+    def _ip_key(ip: str) -> str:
+        return f"login:fail:ip:{ip}"
+
+    @classmethod
+    def _keys(cls, email: str, ip: str) -> tuple[str, str]:
+        return (cls._email_key(email), cls._ip_key(ip))
 
     async def is_locked(self, email: str, ip: str) -> bool:
         """True if either the email or IP counter has reached the threshold.
@@ -83,3 +91,33 @@ class LoginThrottle:
                 logger.info("login.unlocked email=%s ip=%s", _mask(email), ip)
         except RedisError:
             metrics.incr("login.throttle.redis_error", labels={"op": "reset"})
+
+    # ---- IP-only API (used by SSO endpoints where email is not known until AFTER
+    # cryptographic verification, so only the IP counter can gate the work). The key
+    # namespace is shared with the email/ip throttle above — an IP spraying both
+    # /auth/login and /auth/google reaches the threshold faster, not slower.
+
+    async def is_ip_locked(self, ip: str) -> bool:
+        try:
+            v = await self.redis.get(self._ip_key(ip))
+            hits = int(v) if v is not None else 0
+            locked = hits >= self.max_attempts
+            if locked:
+                metrics.incr("login.locked", labels={"by": "ip"})
+                logger.warning("login.locked ip=%s (ip-only)", ip)
+            return locked
+        except RedisError:
+            metrics.incr("login.throttle.redis_error", labels={"op": "ip_check"})
+            logger.warning("login.throttle redis unavailable on ip_check — failing open")
+            return False
+
+    async def record_ip_failure(self, ip: str) -> None:
+        try:
+            key = self._ip_key(ip)
+            await self.redis.incr(key)
+            await self.redis.expire(key, self.lockout_seconds)
+            metrics.incr("login.failed", labels={"by": "ip"})
+            logger.info("login.failed ip=%s (ip-only)", ip)
+        except RedisError:
+            metrics.incr("login.throttle.redis_error", labels={"op": "ip_record"})
+            logger.warning("login.throttle redis unavailable on ip_record — failing open")

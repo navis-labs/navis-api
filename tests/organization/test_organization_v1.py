@@ -179,6 +179,40 @@ async def test_metrics_rollup_shape():
     assert set(roll) == {"status", "plan", "stage", "signals_count", "memory_count", "ttfi_seconds", "activation_score"}
 
 
+# ---- snapshot N+1 fix: bulk capability resolution ----
+
+async def test_snapshot_agrees_with_can_use_across_all_capabilities():
+    """snapshot() (1 SQL roundtrip) must return identical decisions to can_use()
+    (1 SQL roundtrip per cap) for every Capability. Guards against drift between the
+    single-row and multi-row resolution paths — both feed through _decide."""
+    repo = FakeOrgRepo()
+    ent = EntitlementService(repo)
+    await BillingService(repo, ent).set_plan(ORG_A, Plan.PRO)
+    # Mix in: an explicit grant beyond plan + an org-specific kill switch.
+    await ent.set(ORG_A, Capability.EXECUTION, True)
+    await FeatureFlagService(repo).set(
+        ORG_A, kill_switch_flag(Capability.MEMORY.value), kind="kill_switch", enabled=True
+    )
+
+    snap = await ent.snapshot(ORG_A)
+    # Shape: one entry per Capability value, nothing more, nothing less.
+    assert set(snap.keys()) == {c.value for c in Capability}
+    # Every value matches can_use() for that capability — no drift.
+    for cap in Capability:
+        assert snap[cap.value] == await ent.can_use(ORG_A, cap), f"drift on {cap.value}"
+
+
+async def test_snapshot_respects_suspended_lifecycle():
+    """SUSPENDED orgs deny EVERYTHING through both can_use and snapshot."""
+    repo = FakeOrgRepo()
+    ent = EntitlementService(repo)
+    await BillingService(repo, ent).set_plan(ORG_A, Plan.ENTERPRISE)
+    await LifecycleService(repo).activate(ORG_A)
+    await LifecycleService(repo).suspend(ORG_A)
+    snap = await ent.snapshot(ORG_A)
+    assert all(v is False for v in snap.values())
+
+
 # ---- capability contract sanity ----
 
 def test_plan_capability_monotonicity():

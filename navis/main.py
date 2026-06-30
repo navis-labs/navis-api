@@ -13,6 +13,7 @@ from fastapi.responses import PlainTextResponse
 
 import navis.registry  # noqa: F401  (model + event-handler registration side effects)
 from navis.api import api_router
+from navis.identity.google_auth import aclose_http_client as aclose_google_oauth_client
 from navis.platform.cache import redis as cache_redis
 from navis.platform.config import settings
 from navis.platform.database import dispose_engine
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI):
     )
     yield
     logger.info("Navis shutting down — draining connections")
+    await aclose_google_oauth_client()
     await dispose_engine()
     await cache_redis.aclose()
 

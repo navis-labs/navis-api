@@ -25,28 +25,40 @@ class EntitlementService:
         self.repo = repo
         self.flags = flags or FeatureFlagService(repo)
 
-    async def can_use(self, org_id: uuid.UUID, capability: Capability | str) -> bool:
-        cap = capability.value if isinstance(capability, Capability) else capability
-
-        # ONE round-trip for all decision inputs (was 3 sequential reads — the hot path).
-        # Resolution order is unchanged: lifecycle gate -> kill switch -> explicit -> plan.
-        r = await self.repo.resolve_capability(org_id, cap, kill_flag=kill_switch_flag(cap))
-
-        status = r["status"] or LifecycleStatus.TRIAL.value
-        if status in (LifecycleStatus.SUSPENDED.value, LifecycleStatus.CHURNED.value):
+    @staticmethod
+    def _decide(
+        *,
+        status: str | None,
+        plan: str | None,
+        explicit: bool | None,
+        killed: bool,
+        capability: str,
+    ) -> bool:
+        """The single decision function — both can_use() (one row) and snapshot() (N rows)
+        feed through this, so they can NEVER disagree about a capability. Resolution
+        order matches the module docstring: lifecycle -> kill switch -> explicit -> plan.
+        """
+        s = status or LifecycleStatus.TRIAL.value
+        if s in (LifecycleStatus.SUSPENDED.value, LifecycleStatus.CHURNED.value):
             return False
-
-        if r["killed"]:
+        if killed:
             return False
-
-        if r["explicit"] is not None:
-            return bool(r["explicit"])
-
-        plan = Plan(r["plan"]) if r["plan"] else Plan.FREE
-        # Compare by VALUE (not Capability(cap)) so an unknown/garbage capability
+        if explicit is not None:
+            return bool(explicit)
+        p = Plan(plan) if plan else Plan.FREE
+        # Compare by VALUE (not Capability(capability)) so an unknown/garbage capability
         # string denies (False) instead of raising ValueError -> 500. Identical result
         # for valid capabilities; deny-by-default for anything outside the enum.
-        return cap in {c.value for c in capabilities_for_plan(plan)}
+        return capability in {c.value for c in capabilities_for_plan(p)}
+
+    async def can_use(self, org_id: uuid.UUID, capability: Capability | str) -> bool:
+        cap = capability.value if isinstance(capability, Capability) else capability
+        # ONE round-trip for all decision inputs (was 3 sequential reads — the hot path).
+        r = await self.repo.resolve_capability(org_id, cap, kill_flag=kill_switch_flag(cap))
+        return self._decide(
+            status=r["status"], plan=r["plan"],
+            explicit=r["explicit"], killed=r["killed"], capability=cap,
+        )
 
     async def seed_for_plan(self, org_id: uuid.UUID, plan: Plan) -> None:
         """Write an explicit entitlement row per capability for the plan (idempotent).
@@ -64,4 +76,16 @@ class EntitlementService:
         await self.repo.flush()
 
     async def snapshot(self, org_id: uuid.UUID) -> dict[str, bool]:
-        return {cap.value: await self.can_use(org_id, cap) for cap in Capability}
+        """All capabilities for an org in ONE round-trip — the dashboard reads this on
+        every page load, so N×can_use would scale linearly with the Capability enum.
+        Both paths share _decide(), so single-cap and bulk can never drift."""
+        caps = [c.value for c in Capability]
+        rows = await self.repo.snapshot_capabilities(org_id, caps)
+        return {
+            row["capability"]: self._decide(
+                status=row["status"], plan=row["plan"],
+                explicit=row["explicit"], killed=row["killed"],
+                capability=row["capability"],
+            )
+            for row in rows
+        }

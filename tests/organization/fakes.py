@@ -120,6 +120,25 @@ class FakeOrgRepo:
             "killed": killed,
         }
 
+    # Bulk counterpart — mirrors the real single-query snapshot_capabilities.
+    async def snapshot_capabilities(self, org_id, capabilities):
+        lc = self.lifecycles.get(org_id)
+        rows = []
+        for cap in capabilities:
+            ent = self.entitlements.get((org_id, cap))
+            killed = any(
+                f.enabled for f in self.flags
+                if f.flag == f"kill:{cap}" and f.organization_id in (org_id, None)
+            )
+            rows.append({
+                "capability": cap,
+                "status": lc.status if lc else None,
+                "plan": lc.plan if lc else None,
+                "explicit": ent.enabled if ent else None,
+                "killed": killed,
+            })
+        return rows
+
     # read-side rollup (mirrors the real single-JOIN query: NULLs for absent tables)
     async def rollup_row(self, org_id):
         lc = self.lifecycles.get(org_id)
