@@ -27,6 +27,20 @@ from tests.context.fakes import FakeStateReader, MemoryContextCache
 from tests.state.fakes import ORG_A, ORG_B, corpus
 
 
+def test_public_surface_is_importable_and_matches_all():
+    """The package __all__ is the public contract: every name resolves, and a caller can
+    catch the whole layer via the exported ContextError (build() raises its subclasses)."""
+    import navis.context as ctx
+
+    assert set(ctx.__all__) == {
+        "ContextService", "ContextRequest", "ContextTask", "ContextBundle",
+        "ActorRef", "PermissionScope", "TokenBudget", "ContextError",
+    }
+    for name in ctx.__all__:
+        assert getattr(ctx, name) is not None  # no dangling/broken re-export
+    assert issubclass(UnknownContextTask, ctx.ContextError)  # the layer is catchable as one type
+
+
 def _svc(*states, cache=None):
     return ContextService(state_service=FakeStateReader(*states), cache=cache)
 

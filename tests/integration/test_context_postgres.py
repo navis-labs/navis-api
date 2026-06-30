@@ -98,3 +98,31 @@ async def test_tenant_isolation(db):
     await repo.delete(ORG_A)
     assert await repo.get(a.context_id) is None
     assert await repo.get(b.context_id) is not None  # other tenant untouched
+
+
+async def test_prune_evicts_old_bundles(db):
+    import datetime as _dt
+
+    await _org(db, ORG_A)
+    repo = ContextCacheRepository(db)
+    bundle = await _bundle(ORG_A)
+    await repo.put(bundle)
+    assert await repo.get(bundle.context_id) is not None
+    evicted = await repo.prune(_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=1))
+    assert evicted >= 1
+    assert await repo.get(bundle.context_id) is None  # disposable: gone, would rebuild
+
+
+async def test_put_self_heals_on_changed_content(db):
+    # Same context_id, different serialized content (a schema-shape change) — DO UPDATE must
+    # overwrite the stale row rather than DO NOTHING (which would strand a permanent miss).
+    import dataclasses
+
+    await _org(db, ORG_A)
+    repo = ContextCacheRepository(db)
+    a = await _bundle(ORG_A)
+    await repo.put(a)
+    b = dataclasses.replace(a, state_watermark={**a.state_watermark, "_probe": "v2"})  # same id, new content
+    await repo.put(b)
+    got = await repo.get(a.context_id)
+    assert got is not None and got.state_watermark.get("_probe") == "v2"  # row self-healed

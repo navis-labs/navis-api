@@ -12,7 +12,12 @@ Public surface (everything else is internal):
 
     bundle = await ContextService(db).build(ContextRequest.full_org(org_id))
     signals = run_reasoning_v2(bundle.state)   # Reasoning is unchanged
+
+`build()` raises a `ContextError` subclass on a bad request / misconfiguration, so a caller
+can catch the whole layer with one type (`ContextError`) — it is part of this public surface.
 """
+from __future__ import annotations
+
 from navis.context.contracts import (
     ActorRef,
     ContextBundle,
@@ -20,6 +25,7 @@ from navis.context.contracts import (
     PermissionScope,
     TokenBudget,
 )
+from navis.context.exceptions import ContextError
 from navis.context.service import ContextService
 from navis.context.tasks import ContextTask
 
@@ -31,4 +37,5 @@ __all__ = [
     "ActorRef",
     "PermissionScope",
     "TokenBudget",
+    "ContextError",
 ]

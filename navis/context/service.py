@@ -8,6 +8,23 @@ addressed ContextBundle that embeds an INDEPENDENT scoped OrganizationalState (n
 alias of the live projection), so Reasoning consumes it through its existing accessors with
 no change and can never corrupt State. Pure + deterministic: identical (state, request) ⇒
 byte-identical bundle.
+
+Production notes (determinations, not defects):
+  * Concurrency / cache stampede — correctness under N concurrent identical requests is
+    guaranteed WITHOUT a lock: the cache key is content-addressed and the durable
+    cache.put is idempotent (ON CONFLICT DO NOTHING), so concurrent builds converge to the
+    identical bundle and never corrupt the cache; the only cost is redundant work on a cold
+    cache. In-process single-flight is a future OPTIMIZATION gated on load profiling, not a
+    correctness fix — deliberately not added to keep this orchestrator stateless and
+    cancellation-clean.
+  * Cancellation — build() is cancellation-aware: a CancelledError mid-build abandons the
+    request, leaves no partial cache entry (cache.put is the final step), and emits no audit
+    (telemetry runs only after a complete bundle).
+  * Timeout — imposed by the CALLER (asyncio.wait_for / Celery time limits / DB statement
+    timeout), never hardcoded here (the service has no knowledge of deployment SLOs).
+  * Event-loop blocking — `_scope_state`'s deep copy is O(scoped entities) and runs only on
+    a cache MISS; FULL_ORG (O(org)) is the low-concurrency daily-brief path. If a high-
+    concurrency large-scoped path emerges, offload the copy to a process pool (GIL-bound).
 """
 from __future__ import annotations
 
@@ -45,8 +62,11 @@ from navis.context.ranking import StructuralRanker
 from navis.context.selectors import DeterministicSelector
 from navis.context.tasks import TASK_SPECS
 from navis.context.telemetry import log_audit, log_built
+from navis.platform.monitoring import get_logger
 from navis.state.v2.models import OrganizationalState
 from navis.state.v2.service import StateService
+
+logger = get_logger("context.service")
 
 
 class ContextService:
@@ -79,7 +99,7 @@ class ContextService:
 
     async def build(self, request: ContextRequest) -> ContextBundle:
         if request.task not in TASK_SPECS:
-            raise UnknownContextTask(f"no selection spec for task {request.task!r}")
+            raise UnknownContextTask(request.task)
 
         # Effective scope = what the actor's roles GRANT ∩ what the request asks for. A
         # non-system actor presenting allow_all is bounded to its role grant here (no
@@ -87,30 +107,49 @@ class ContextService:
         effective = intersect_scopes(request.permissions, self.permission_resolver.resolve(request.actor))
 
         start = time.perf_counter()
-        bundle, cache_hit = await self._build(request, effective)
+        try:
+            bundle, cache_hit = await self._build(request, effective)
+        except Exception:
+            # Failure observability (best-effort) — never mask the original error.
+            try:
+                metrics.incr("build_error", labels={"task": request.task.value})
+            except Exception:
+                pass
+            raise
         latency_ms = (time.perf_counter() - start) * 1000.0
-        metrics.observe_ms("assembly_ms", latency_ms, labels={"task": request.task.value})
-        log_audit(
-            org_id=request.org_id,
-            actor_fingerprint=request.actor.fingerprint(),
-            actor_kind=request.actor.kind,
-            task=request.task.value,
-            context_id=bundle.context_id,
-            permission_fingerprint=effective.fingerprint(),
-            policy_fingerprint=request.policy_fingerprint,
-            entity_count=bundle.budget_report.admitted,
-            bundle_tokens=bundle.budget_report.token_estimate,
-            state_as_of=bundle.state_as_of,
-            latency_ms=latency_ms,
-            cache_hit=cache_hit,
-        )
+
+        # Telemetry isolation: a metrics/audit failure must NEVER discard a valid bundle or
+        # fail a successful request. The bundle is already complete and correct here.
+        try:
+            metrics.observe_ms("assembly_ms", latency_ms, labels={"task": request.task.value})
+            log_audit(
+                org_id=request.org_id,
+                actor_fingerprint=request.actor.fingerprint(),
+                actor_kind=request.actor.kind,
+                task=request.task.value,
+                context_id=bundle.context_id,
+                permission_fingerprint=effective.fingerprint(),
+                policy_fingerprint=request.policy_fingerprint,
+                entity_count=bundle.budget_report.admitted,
+                bundle_tokens=bundle.budget_report.token_estimate,
+                state_as_of=bundle.state_as_of,
+                latency_ms=latency_ms,
+                cache_hit=cache_hit,
+            )
+        except Exception:
+            logger.warning("context telemetry failed (task=%s) — returning the valid bundle",
+                           request.task.value, exc_info=True)
         return bundle
 
     async def _build(
         self, request: ContextRequest, effective: PermissionScope
     ) -> tuple[ContextBundle, bool]:
         state = await self.state_service.get_state(request.org_id)
-        context_id = compute_context_id(request, state)
+        # Fold the active RBAC policy's fingerprint into the cache key so a policy change
+        # invalidates stale bundles (replay-safe authorization).
+        context_id = compute_context_id(
+            request, state, rbac_policy_fingerprint=self.permission_resolver.fingerprint()
+        )
 
         cached = await self.cache.get(context_id)
         if cached is not None:

@@ -203,11 +203,21 @@ class ContextRequest:
 
 
 def compute_context_id(
-    request: ContextRequest, state: OrganizationalState, *, context_version: int = CONTEXT_VERSION
+    request: ContextRequest,
+    state: OrganizationalState,
+    *,
+    context_version: int = CONTEXT_VERSION,
+    rbac_policy_fingerprint: str = "",
 ) -> str:
     """Content-addressed bundle id. Folds the State version (watermark), the task, and the
     actor/permission/policy fingerprints, so any of them changing yields a new id — and an
-    identical request over the identical State always reproduces the same id."""
+    identical request over the identical State always reproduces the same id. A bundle is
+    therefore reproducible from (Actor, PermissionScope, PolicyFingerprint, State, Task).
+
+    `rbac_policy_fingerprint` is the active role->scope policy's digest
+    (RolePermissionResolver.fingerprint()). It is folded in so that changing the RBAC policy
+    (which changes the effective scope for a given actor) invalidates cached bundles —
+    closing the stale-permissions hole."""
     wm = state.watermark
     return _digest(
         str(request.org_id),
@@ -217,6 +227,7 @@ def compute_context_id(
         request.actor.fingerprint(),
         request.permissions.fingerprint(),
         request.policy_fingerprint,
+        rbac_policy_fingerprint,
         # Budget is part of the request semantics: a 10-token bundle and an unbounded
         # bundle for the same (org, state, task, actor) are DIFFERENT artefacts and must
         # never collide in the cache.
