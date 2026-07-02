@@ -94,6 +94,9 @@ async def list_pending(
                 ExecutionRequest.status == ExecutionStatus.REQUESTED.value,
             )
             .order_by(ExecutionRequest.created_at.desc())
+            # Bounded response: the approval queue is human-scale; a runaway proposer must
+            # not turn this endpoint into an unbounded scan + payload.
+            .limit(500)
         )
     ).all()
     return [_serialize(r) for r in rows]

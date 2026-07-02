@@ -4,6 +4,7 @@ Kept minimal and future-ready; activated only when a Google API key is configure
 """
 from __future__ import annotations
 
+import asyncio
 import time
 
 from navis.ml.providers.base import EmbedResult, GenRequest, GenResult, MLProvider, ProviderInfo
@@ -18,11 +19,17 @@ class GeminiProvider(MLProvider):
     def __init__(self, model: str = DEFAULT_MODEL) -> None:
         self._model = model
         self.info = ProviderInfo("gemini", model, EMBED_MODEL, EMBED_DIM, online=True)
+        self._configured = False
 
     def _genai(self):
+        # Configure the SDK once per instance (module-global config; genai owns no client we
+        # pool). embed() offloads its sync SDK call off the event loop (below); request batching
+        # via Gemini's batch endpoint remains a future enhancement.
         import google.generativeai as genai
 
-        genai.configure(api_key=getattr(settings, "google_api_key", None))
+        if not self._configured:
+            genai.configure(api_key=getattr(settings, "google_api_key", None))
+            self._configured = True
         return genai
 
     async def generate(self, req: GenRequest) -> GenResult:
@@ -46,9 +53,14 @@ class GeminiProvider(MLProvider):
     async def embed(self, texts: list[str]) -> EmbedResult:
         genai = self._genai()
         start = time.monotonic()
-        vectors = [
-            genai.embed_content(model=EMBED_MODEL, content=t)["embedding"] for t in texts
-        ]
+
+        # google-generativeai's embed_content is SYNCHRONOUS. Run it OFF the event loop so a
+        # Gemini embed never blocks other concurrent coroutines (generate already uses the async
+        # API). True request batching would need Gemini's batch endpoint — a future enhancement.
+        def _embed_all() -> list[list[float]]:
+            return [genai.embed_content(model=EMBED_MODEL, content=t)["embedding"] for t in texts]
+
+        vectors = await asyncio.to_thread(_embed_all)
         latency = int((time.monotonic() - start) * 1000)
         return EmbedResult(
             vectors=vectors, model=EMBED_MODEL,

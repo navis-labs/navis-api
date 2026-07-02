@@ -17,6 +17,12 @@ _EXECUTION_NAMESPACE = uuid.UUID("e9c1a7b2-4d36-5e80-9a1f-2b3c4d5e6f70")
 
 
 def _canonical(payload: dict[str, Any] | None) -> str:
+    # Determinism constraint: payloads must be JSON-pure (str keys; no set/frozenset).
+    # Both producers guarantee this (proposer builds literals; the API parses JSON), and
+    # `default=str` stays deterministic for UUID/datetime — but a set would stringify in
+    # PYTHONHASHSEED-dependent order, splitting one logical payload into DIFFERENT
+    # idempotency keys across processes (= duplicate side effects). Mixed-type dict keys
+    # fail fast in sort_keys. Keep payloads JSON-pure.
     return json.dumps(payload or {}, sort_keys=True, separators=(",", ":"), default=str)
 
 

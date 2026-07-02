@@ -84,12 +84,20 @@ class DecisionService:
             )
         )
         logger.info("brief %s org=%s decisions=%d", brief_id, org_id, len(decisions))
-        return await self.db.get(DailyBrief, brief_id)
+        brief = await self.db.get(DailyBrief, brief_id)
+        assert brief is not None  # upserted above in this same transaction
+        return brief
 
     async def latest_brief(self, org_id: uuid.UUID) -> DailyBrief | None:
+        # NULLS LAST is load-bearing: as_of is nullable (an empty-state brief — new org, no
+        # facts folded yet — persists with as_of=None under its own watermark-keyed row).
+        # Postgres sorts NULLs FIRST under DESC, so without it that early empty brief would
+        # permanently shadow every later real brief here (empty /brief/today, zero proposed
+        # actions). created_at desc is a stable read tiebreak when as_of values tie; it is
+        # cache-write metadata, never decision identity.
         return await self.db.scalar(
             select(DailyBrief)
             .where(DailyBrief.organization_id == org_id)
-            .order_by(desc(DailyBrief.as_of))
+            .order_by(desc(DailyBrief.as_of).nulls_last(), desc(DailyBrief.created_at))
             .limit(1)
         )

@@ -13,11 +13,13 @@ class ProviderTelemetry:
     def __init__(self) -> None:
         self.counters: Counter = Counter()
 
-    def record(self, provider: str, *, ok: bool, retried: bool, latency_s: float) -> None:
+    # No `retried` counter: the in-call retry count lives inside execute_with_retry
+    # (tenacity) and cannot reach this seam without changing the ProviderResult contract.
+    # The old flag counted "failed" (already counted) as "retried" — false data that would
+    # mislead an incident. Add a real retry metric only when the retry layer can report it.
+    def record(self, provider: str, *, ok: bool, latency_s: float) -> None:
         self.counters[f"{provider}.calls"] += 1
         self.counters[f"{provider}.{'success' if ok else 'failure'}"] += 1
-        if retried:
-            self.counters[f"{provider}.retried"] += 1
         self.counters[f"{provider}.latency_ms_total"] += int(latency_s * 1000)
 
     def success_rate(self, provider: str) -> float | None:

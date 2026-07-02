@@ -15,6 +15,3 @@ PROVIDER_RATE_LIMITS: dict[str, int] = {
     "slack": 50,
     "tasks": 500,  # internal, cheap
 }
-
-# Outbox events older than this while still unpublished are "stuck".
-OUTBOX_STUCK_SECONDS = 120

@@ -160,6 +160,25 @@ async def test_provider_registry_and_dry_run():
     assert res.ok and res.reference.extra.get("dry_run") is True  # safe by default
 
 
+def test_injected_empty_registry_means_no_providers():
+    """Regression (production fix in get_provider): `registry or _DEFAULT_PROVIDERS`
+    treated an explicitly injected EMPTY registry as falsy and silently fell back to the
+    LIVE defaults — a hidden fallback that would dispatch real providers where the caller
+    wired none. Empty must mean empty (lookups miss -> the worker fails closed); only
+    None selects the default registry."""
+    assert get_provider(ActionType.CREATE_TASK.value, {}) is None
+    assert get_provider(ActionType.CREATE_TASK.value) is not None  # None -> defaults
+
+
+def test_every_action_type_has_a_registered_provider():
+    """Registry <-> enum contract lock: a declared ActionType with no provider is exactly the
+    poison-request condition (the worker now fails it closed, but it should never ship). A new
+    ActionType MUST land with its provider in the same change; unknown types stay None."""
+    for t in ActionType:
+        assert get_provider(t.value) is not None, f"no provider registered for {t.value}"
+    assert get_provider("not_a_real_action") is None  # unknowns are None -> worker fails closed
+
+
 async def test_provider_validation_raises():
     with pytest.raises(ProviderValidationError):
         await GmailProvider().validate({"to": "a@x.com"})  # no subject

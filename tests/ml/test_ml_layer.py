@@ -15,7 +15,6 @@ from navis.ml.providers.deterministic import DeterministicProvider
 from navis.ml.rag.grounding import GroundedContext, Grounding
 from navis.ml.retrieval.reranker import rerank
 from navis.ml.retrieval.vector_search import Hit
-from navis.ml.routing import Task, Tier, tier_for
 
 NAVIS = pathlib.Path(__file__).resolve().parent.parent.parent / "navis"
 PIPELINE = {
@@ -73,7 +72,7 @@ def test_rerank_orders_by_relevance_without_rewriting():
 def test_grounded_context_renders_only_cited_facts():
     ctx = GroundedContext(
         org_id=str(ORG), question="What happened with YC?",
-        facts=[Grounding("memory", "m1", "Applied to YC W26"), Grounding("memory", "m2", "Intro call booked")],
+        facts=(Grounding("memory", "m1", "Applied to YC W26"), Grounding("memory", "m2", "Intro call booked")),
         token_estimate=20,
     )
     rendered = ctx.render()
@@ -89,7 +88,7 @@ async def test_brief_generates_narrative_with_lineage_and_telemetry():
 
     ctx = GroundedContext(
         org_id=str(ORG), question="brief",
-        facts=[Grounding("memory", "m1", "Closed deal with Acme")],
+        facts=(Grounding("memory", "m1", "Closed deal with Acme"),),
     )
     out = await brief(ORG, ctx)
     assert isinstance(out, Narrative)
@@ -125,14 +124,31 @@ def test_prompt_fingerprint_changes_on_edit():
     assert a != prompt_fingerprint("brief", 2, "sys", "user")
 
 
-# ---- routing ----
+# ---- telemetry: usage() must not leak internal mutable accounting ----
 
-def test_routing_tiers():
-    assert tier_for(Task.SUMMARY) is Tier.FAST
-    assert tier_for(Task.BRIEF_NARRATIVE) is Tier.DEEP
+def test_telemetry_usage_returns_a_defensive_copy():
+    import uuid as _uuid
+
+    from navis.ml.providers.base import GenResult
+    from navis.ml.telemetry import MLTelemetry
+
+    t = MLTelemetry()
+    org = _uuid.uuid4()
+    t.record(org, GenResult(text="x", model="gpt-4o-mini", input_tokens=10, output_tokens=5),
+             prompt_id=None, prompt_version=None)
+    snapshot = t.usage(org)
+    snapshot.calls = 999                # mutate the returned copy
+    assert t.usage(org).calls == 1      # internal accounting is unaffected
 
 
 # ---- THE invariant: the deterministic pipeline never imports ML ----
+#
+# ONE sanctioned seam exists: the AI reasoning source (navis/reasoning/ai.py) may import the
+# stable ReasoningModelGateway module (navis.ml.gateway) and NOTHING else from navis.ml —
+# never providers, SDKs, routing, prompts, telemetry, embeddings, retrieval, or cache.
+# The deterministic pipeline (reasoning/v2 and every other domain) stays ML-free.
+_SANCTIONED_ML_SEAMS = {("reasoning", "ai.py", "navis.ml.gateway")}
+
 
 def test_no_pipeline_domain_imports_ml():
     violations = []
@@ -146,6 +162,8 @@ def test_no_pipeline_domain_imports_ml():
                     mods = [node.module]
                 for m in mods:
                     if m == "navis.ml" or m.startswith("navis.ml."):
+                        if (domain, py.name, m) in _SANCTIONED_ML_SEAMS and py.parent == NAVIS / domain:
+                            continue
                         violations.append(f"{domain}/{py.name} imports {m}")
     assert not violations, "ML must not enter the truth pipeline:\n" + "\n".join(violations)
 

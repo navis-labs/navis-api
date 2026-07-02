@@ -9,17 +9,13 @@ narrative, never narrative→Decision), routing, telemetry, and evals.
 INVARIANT (enforced by test): no pipeline domain imports navis.ml. ML may READ the
 truth layers for retrieval; it may never inject itself into them.
 """
-from navis.ml.providers import (
-    EmbedResult,
-    GenRequest,
-    GenResult,
-    MLProvider,
-    get_embedding_provider,
-    get_provider,
-)
-from navis.ml.rag import ContextBuilder, GroundedContext
+from navis.ml.gateway import Capability, GatewayRequest, GatewayResponse, ReasoningModelGateway
+from navis.ml.providers import EmbedResult  # the return type of ReasoningModelGateway.embed
 
+# The Gateway is the ONLY entrypoint: every layer above navis.ml imports ONLY these. Provider
+# construction / SDKs / routing / telemetry are IMPLEMENTATION below the gateway and are NOT
+# re-exported here (infra/tests import them from their own module paths). Keeping this surface
+# minimal is what lets providers/routing/telemetry evolve without touching any caller.
 __all__ = [
-    "MLProvider", "GenRequest", "GenResult", "EmbedResult",
-    "get_provider", "get_embedding_provider", "ContextBuilder", "GroundedContext",
+    "ReasoningModelGateway", "GatewayRequest", "GatewayResponse", "Capability", "EmbedResult",
 ]

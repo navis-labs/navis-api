@@ -101,11 +101,24 @@ def validate_change(field: str, old: float, new: float) -> None:
 
 
 def merge_defaults(payload: dict[str, Any] | None) -> dict[str, Any]:
-    """Full policy = defaults overlaid by any provided fields (unknowns dropped)."""
+    """Full policy = defaults overlaid by any provided fields (unknowns dropped).
+
+    TOTAL and fail-safe: this is the read seam that produces the EFFECTIVE policy the
+    pipeline consumes (orchestration -> Decision), and its caller documents "never
+    raises". Every sanctioned writer already validates against POLICY_FIELDS, so for
+    valid stored data this is byte-identical to a bare cast — but a corrupt or
+    historical snapshot value must degrade, never propagate: an out-of-bounds number
+    is clamped to the field's declared safe bounds, and an un-castable value falls
+    back to the field default. Without this, a single bad stored value either crashes
+    brief assembly for the org (ValueError here) or silently empties its briefs
+    (e.g. brief_min_confidence=5.0 filters every signal)."""
     out = dict(DEFAULT_POLICY)
     for k, v in (payload or {}).items():
         if k in POLICY_FIELDS:
-            out[k] = POLICY_FIELDS[k].cast(v)
+            try:
+                out[k] = clamp(k, v)
+            except (TypeError, ValueError):
+                pass  # un-castable stored value -> keep the safe code default
     return out
 
 

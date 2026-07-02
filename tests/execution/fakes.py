@@ -26,7 +26,7 @@ class FakeExecutionRepo:
         self.by_idem: dict[tuple, uuid.UUID] = {}
         self.events: list[SimpleNamespace] = []
         self.dead_letters: list[SimpleNamespace] = []
-        self.inbox: set[tuple] = set()
+        self.log: list[str] = []  # ordering probe: commits (and test-injected markers)
 
     async def upsert_request(self, values: dict[str, Any]):
         idem = (values["organization_id"], values["idempotency_key"])
@@ -54,6 +54,9 @@ class FakeExecutionRepo:
 
     async def flush(self):
         pass
+
+    async def commit(self):
+        self.log.append("commit")
 
     async def claim_executable(self, *, max_attempts, limit=100):
         out = []
@@ -91,12 +94,10 @@ class FakeExecutionRepo:
             if d.id == dlq_id:
                 d.replayed_at = d.resolved_at = _now()
 
-    async def inbox_claim(self, consumer, event_id) -> bool:
-        key = (consumer, event_id)
-        if key in self.inbox:
-            return False
-        self.inbox.add(key)
-        return True
+    async def mark_dead_letter_resolved(self, dlq_id):
+        for d in self.dead_letters:
+            if d.id == dlq_id:
+                d.resolved_at = _now()
 
     async def pending_events(self, *, limit=500):
         return [e for e in self.events if e.published_at is None][:limit]

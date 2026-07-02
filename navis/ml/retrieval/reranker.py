@@ -1,5 +1,9 @@
 """Reranker — reorder candidate hits by relevance to the query.
 
+ONE RESPONSIBILITY -> ONE HOME: this is the SINGLE home for retrieval-stage reranking
+(over `Hit`s). The provider-capability fallback `MLProvider.rerank` (generic cosine over
+raw strings) is a distinct concern; keep them separate — do not add a third reranker.
+
 Default is a deterministic lexical overlap rerank (no network); an online provider's
 rerank can be substituted via the registry. Reranking only REORDERS — it never
 rewrites or invents content, so it cannot fabricate facts.

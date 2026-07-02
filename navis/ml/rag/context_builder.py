@@ -20,6 +20,10 @@ _WORD = re.compile(r"\S+")
 
 def estimate_tokens(text: str) -> int:
     # ~0.75 words/token; conservative integer estimate without a tokenizer dependency.
+    # ONE RESPONSIBILITY -> ONE HOME (per layer): this is the ML/RAG estimator. The Context
+    # layer keeps its OWN deterministic budgeter (navis.context.budget) on the truth path;
+    # the two are separate ON PURPOSE — Context must never depend on navis.ml (layer
+    # integrity / determinism). Do not merge them into a single cross-layer estimator.
     return max(1, int(len(_WORD.findall(text)) / 0.75))
 
 
@@ -53,5 +57,5 @@ class ContextBuilder:
             used += cost
 
         return GroundedContext(
-            org_id=str(org_id), question=question, facts=admitted, token_estimate=used
+            org_id=str(org_id), question=question, facts=tuple(admitted), token_estimate=used
         )

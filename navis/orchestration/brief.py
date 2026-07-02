@@ -35,6 +35,14 @@ def _context_layer_enabled() -> bool:
     return os.environ.get("USE_CONTEXT_LAYER", "false").strip().lower() in ("1", "true", "yes")
 
 
+def _ai_reasoning_enabled() -> bool:
+    """USE_AI_REASONING gates the ADDITIVE AI reasoning pass (navis.reasoning.ai). Default OFF:
+    production stays deterministic-only, byte-identical. Even when ON, the AI pass is fail-open
+    ([] on any failure) and the merge is deterministic-first, so the deterministic signals are
+    always present and authoritative."""
+    return os.environ.get("USE_AI_REASONING", "false").strip().lower() in ("1", "true", "yes")
+
+
 class _PinnedState:
     """A StateReader that returns an already-loaded state — lets Context build a bundle
     over the SAME snapshot we already read (no second get_state, guaranteed consistency)."""
@@ -78,7 +86,15 @@ async def build_brief(db: AsyncSession, org_id: uuid.UUID) -> DailyBrief:
         DomainEvent(type=EventType.STATE_UPDATED, org_id=org_id, source="state.v2",
                     payload=state.counts())
     )
-    signals = run_reasoning_v2(await _reasoning_input(db, org_id, state))
+    reasoning_input = await _reasoning_input(db, org_id, state)
+    signals = run_reasoning_v2(reasoning_input)
+    if _ai_reasoning_enabled():
+        # Additive AI pass over the SAME state the deterministic pass consumed. Imported lazily
+        # (like Context) so the module stays fully removable with the flag off. run_ai_reasoning
+        # never raises; merge_signals keeps deterministic signals authoritative.
+        from navis.reasoning.ai import merge_signals, run_ai_reasoning
+
+        signals = merge_signals(signals, await run_ai_reasoning(reasoning_input))
     watermark = state.watermark.last_memory_id
     policy = await resolve_policy(db, org_id)
     return await DecisionService(db).decide(

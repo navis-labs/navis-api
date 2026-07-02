@@ -18,11 +18,32 @@ class ClaudeProvider(MLProvider):
         self._model = model
         self.info = ProviderInfo("claude", model, "navis-hash-256", 256, online=True)
         self._embedder = DeterministicProvider()
+        self._client_obj = None
+        self._client_loop = None
 
-    async def generate(self, req: GenRequest) -> GenResult:
+    def _client(self):
+        # One AsyncAnthropic (+ its httpx pool) per event loop — reused on a long-lived server
+        # loop, rebuilt on a new loop so a client bound to a closed loop is never reused.
+        import asyncio
+
         from anthropic import AsyncAnthropic
 
-        client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+        loop = asyncio.get_running_loop()
+        if self._client_obj is None or self._client_loop is not loop:
+            # ResilientProvider (registry) is the SOLE retry owner. The anthropic SDK defaults to
+            # max_retries=2; leaving it would DOUBLE-retry (up to 9 provider calls per logical
+            # call during an incident — retry amplification).
+            self._client_obj = AsyncAnthropic(api_key=settings.anthropic_api_key, max_retries=0)
+            self._client_loop = loop
+        return self._client_obj
+
+    async def aclose(self) -> None:
+        client, self._client_obj, self._client_loop = self._client_obj, None, None
+        if client is not None:
+            await client.close()
+
+    async def generate(self, req: GenRequest) -> GenResult:
+        client = self._client()
         start = time.monotonic()
         resp = await client.messages.create(
             model=self._model,

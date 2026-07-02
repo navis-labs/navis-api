@@ -47,6 +47,8 @@ class ExecutionService:
         if repo is not None:
             self.repo = repo
         else:
+            if db is None:
+                raise ValueError("ExecutionService requires `db` when `repo` is not provided")
             from navis.execution.repository import ExecutionRepository
 
             self.repo = ExecutionRepository(db)

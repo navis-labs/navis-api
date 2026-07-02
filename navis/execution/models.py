@@ -117,15 +117,7 @@ class ExecutionDeadLetter(UUIDPrimaryKey, Base):
     )
 
 
-class ExecutionInbox(Base):
-    """Idempotent-consumer dedupe table. A consumer claims an event_id here once;
-    duplicate deliveries (at-least-once outbox) are no-ops."""
-
-    __tablename__ = "execution_inbox"
-
-    # (consumer, event_id) — different consumers each process an event once.
-    consumer: Mapped[str] = mapped_column(String(64), primary_key=True)
-    event_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    processed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
+# NOTE: the idempotent-consumer inbox lives with each CONSUMER domain (ObservationInbox,
+# LearningInbox) — deliberately, so consumers never import the producer. Execution itself
+# consumes no events, so it carries no inbox. (The old `execution_inbox` table is orphaned
+# pending a drop migration.)

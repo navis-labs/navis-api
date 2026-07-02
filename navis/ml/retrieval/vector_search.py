@@ -1,9 +1,9 @@
 """Org-scoped vector search over memory_embeddings (brute-force cosine).
 
-Correct and exact at current scale: fetch an org's embeddings (bounded), score by
-cosine, return top-k. The scale upgrade is a pgvector ANN index behind the SAME
-signature — callers never change. Always tenant-scoped: an org can only search its
-own vectors.
+Fetch an org's embeddings (bounded, ORDERED by memory_id so the candidate set is DETERMINISTIC
+under the cap), score by cosine, return top-k with a stable (score desc, memory_id) tiebreak —
+deterministic and replay-safe. The scale upgrade is a pgvector ANN index behind the SAME
+signature — callers never change. Always tenant-scoped: an org can only search its own vectors.
 """
 from __future__ import annotations
 
@@ -44,6 +44,11 @@ async def search(
                 MemoryEmbedding.model == model,
                 MemoryEmbedding.version == version,
             )
+            # Deterministic candidate selection: ORDER BY the PK so that when an org has more
+            # than `candidate_limit` embeddings, the SAME candidate set is fetched every run
+            # (replay-safe). Without this, `.limit()` returns an unordered/unstable subset →
+            # non-deterministic top-k. (pgvector/ANN is the scale upgrade for full recall.)
+            .order_by(MemoryEmbedding.memory_id)
             .limit(candidate_limit)
         )
     ).all()

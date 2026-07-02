@@ -7,7 +7,7 @@ Truth is never authored by the model — only narrated.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,8 +23,17 @@ class Grounding:
 class GroundedContext:
     org_id: str
     question: str
-    facts: list[Grounding] = field(default_factory=list)
+    facts: tuple[Grounding, ...] = ()
     token_estimate: int = 0
+
+    def __post_init__(self) -> None:
+        # Immutability guarantee: GroundedContext is the ONLY contract this package exports, and
+        # the model treats its facts as ground truth. A `list` would let a caller mutate evidence
+        # after construction (ctx.facts.append(...)) — injecting an un-cited "fact" the model
+        # would then narrate as grounded. Coerce to a tuple so `frozen=True` actually holds for
+        # the evidence. Any iterable (incl. existing list callers) is accepted — backward-compatible.
+        if not isinstance(self.facts, tuple):
+            object.__setattr__(self, "facts", tuple(self.facts))
 
     def render(self) -> str:
         """The exact text handed to the model — facts only, each cited."""

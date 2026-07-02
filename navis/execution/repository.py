@@ -10,13 +10,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.execution.models import (
     ExecutionDeadLetter,
-    ExecutionInbox,
     ExecutionOutbox,
     ExecutionRequest,
 )
@@ -38,6 +37,7 @@ class ExecutionRepository:
         created = (result.rowcount or 0) == 1
         # id is deterministic (uuid5 of org+key), so the existing row has the same id.
         row = await self.db.get(ExecutionRequest, values["id"])
+        assert row is not None  # just inserted, or the prior row under the same id
         return row, created
 
     async def get(self, execution_id: uuid.UUID) -> ExecutionRequest | None:
@@ -57,6 +57,13 @@ class ExecutionRepository:
 
     async def flush(self) -> None:
         await self.db.flush()
+
+    async def commit(self) -> None:
+        """Worker durability point. EXECUTING must be committed BEFORE a provider runs
+        (stale recovery can only reap what is durable), and each terminal transition
+        right after it lands (bounds a crash's duplicate window to one request).
+        Sessions use expire_on_commit=False, so loaded rows stay usable across this."""
+        await self.db.commit()
 
     async def claim_approved(self, *, limit: int = 100) -> Sequence[ExecutionRequest]:
         """Claim APPROVED requests for execution without global locks."""
@@ -149,7 +156,14 @@ class ExecutionRepository:
     async def unresolved_dead_letters(
         self, org_id: uuid.UUID | None = None, *, limit: int = 100
     ) -> Sequence[ExecutionDeadLetter]:
-        stmt = select(ExecutionDeadLetter).where(ExecutionDeadLetter.resolved_at.is_(None))
+        stmt = (
+            select(ExecutionDeadLetter)
+            .where(ExecutionDeadLetter.resolved_at.is_(None))
+            # Deterministic FIFO under the limit: an unordered LIMIT returns an unstable
+            # subset, so replay selection would be nondeterministic and rows past the
+            # window could be starved indefinitely.
+            .order_by(ExecutionDeadLetter.created_at, ExecutionDeadLetter.id)
+        )
         if org_id is not None:
             stmt = stmt.where(ExecutionDeadLetter.organization_id == org_id)
         return (await self.db.scalars(stmt.limit(limit))).all()
@@ -162,28 +176,11 @@ class ExecutionRepository:
             .values(replayed_at=now, resolved_at=now)
         )
 
-    # ---- hardening: inbox (idempotent consumer) ----
-
-    async def inbox_claim(self, consumer: str, event_id: uuid.UUID) -> bool:
-        """True if this consumer is seeing event_id for the FIRST time."""
-        stmt = (
-            pg_insert(ExecutionInbox)
-            .values(consumer=consumer, event_id=event_id)
-            .on_conflict_do_nothing(index_elements=["consumer", "event_id"])
+    async def mark_dead_letter_resolved(self, dlq_id: uuid.UUID) -> None:
+        """Close a dead letter WITHOUT claiming a replay (request gone or terminal)."""
+        await self.db.execute(
+            update(ExecutionDeadLetter)
+            .where(ExecutionDeadLetter.id == dlq_id)
+            .values(resolved_at=datetime.now(timezone.utc))
         )
-        result = await self.db.execute(stmt)
-        return (result.rowcount or 0) == 1
 
-    # ---- hardening: outbox observability ----
-
-    async def outbox_stats(self) -> dict[str, Any]:
-        pending = await self.db.scalar(
-            select(func.count(ExecutionOutbox.id)).where(ExecutionOutbox.published_at.is_(None))
-        )
-        oldest = await self.db.scalar(
-            select(func.min(ExecutionOutbox.created_at)).where(
-                ExecutionOutbox.published_at.is_(None)
-            )
-        )
-        lag = (datetime.now(timezone.utc) - oldest).total_seconds() if oldest else 0.0
-        return {"pending": int(pending or 0), "oldest_lag_seconds": round(lag, 1)}

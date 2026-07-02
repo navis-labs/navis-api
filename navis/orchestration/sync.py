@@ -214,18 +214,35 @@ async def _renew_all_watches() -> dict:
 
 async def _sync_account(provider: str, email: str | None, history_id: str | None) -> dict:
     """Webhook-triggered: sync the specific mailbox the push notification named."""
+    if not email:
+        # A push without a mailbox cannot be routed to a tenant. Never guess: the old
+        # unordered single-row pick could sync an arbitrary org's integration. The periodic
+        # beat sync covers any real backlog, so dropping the notification is safe.
+        logger.warning("pubsub sync: notification without emailAddress provider=%s", provider)
+        return {"matched": False}
     async with session_scope() as db:
-        stmt = select(Integration).where(
-            Integration.provider == IntegrationProvider(provider),
-            Integration.is_active.is_(True),
-        )
-        if email:
-            stmt = stmt.where(Integration.external_account == email)
-        integration = await db.scalar(stmt)
-    if integration is None:
+        integrations = (
+            await db.scalars(
+                select(Integration)
+                .where(
+                    Integration.provider == IntegrationProvider(provider),
+                    Integration.external_account == email,
+                    Integration.is_active.is_(True),
+                )
+                .order_by(Integration.id)  # deterministic across redeliveries
+            )
+        ).all()
+    if not integrations:
         logger.warning("pubsub sync: no integration for %s/%s", provider, email)
         return {"matched": False}
-    return await sync_integration(integration)
+    # (organization_id, provider, external_account) is unique PER ORG, so the same mailbox
+    # can be connected by more than one org. Each integration syncs its OWN org with its OWN
+    # token (self-scoped — no cross-tenant read), so sync every match; the old arbitrary
+    # single pick silently starved the other org's push path until the next beat sync.
+    results = [await sync_integration(i) for i in integrations]
+    if len(results) == 1:
+        return results[0]
+    return {"matched": True, "synced": len(results), "results": results}
 
 
 async def _process_slack_event(team_id: str | None, envelope: dict) -> dict:
@@ -238,23 +255,48 @@ async def _process_slack_event(team_id: str | None, envelope: dict) -> dict:
         return {"matched": False}
     inner_type = (envelope.get("event") or {}).get("type") or envelope.get("type")
     async with session_scope() as db:
-        integration = await db.scalar(
-            select(Integration).where(
-                Integration.provider == IntegrationProvider.SLACK,
-                Integration.external_account == team_id,
-                Integration.is_active.is_(True),
+        integrations = (
+            await db.scalars(
+                select(Integration)
+                .where(
+                    Integration.provider == IntegrationProvider.SLACK,
+                    Integration.external_account == team_id,
+                    Integration.is_active.is_(True),
+                )
+                .order_by(Integration.id)  # deterministic across redeliveries
             )
-        )
-        if integration is None or not integration.user_id:
+        ).all()
+        if not integrations:
             logger.warning("slack event: no active integration for team=%s", team_id)
             return {"matched": False}
 
         # M-1: workspace disconnect / token revocation -> deactivate (don't keep hitting Slack
-        # with a dead token; that failure rate is what trips Slack's 95% auto-disable).
+        # with a dead token; that failure rate is what trips Slack's 95% auto-disable). The
+        # revocation is a WORKSPACE-level fact, so every org's row for this team is dead.
         if inner_type in ("app_uninstalled", "tokens_revoked"):
-            integration.is_active = False
-            logger.warning("slack %s for team=%s; integration deactivated", inner_type, team_id)
-            return {"matched": True, "deactivated": True}
+            for integ in integrations:
+                integ.is_active = False
+            logger.warning(
+                "slack %s for team=%s; %d integration(s) deactivated",
+                inner_type, team_id, len(integrations),
+            )
+            return {"matched": True, "deactivated": len(integrations)}
+
+        # Tenancy guard: (organization_id, provider, external_account) is unique PER ORG, so
+        # two orgs CAN hold active rows for one team_id. Event CONTENT must never be ingested
+        # under an arbitrarily-picked org (cross-tenant injection). Fail CLOSED on ambiguity —
+        # a dropped event is recoverable (Slack backfill); a misattributed one is not.
+        if len(integrations) > 1:
+            logger.error(
+                "slack event: %d active integrations for team=%s — ambiguous tenant, dropped",
+                len(integrations), team_id,
+            )
+            return {"matched": False, "ambiguous": True}
+
+        integration = integrations[0]
+        if not integration.user_id:
+            logger.warning("slack event: integration %s has no user_id", integration.id)
+            return {"matched": False}
 
         ctx = SignalContext(integration.organization_id, integration.user_id, integration.id)
         slack_state = (integration.sync_state or {}).get("slack") or {}
