@@ -1,0 +1,287 @@
+{
+  "info": {
+    "name": "Navis Identity",
+    "_postman_id": "navis-identity-v1",
+    "description": "Manual + scripted tests for Layer 1 (Identity) endpoints.\n\nVariables:\n  base_url       - http://localhost:8000 by default\n  test_email     - auto-generated per-run by the Signup request\n  test_password  - kept in collection scope; meets the schema's strength rules\n  access_token   - auto-captured by Signup/Login/Refresh test scripts\n  refresh_token  - auto-captured by Signup/Login/Refresh test scripts\n  old_refresh    - captured BEFORE Refresh so the Replay request can prove reuse detection\n\nFlow to run end-to-end: Signup -> Me -> Refresh -> Refresh (replay old) -> Logout -> Refresh after logout. The Throttle folder is independent.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8000" },
+    { "key": "test_email", "value": "" },
+    { "key": "test_password", "value": "GoldenPath!2026-Run" },
+    { "key": "access_token", "value": "" },
+    { "key": "refresh_token", "value": "" },
+    { "key": "old_refresh", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": { "method": "GET", "url": "{{base_url}}/health" },
+          "event": [{
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));"
+            ]}
+          }]
+        },
+        {
+          "name": "GET /ready",
+          "request": { "method": "GET", "url": "{{base_url}}/ready" },
+          "event": [{
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('reports DB + Redis', () => pm.expect(body).to.be.an('object'));"
+            ]}
+          }]
+        }
+      ]
+    },
+    {
+      "name": "Core auth flow",
+      "item": [
+        {
+          "name": "Signup",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": { "type": "text/javascript", "exec": [
+                "const suffix = Math.random().toString(36).slice(2, 10);",
+                "pm.collectionVariables.set('test_email', `postman+${suffix}@navis-test.local`);"
+              ]}
+            },
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": [
+                "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                "const b = pm.response.json();",
+                "pm.test('access + refresh issued', () => {",
+                "  pm.expect(b.access_token).to.be.a('string').and.not.empty;",
+                "  pm.expect(b.refresh_token).to.be.a('string').and.not.empty;",
+                "});",
+                "pm.collectionVariables.set('access_token', b.access_token);",
+                "pm.collectionVariables.set('refresh_token', b.refresh_token);"
+              ]}
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/auth/signup",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"password\": \"{{test_password}}\",\n  \"full_name\": \"Postman Tester\",\n  \"organization_name\": \"Postman Co\"\n}" }
+          }
+        },
+        {
+          "name": "Signup duplicate -> 400",
+          "event": [{
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [
+              "pm.test('400 Bad Request', () => pm.response.to.have.status(400));"
+            ]}
+          }],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/auth/signup",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"password\": \"{{test_password}}\",\n  \"full_name\": \"Dup\",\n  \"organization_name\": \"Dup Co\"\n}" }
+          }
+        },
+        {
+          "name": "Signup weak password -> 422",
+          "event": [{
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [
+              "pm.test('422 Unprocessable Entity', () => pm.response.to.have.status(422));"
+            ]}
+          }],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/auth/signup",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"weak@navis-test.local\",\n  \"password\": \"password\",\n  \"full_name\": \"Weak\",\n  \"organization_name\": \"Weak Co\"\n}" }
+          }
+        },
+        {
+          "name": "Login (correct creds)",
+          "event": [{
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const b = pm.response.json();",
+              "pm.collectionVariables.set('access_token', b.access_token);",
+              "pm.collectionVariables.set('refresh_token', b.refresh_token);"
+            ]}
+          }],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/auth/login",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"password\": \"{{test_password}}\"\n}" }
+          }
+        },
+        {
+          "name": "GET /me",
+          "event": [{
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "const b = pm.response.json();",
+              "pm.test('returns user + organization + role', () => {",
+              "  pm.expect(b).to.have.property('user');",
+              "  pm.expect(b).to.have.property('organization');",
+              "  pm.expect(b).to.have.property('role');",
+              "});",
+              "pm.test('email matches signup', () => pm.expect(b.user.email).to.eql(pm.collectionVariables.get('test_email')));"
+            ]}
+          }],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/v1/auth/me",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }]
+          }
+        },
+        {
+          "name": "Refresh (rotates tokens)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": { "type": "text/javascript", "exec": [
+                "pm.collectionVariables.set('old_refresh', pm.collectionVariables.get('refresh_token'));"
+              ]}
+            },
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": [
+                "pm.test('200', () => pm.response.to.have.status(200));",
+                "const b = pm.response.json();",
+                "pm.test('new refresh differs from old', () => pm.expect(b.refresh_token).to.not.eql(pm.collectionVariables.get('old_refresh')));",
+                "pm.collectionVariables.set('access_token', b.access_token);",
+                "pm.collectionVariables.set('refresh_token', b.refresh_token);"
+              ]}
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/auth/refresh",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"refresh_token\": \"{{refresh_token}}\"\n}" }
+          }
+        },
+        {
+          "name": "Refresh REPLAY old -> 401",
+          "event": [{
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [
+              "pm.test('401 (reuse detected)', () => pm.response.to.have.status(401));"
+            ]}
+          }],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/auth/refresh",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"refresh_token\": \"{{old_refresh}}\"\n}" }
+          }
+        },
+        {
+          "name": "Logout",
+          "event": [{
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));"
+            ]}
+          }],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/auth/logout",
+            "header": [{ "key": "Authorization", "value": "Bearer {{access_token}}" }]
+          }
+        },
+        {
+          "name": "Refresh after logout -> 401",
+          "event": [{
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [
+              "pm.test('401 (session revoked)', () => pm.response.to.have.status(401));"
+            ]}
+          }],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/auth/refresh",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"refresh_token\": \"{{refresh_token}}\"\n}" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Google SSO",
+      "item": [
+        {
+          "name": "POST /auth/google (paste real code/id_token)",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/auth/google",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"code\": \"<PASTE OAUTH2 AUTHORIZATION CODE HERE>\"\n}" },
+            "description": "Replace the body with a real `code` (preferred) OR `id_token` from the Google OAuth2 client. Returns TokenPair with is_new_user + onboarding_completed flags."
+          }
+        },
+        {
+          "name": "POST /auth/google (empty body -> 422)",
+          "event": [{
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [
+              "pm.test('422 (must provide code or id_token)', () => pm.response.to.have.status(422));"
+            ]}
+          }],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/auth/google",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{}" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Security: throttle (run sequentially)",
+      "description": "Each of these requests intentionally sends the WRONG password for the test_email user. After the 5th attempt the account/IP is locked; the 6th run of 'Login w/ correct password' must also 401. Reset by waiting login_lockout_seconds (default 15 min) or restarting Redis.",
+      "item": [
+        {
+          "name": "Login w/ WRONG password",
+          "event": [{
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [
+              "pm.test('401 (bad creds OR locked)', () => pm.response.to.have.status(401));"
+            ]}
+          }],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/auth/login",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"password\": \"WrongPassword!2026\"\n}" }
+          }
+        },
+        {
+          "name": "Login w/ correct password (locked -> 401)",
+          "event": [{
+            "listen": "test",
+            "script": { "type": "text/javascript", "exec": [
+              "pm.test('401 (locked, generic error)', () => pm.response.to.have.status(401));"
+            ]}
+          }],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/v1/auth/login",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"password\": \"{{test_password}}\"\n}" }
+          }
+        }
+      ]
+    }
+  ]
+}

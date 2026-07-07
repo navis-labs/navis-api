@@ -35,6 +35,14 @@ logger = get_logger("identity.google_auth")
 # Google's token endpoint — where we exchange an auth code for tokens.
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
+# Acceptable forward clock drift when verifying a Google id_token's
+# `iat`/`nbf`. Real-world observation: Windows dev hosts and unsynced
+# cloud VMs are routinely 1-3 seconds ahead/behind Google. Without a
+# leeway the user sees "Token used too early" on a perfectly valid
+# login. 10s is tight enough that it doesn't widen the replay window
+# meaningfully (Google id_token lifetime is 3600s).
+_CLOCK_SKEW_SECONDS = 10
+
 # Module-level pooled httpx client. Created lazily so importing this module does
 # not allocate sockets, and closed by the FastAPI lifespan on shutdown. Reused
 # across requests so we don't re-do TLS to Google on every SSO login.
@@ -156,12 +164,22 @@ class GoogleAuthService:
         Uses google-auth's `verify_oauth2_token` which fetches Google's public
         certs on the first call and caches them. This is the standard approach
         recommended by Google.
+
+        Clock skew leeway: we accept tokens whose `iat`/`nbf` is up to
+        `_CLOCK_SKEW_SECONDS` ahead of our wall clock. Without this, a 1-2
+        second drift between Google's signing servers and this host (very
+        common on dev machines + cloud VMs without NTP sync) surfaces as
+        "Token used too early" 401s on legitimate logins. The window is
+        kept tight (10s) so we don't widen the replay window unnecessarily —
+        Google's id_token lifetime is 1h, so 10s of slack is invisible
+        operationally but covers the real-world drift we observe.
         """
         try:
             claims = google_id_token.verify_oauth2_token(
                 raw_id_token,
                 google_requests.Request(),
                 self._client_id,
+                clock_skew_in_seconds=_CLOCK_SKEW_SECONDS,
             )
         except Exception as exc:
             logger.warning("google id_token verification failed: %s", exc)
