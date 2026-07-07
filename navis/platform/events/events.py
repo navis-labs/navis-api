@@ -42,6 +42,10 @@ class EventType(str, Enum):
     # Layer 5 — Decision
     DECISION_GENERATED = "DecisionGenerated"
     BRIEF_READY = "BriefReady"
+    # User engagement feedback (frontend -> Learning). Additive: consumers that
+    # don't care ignore; Learning observes these as first-class outcome signals.
+    BRIEF_OPENED = "BriefOpened"
+    DECISION_DISMISSED = "DecisionDismissed"
 
     # Layer 6 — Execution
     ACTION_REQUESTED = "ActionRequested"
@@ -57,6 +61,17 @@ class EventType(str, Enum):
 
     # Layer 8 — Learning
     LEARNING_UPDATED = "LearningUpdated"
+
+    # Layer 2b — Identity Resolution (additive; sits above Memory).
+    # Emitted when an alias is first observed, and when two aliases are asserted
+    # to refer to the same organizational person. Immutable, provenanced facts —
+    # the KG projection is built by folding these two event streams alone.
+    IDENTITY_ALIAS_OBSERVED = "IdentityAliasObserved"
+    IDENTITY_ALIAS_LINKED = "IdentityAliasLinked"
+
+    # Integration lifecycle (soft-disconnect, reconnect). Fed to org onboarding /
+    # capability gates so the UI reflects the connection state without a poll.
+    INTEGRATION_DISCONNECTED = "IntegrationDisconnected"
 
     # Organization lifecycle / onboarding (owned by Organization V1)
     ORG_CREATED = "OrgCreated"

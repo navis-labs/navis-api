@@ -14,6 +14,7 @@ PLATFORM_DIR = pathlib.Path(__file__).resolve().parent.parent / "navis" / "platf
 
 BUSINESS_DOMAINS = {
     "identity",
+    "identity_resolution",
     "signals",
     "memory",
     "state",

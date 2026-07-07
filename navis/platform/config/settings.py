@@ -112,6 +112,12 @@ class Settings(BaseSettings):
     slack_client_id: str | None = None
     slack_client_secret: str | None = None
     slack_redirect_uri: str | None = None
+    # Where OAuth callbacks bounce the browser after finishing the
+    # code exchange. This is a FRONTEND URL (not a Google redirect_uri —
+    # that stays pointed at the backend callback so client_secret stays
+    # server-side). Callback appends `?connected=<provider>` on success
+    # or `?error=<code>` on failure so the frontend can toast.
+    frontend_url: str = "http://localhost:3000"
 
     # ---- Background tasks ----
     celery_broker_url: str = "redis://localhost:6379/2"

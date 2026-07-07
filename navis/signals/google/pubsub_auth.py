@@ -54,11 +54,23 @@ def verify_claims(
         raise PubSubAuthError("service-account email not verified", reason="email_unverified")
 
 
+# Mirror navis.identity.google_auth._CLOCK_SKEW_SECONDS — same drift
+# tolerance applies to Pub/Sub push tokens. Without it a 1-2s skew
+# between Google's signer and this host surfaces as silent webhook
+# drops (a worse failure mode than a noisy 401 on user login).
+_PUBSUB_CLOCK_SKEW_SECONDS = 10
+
+
 def _default_decoder(token: str, audience: str) -> dict[str, Any]:  # pragma: no cover - network
     from google.auth.transport import requests as g_requests
     from google.oauth2 import id_token
 
-    return id_token.verify_oauth2_token(token, g_requests.Request(), audience or None)
+    return id_token.verify_oauth2_token(
+        token,
+        g_requests.Request(),
+        audience or None,
+        clock_skew_in_seconds=_PUBSUB_CLOCK_SKEW_SECONDS,
+    )
 
 
 def verify_pubsub_request(

@@ -113,11 +113,32 @@ async def test_seed_allowed_outside_production(monkeypatch):
             captured["event"] = event
             return True
 
+    # Seed now resolves integration_id via a DB lookup — return a fake row so the
+    # caller-supplied path is validated without hitting Postgres.
+    supplied_integration_id = uuid.uuid4()
+
+    class _FakeIntegration:
+        id = supplied_integration_id
+
+    class _FakeDb:
+        async def scalar(self, *args, **kwargs):
+            return _FakeIntegration()
+
+        async def rollback(self):  # never fired on the happy path, but ingest may branch
+            pass
+
     monkeypatch.setattr(R, "SignalIngestionService", _FakeIngestion)
-    body = R.SeedSignal(external_id="x", user_id=uuid.uuid4(), integration_id=uuid.uuid4())
+    # Silence the background bus publish — the test asserts the sync return only.
+    monkeypatch.setattr(R, "logger", R.logger)
+    body = R.SeedSignal(external_id="x", integration_id=supplied_integration_id)
+
+    class _User:
+        id = uuid.uuid4()
 
     class _Ctx:
         org_id = uuid.uuid4()
+        user = _User()
 
-    out = await R.seed_signal(body, ctx=_Ctx(), db=None)  # type: ignore[arg-type]
+    out = await R.seed_signal(body, ctx=_Ctx(), db=_FakeDb())  # type: ignore[arg-type]
     assert out["ingested"] is True and captured["event"].external_id == "x"
+    assert out["integration_id"] == str(supplied_integration_id)

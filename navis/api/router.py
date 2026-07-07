@@ -9,6 +9,7 @@ from navis.execution.router import router as execution_router
 from navis.identity.admin_router import router as identity_admin_router
 from navis.identity.router import router as identity_router
 from navis.identity.scim_router import router as scim_router
+from navis.identity_resolution.router import router as identity_resolution_router
 from navis.intelligence.router import router as intelligence_router
 from navis.observation.webhooks.router import router as observation_webhooks_router
 from navis.organization.router import router as organization_router
@@ -20,6 +21,7 @@ api_router.include_router(identity_admin_router)
 api_router.include_router(scim_router)
 api_router.include_router(organization_router)
 api_router.include_router(signals_router)
+api_router.include_router(identity_resolution_router)
 api_router.include_router(brief_router)
 api_router.include_router(execution_router)
 api_router.include_router(intelligence_router)

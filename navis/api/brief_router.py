@@ -7,18 +7,28 @@ EXECUTE_ACTIONS permission + the EXECUTION capability.
 """
 from __future__ import annotations
 
-from typing import Any
+import uuid
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from navis.decisions.models import DailyBrief, DecisionDismissal
 from navis.decisions.service import DecisionService
 from navis.identity.authz import Principal, require_permission
+from navis.identity.dependencies import CurrentContext, get_current_context
 from navis.identity.permissions import Permission
 from navis.orchestration.brief import build_brief, propose_actions
 from navis.organization.contract import Capability
 from navis.organization.guards import require_capability
 from navis.platform.database import get_session
+from navis.platform.events import DomainEvent, EventType, event_bus
+
+# Deterministic namespace for dismissal ids — replay-safe and disjoint from
+# every other UUIDv5 space in the app.
+_DISMISSAL_NAMESPACE = uuid.UUID("7e2b1c4a-9d5f-5e11-b8c2-4a9f6c3d2b18")
 
 router = APIRouter(prefix="/brief", tags=["decisions"])
 
@@ -66,3 +76,81 @@ async def propose(
     (idempotent; human approval still required before anything runs)."""
     created = await propose_actions(db, p.org_id)
     return {"proposed": created}
+
+
+@router.post("/{brief_id}/open")
+async def mark_brief_opened(
+    brief_id: uuid.UUID,
+    ctx: CurrentContext = Depends(get_current_context),
+    _: Any = Depends(require_capability(Capability.DECISION)),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """The founder opened today's brief. Emits BRIEF_OPENED (Learning consumes it
+    as a positive engagement signal). No persistence — the event stream is the
+    source of truth; the brief itself is a replayable cache."""
+    brief = await db.get(DailyBrief, brief_id)
+    if brief is None or brief.organization_id != ctx.org_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "brief not found")
+
+    await event_bus.publish(DomainEvent(
+        type=EventType.BRIEF_OPENED,
+        org_id=ctx.org_id,
+        source="brief.router",
+        payload={
+            "brief_id": str(brief_id),
+            "user_id": str(ctx.user.id),
+            "reasoning_version": brief.reasoning_version,
+            "state_watermark": brief.state_watermark,
+        },
+    ))
+    return {"status": "opened", "brief_id": str(brief_id)}
+
+
+class DismissDecisionBody(BaseModel):
+    reason: Literal["explicit", "stale", "duplicate"] = "explicit"
+
+
+@router.post("/decisions/{decision_ref}/dismiss")
+async def dismiss_decision(
+    decision_ref: str,
+    body: DismissDecisionBody,
+    ctx: CurrentContext = Depends(get_current_context),
+    _: Any = Depends(require_capability(Capability.DECISION)),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """The founder dismissed a decision from today's brief. Persists an idempotent
+    row (org, decision_ref, user) so replay converges, then emits DECISION_DISMISSED
+    for Learning to consume as an explicit negative signal.
+
+    `decision_ref` is opaque by design — the frontend may pass a Decision id, a
+    reasoning signal id, or any stable event id; we don't couple to a specific
+    identifier space, so removed decisions still carry their dismissal history."""
+    dismissal_id = uuid.uuid5(
+        _DISMISSAL_NAMESPACE, f"{ctx.org_id}|{decision_ref}|{ctx.user.id}"
+    )
+    stmt = (
+        pg_insert(DecisionDismissal)
+        .values(
+            id=dismissal_id,
+            organization_id=ctx.org_id,
+            decision_ref=decision_ref,
+            reason=body.reason,
+            user_id=ctx.user.id,
+        )
+        .on_conflict_do_nothing(index_elements=["id"])
+    )
+    await db.execute(stmt)
+    await db.commit()
+
+    await event_bus.publish(DomainEvent(
+        type=EventType.DECISION_DISMISSED,
+        org_id=ctx.org_id,
+        source="brief.router",
+        payload={
+            "dismissal_id": str(dismissal_id),
+            "decision_ref": decision_ref,
+            "reason": body.reason,
+            "user_id": str(ctx.user.id),
+        },
+    ))
+    return {"status": "dismissed", "dismissal_id": str(dismissal_id)}
