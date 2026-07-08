@@ -55,9 +55,10 @@ class FakeLearningRepo:
         self.inbox.add(key)
         return True
 
-    async def all_events(self, org_id, *, limit=1_000_000):
+    async def stream_events(self, org_id, *, batch=5000):
         rows = [e for e in self.events.values() if e.organization_id == org_id]
-        return sorted(rows, key=lambda e: (e.occurred_at, str(e.id)))[:limit]
+        for e in sorted(rows, key=lambda e: (e.occurred_at, str(e.id))):
+            yield e
 
     async def aggregates(self, org_id, *, dimension=None):
         return [
@@ -67,6 +68,15 @@ class FakeLearningRepo:
 
     async def signal_aggregates(self, org_id):
         return await self.aggregates(org_id, dimension=AggregateDimension.SIGNAL.value)
+
+    async def signal_aggregates_for(self, org_id, keys):
+        keyset = set(keys)
+        return [
+            a for a in self.aggs.values()
+            if a.organization_id == org_id
+            and a.dimension == AggregateDimension.SIGNAL.value
+            and a.key in keyset
+        ]
 
     async def delete_projections(self, org_id):
         self.aggs = {k: v for k, v in self.aggs.items() if k[0] != org_id}

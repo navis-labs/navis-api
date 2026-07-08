@@ -5,10 +5,11 @@ recommendations. Pure function of the aggregates, so it rebuilds identically.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from navis.learning.aggregates import success_rate
-from navis.learning.models import pattern_id
+from navis.learning.models import LearningAggregate, pattern_id
 
 MIN_SAMPLES = 5
 RELIABLE_THRESHOLD = 0.7
@@ -24,9 +25,11 @@ class PatternFact:
     success_rate: float
 
 
-def derive_signal_patterns(org_id: uuid.UUID, signal_aggregates) -> list[PatternFact]:
-    """signal_aggregates: rows with .key (signal_id), .successes, .failures.
-    Emits a pattern for each signal with enough decisive samples."""
+def derive_signal_patterns(
+    org_id: uuid.UUID, signal_aggregates: Sequence[LearningAggregate]
+) -> list[PatternFact]:
+    """Emit a pattern fact per SIGNAL aggregate with enough decisive samples
+    (successes + failures >= MIN_SAMPLES). Pure + deterministic; key == signal_id."""
     facts: list[PatternFact] = []
     for agg in signal_aggregates:
         decisive = agg.successes + agg.failures
