@@ -39,7 +39,13 @@ class OutcomeType(str, enum.Enum):
 
 
 def compute_outcome_id(source_event_id: str, outcome_type: str) -> uuid.UUID:
-    """Deterministic id — same source event + type => same outcome (idempotent)."""
+    """Deterministic id — same source event + type => same outcome (idempotent).
+
+    Identity constraint: source_event_id must be GLOBALLY unique (org is deliberately
+    not in the key — changing the formula would double-record any event redelivered
+    across the deploy). Both producers satisfy it: execution outbox row UUIDs, and
+    provider-prefixed webhook ids ("gmail:<msg>:<reply>"). A new source must keep
+    that guarantee, or a cross-org id collision silently drops the second outcome."""
     return uuid.uuid5(_OUTCOME_NAMESPACE, f"{source_event_id}|{outcome_type}")
 
 

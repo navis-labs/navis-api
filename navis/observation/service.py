@@ -22,19 +22,6 @@ from navis.platform.monitoring import get_logger
 
 logger = get_logger("observation")
 
-# Back-compat transport hint for the (not-yet-rewired) Learning subscriber.
-# Observation does NOT store this — it is a fact->label mapping that belongs to
-# Learning. Kept in the EVENT only until Learning consumes outcome_type directly.
-_SUCCESS_HINT = {
-    OutcomeType.REPLY_RECEIVED.value: 1.0,
-    OutcomeType.MEETING_ACCEPTED.value: 1.0,
-    OutcomeType.MEETING_COMPLETED.value: 1.0,
-    OutcomeType.ACTION_EXECUTED.value: 0.5,
-    OutcomeType.ACTION_FAILED.value: 0.0,
-    OutcomeType.NO_RESPONSE.value: 0.0,
-}
-
-
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -55,6 +42,8 @@ class ObservationService:
         if repo is not None:
             self.repo = repo
         else:
+            if db is None:
+                raise ValueError("ObservationService requires `db` when `repo` is not provided")
             from navis.observation.repository import OutcomeRepository
 
             self.repo = OutcomeRepository(db)
@@ -103,6 +92,8 @@ class ObservationService:
     async def record_from_execution(
         self, event: DomainEvent, outcome_type: OutcomeType, source_event_id: str
     ) -> Outcome | None:
+        if event.org_id is None:  # an outcome without a tenant is unrecordable
+            return None
         p = event.payload or {}
         outcome_block = p.get("outcome") or {}
         return await self.record(
@@ -161,9 +152,10 @@ class ObservationService:
                     "state_watermark": o.state_watermark,
                     # Reality time, so Learning can record occurred_at without now().
                     "occurred_at": o.occurred_at.isoformat() if o.occurred_at else None,
-                    # Back-compat for the current Learning subscriber (to be retired):
-                    "subject_ref": f"execution:{o.execution_id}" if o.execution_id else None,
-                    "success": _SUCCESS_HINT.get(o.outcome_type, 0.0),
+                    # No success/subject_ref: the fact->label mapping is Learning's, and
+                    # Learning already consumes outcome_type + lineage directly
+                    # (learning/attribution.learning_event_values) — the old hint's own
+                    # retirement condition. Observation publishes facts only.
                 },
             )
         )

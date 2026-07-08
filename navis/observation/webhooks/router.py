@@ -23,7 +23,16 @@ _PARSERS = {"gmail": parse_gmail, "calendar": parse_calendar}
 
 def _verify(provider: str, token: str | None) -> None:
     expected = os.environ.get(f"OBSERVATION_WEBHOOK_TOKEN_{provider.upper()}")
-    if expected and token != expected:
+    if not expected:
+        # Fail CLOSED. This endpoint WRITES outcome truth that flows into Learning ->
+        # Intelligence -> Adaptive policy. The old `if expected and ...` accepted EVERY
+        # request when no token was configured — an unauthenticated outcome-forgery /
+        # learning-poisoning vector (fabricated replies inflate an org's positive rate,
+        # which Adaptive turns into policy proposals). Unconfigured must mean DISABLED.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, f"webhook ingestion for {provider} is not configured"
+        )
+    if token != expected:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bad webhook token")
 
 
@@ -36,7 +45,8 @@ async def receive(
     parser = _PARSERS.get(provider)
     if parser is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown provider {provider}")
-    _verify(provider, request.query_params.get("token"))
+    # Header preferred (query strings land in access logs); query kept as fallback.
+    _verify(provider, request.headers.get("x-webhook-token") or request.query_params.get("token"))
 
     body = await request.json()
     webhook = parser(body or {})

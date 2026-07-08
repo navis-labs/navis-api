@@ -118,6 +118,80 @@ def test_gmail_parser_maps_reply():
     assert we.outcome_type == OutcomeType.REPLY_RECEIVED
 
 
+# ---- webhook hardening (production fixes) ----
+
+def test_parse_when_never_raises_and_always_returns_aware():
+    """Regression (production fix in webhooks/base.parse_when): a malformed timestamp used
+    to raise ValueError out of the parser -> 500 -> the provider redelivers forever (poison
+    retry loop); a NAIVE timestamp would fail the timestamptz write/comparison downstream,
+    re-entering the same loop. Bad input must degrade to ingest time; naive input is UTC."""
+    from datetime import timezone
+
+    from navis.observation.webhooks.base import parse_when
+
+    assert parse_when("not-a-date").tzinfo is not None          # degrades, never raises
+    naive = parse_when("2026-06-01T10:00:00")
+    assert naive.tzinfo == timezone.utc                          # coerced aware
+    aware = parse_when("2026-06-01T10:00:00+02:00")
+    assert aware.utcoffset() is not None and aware.hour == 10    # preserved verbatim
+    assert parse_when(None).tzinfo is not None                   # absent -> ingest time
+
+
+def test_webhook_verification_fails_closed(monkeypatch):
+    """Regression (production fix in webhooks/router._verify): `if expected and ...`
+    accepted EVERY request when no token was configured — an unauthenticated
+    outcome-forgery / learning-poisoning vector. Unconfigured must mean DISABLED (503);
+    a wrong token stays 401; the right token passes."""
+    import pytest
+    from fastapi import HTTPException
+
+    from navis.observation.webhooks.router import _verify
+
+    monkeypatch.delenv("OBSERVATION_WEBHOOK_TOKEN_GMAIL", raising=False)
+    with pytest.raises(HTTPException) as e:
+        _verify("gmail", None)
+    assert e.value.status_code == 503                            # fail closed, not open
+
+    monkeypatch.setenv("OBSERVATION_WEBHOOK_TOKEN_GMAIL", "s3cret")
+    with pytest.raises(HTTPException) as e:
+        _verify("gmail", "wrong")
+    assert e.value.status_code == 401
+    _verify("gmail", "s3cret")                                   # correct token passes
+
+
+async def test_outcome_event_publishes_facts_only():
+    """Regression (production fix in service._emit): the success/subject_ref back-compat
+    hint was dead transport — Learning consumes outcome_type + occurred_at + lineage
+    directly (learning/attribution.learning_event_values). Observation publishes facts."""
+    repo, pub = FakeOutcomeRepo(), FakePublisher()
+    svc = ObservationService(repo=repo, publisher=pub)
+    await svc.record_from_execution(action_event(EventType.ACTION_EXECUTED), OutcomeType.ACTION_EXECUTED, "e-1")
+    payload = pub.events[0].payload
+    assert "success" not in payload and "subject_ref" not in payload
+    assert payload["outcome_type"] == OutcomeType.ACTION_EXECUTED.value
+    assert payload["occurred_at"] is not None                    # Learning's clock source
+
+
+async def test_webhook_lineage_pick_is_totally_ordered():
+    """Regression (production fix in repository.by_provider_external_id): the 'most recent
+    matching outcome' pick ordered by bare occurred_at — a tie made the inherited-lineage
+    row nondeterministic. The REAL statement must carry the full tiebreak chain."""
+    from sqlalchemy.dialects import postgresql
+
+    from navis.observation.repository import OutcomeRepository
+
+    class _CaptureDB:
+        stmt = None
+
+        async def scalar(self, stmt):
+            _CaptureDB.stmt = stmt
+            return None
+
+    await OutcomeRepository(_CaptureDB()).by_provider_external_id("gmail", "m-1")
+    sql = str(_CaptureDB.stmt.compile(dialect=postgresql.dialect()))
+    assert "occurred_at DESC" in sql and "created_at DESC" in sql and "outcome_id DESC" in sql
+
+
 # ---- timeline reconstruction ----
 
 async def test_timeline_reconstruction_orders_by_occurred_at():

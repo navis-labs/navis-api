@@ -140,9 +140,17 @@ async def _on_signal_pointer(event: DomainEvent) -> None:
         await MemoryIngestionService(db).ingest_signal(uuid.UUID(event_id))
 
 
+# This tuple must cover EVERY bus event the signal pointer can route to
+# (signals.service._BUS_EVENT_FOR_TYPE values + the SIGNAL_INGESTED fallback). It once
+# missed CALENDAR_EVENT_UPDATED/CANCELLED: those pointers had no Memory consumer, so a
+# meeting cancelled or rescheduled in Calendar NEVER updated organizational truth — the
+# meeting stayed "confirmed" in State forever and kept counting toward MEETING_OVERLOAD.
+# (The Meet deriver only covers conference events and explicitly skips cancellations.)
 for _evt in (
     EventType.GMAIL_RECEIVED,
     EventType.CALENDAR_EVENT_CREATED,
+    EventType.CALENDAR_EVENT_UPDATED,
+    EventType.CALENDAR_EVENT_CANCELLED,
     EventType.MEETING_COMPLETED,
     EventType.SIGNAL_INGESTED,
 ):
