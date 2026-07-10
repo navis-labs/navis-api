@@ -213,3 +213,67 @@ def test_no_recommendation_or_score_columns():
     cols = set(IntelligenceInsight.__table__.columns.keys())
     forbidden = {"recommendation", "action", "score", "risk", "priority", "advice"}
     assert cols & forbidden == set()
+
+
+# ---- Phase 3: Knowledge Graph (Learning-scoped influence) --------------------
+
+def test_influence_graph_is_deterministic_and_counts_co_occurrence():
+    from types import SimpleNamespace
+
+    from navis.intelligence.graph import build_influence_graph
+
+    events = [
+        SimpleNamespace(reasoning_signal_ids=["sig-A", "sig-B"], decision_id="dec-1",
+                        outcome_type="reply_received"),
+        SimpleNamespace(reasoning_signal_ids=["sig-A"], decision_id="dec-1",
+                        outcome_type="reply_received"),
+        SimpleNamespace(reasoning_signal_ids=["sig-A"], decision_id=None,
+                        outcome_type="no_response"),
+        SimpleNamespace(reasoning_signal_ids=[], decision_id="dec-1", outcome_type=""),  # skipped
+    ]
+    g = build_influence_graph(events)
+    edges = {(e.source_kind, e.source, e.outcome_type): e.count for e in g.edges}
+    assert edges == {
+        ("signal", "sig-A", "reply_received"): 2,
+        ("signal", "sig-A", "no_response"): 1,
+        ("signal", "sig-B", "reply_received"): 1,
+        ("decision", "dec-1", "reply_received"): 2,
+    }
+    # Deterministic: same events => byte-identical graph, in a total sorted order.
+    assert build_influence_graph(events).to_dict() == g.to_dict()
+    assert [e.to_dict() for e in g.edges] == sorted(
+        (e.to_dict() for e in g.edges), key=lambda d: (d["source_kind"], d["source"], d["outcome_type"])
+    )
+
+
+# ---- Phase 4: Trend Engine (temporal dimension) ------------------------------
+
+def test_trend_engine_detects_degradation_deterministically():
+    from types import SimpleNamespace
+
+    from navis.intelligence.trends import build_trends
+
+    def ev(result):  # recent-first order: 6 recent then 6 prior for sig-A
+        return SimpleNamespace(reasoning_signal_ids=["sig-A"], decision_id=None, result=result)
+
+    # RECENT window (first half): 1/6 success. PRIOR window (second half): 5/6 success.
+    recent = [ev("success")] + [ev("failure")] * 5
+    prior = [ev("success")] * 5 + [ev("failure")]
+    trends = build_trends(recent + prior, min_samples=5)
+    assert len(trends) == 1
+    t = trends[0]
+    assert t.subject_kind == "signal" and t.subject == "sig-A"
+    assert t.recent_rate == round(1 / 6, 4) and t.prior_rate == round(5 / 6, 4)
+    assert t.direction == "degrading"  # recent << prior
+    # Neutrals excluded; thin subjects skipped; deterministic re-run.
+    assert [x.to_dict() for x in build_trends(recent + prior)] == [x.to_dict() for x in trends]
+
+
+def test_trend_engine_skips_subjects_without_both_windows():
+    from types import SimpleNamespace
+
+    from navis.intelligence.trends import build_trends
+
+    # Only 3 decisive events for sig-B (below min_samples in each window) -> no trend.
+    events = [SimpleNamespace(reasoning_signal_ids=["sig-B"], decision_id=None, result="success")] * 3
+    assert build_trends(events) == []

@@ -10,13 +10,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from navis.intelligence.features import compute_features
 from navis.intelligence.models import InsightType
 
 MIN_SAMPLES = 5
-# Outcome types that represent customer engagement / positive results.
-_CUSTOMER_POSITIVE = {"reply_received", "meeting_accepted", "meeting_completed"}
-_NEGATIVE = {"action_failed", "no_response"}
-_ATTEMPT = "action_executed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,10 +68,6 @@ class InsightDraft:
 
 def _confidence(decisive: int) -> float:
     return round(min(1.0, decisive / 100.0), 4)
-
-
-def _outcome_total(view: LearningView, keys) -> int:
-    return sum(a.total for a in view.outcome_aggs if a.key in keys)
 
 
 # 1. Signal Intelligence -------------------------------------------------------
@@ -132,22 +125,22 @@ def decision_intelligence(view: LearningView) -> list[InsightDraft]:
 # 3. Team Intelligence (from learning_patterns) --------------------------------
 
 def team_intelligence(view: LearningView) -> list[InsightDraft]:
-    if not view.patterns:
+    f = compute_features(view)
+    if f.total_patterns == 0:
         return []
-    reliable = [p for p in view.patterns if p.kind == "reliable"]
     samples = sum(p.samples for p in view.patterns)
     return [
         InsightDraft(
             insight_type=InsightType.TEAM,
             key="signal_reliability",
-            title=f"Signal judgment reliable in {len(reliable)}/{len(view.patterns)} patterns",
+            title=f"Signal judgment reliable in {f.reliable_patterns}/{f.total_patterns} patterns",
             summary=(
-                f"The team's reasoning signals proved reliable in {len(reliable)} of "
-                f"{len(view.patterns)} recurring patterns."
+                f"The team's reasoning signals proved reliable in {f.reliable_patterns} of "
+                f"{f.total_patterns} recurring patterns."
             ),
-            evidence={"reliable": len(reliable), "total_patterns": len(view.patterns)},
+            evidence={"reliable": f.reliable_patterns, "total_patterns": f.total_patterns},
             sample_size=samples,
-            confidence=_confidence(len(view.patterns) * 10),
+            confidence=_confidence(f.total_patterns * 10),
             supporting=[],
         )
     ]
@@ -156,11 +149,12 @@ def team_intelligence(view: LearningView) -> list[InsightDraft]:
 # 4. Customer Intelligence (from outcome aggregates) ---------------------------
 
 def customer_intelligence(view: LearningView) -> list[InsightDraft]:
-    engaged = _outcome_total(view, _CUSTOMER_POSITIVE)
-    attempts = _outcome_total(view, {_ATTEMPT})
-    if attempts == 0:
+    f = compute_features(view)
+    if f.executed_attempts == 0:
         return []
-    rate = round(min(1.0, engaged / attempts), 4)
+    engaged, attempts = f.positive_outcomes, f.executed_attempts
+    rate = f.engagement_rate
+    assert rate is not None  # executed_attempts > 0 guarantees a rate
     return [
         InsightDraft(
             insight_type=InsightType.CUSTOMER,
@@ -181,12 +175,12 @@ def customer_intelligence(view: LearningView) -> list[InsightDraft]:
 # 5. Organizational Intelligence -----------------------------------------------
 
 def organizational_intelligence(view: LearningView) -> list[InsightDraft]:
-    positive = _outcome_total(view, _CUSTOMER_POSITIVE)
-    negative = _outcome_total(view, _NEGATIVE)
-    decisive = positive + negative
+    f = compute_features(view)
+    decisive = f.decisive_outcomes
     if decisive == 0:
         return []
-    rate = round(positive / decisive, 4)
+    rate = f.outcome_positive_rate
+    assert rate is not None  # decisive > 0 guarantees a rate
     return [
         InsightDraft(
             insight_type=InsightType.ORGANIZATIONAL,
@@ -194,9 +188,9 @@ def organizational_intelligence(view: LearningView) -> list[InsightDraft]:
             title=f"{rate:.0%} of decisive outcomes were positive",
             summary=(
                 f"Across {decisive} decisive outcomes, {rate:.0%} were positive; "
-                f"{len(view.patterns)} recurring signal patterns have emerged."
+                f"{f.total_patterns} recurring signal patterns have emerged."
             ),
-            evidence={"positive": positive, "negative": negative, "patterns": len(view.patterns)},
+            evidence={"positive": f.positive_outcomes, "negative": f.negative_outcomes, "patterns": f.total_patterns},
             sample_size=decisive,
             confidence=_confidence(decisive),
             supporting=[],

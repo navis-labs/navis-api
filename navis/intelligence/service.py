@@ -56,3 +56,20 @@ class IntelligenceService:
 
     async def get_insights(self, org_id: uuid.UUID):
         return await self.repo.get_insights(org_id)
+
+    async def get_influence_graph(self, org_id: uuid.UUID):
+        """The Learning-scoped knowledge graph: signal/decision -> outcome-type influence.
+        Deterministic, derived-on-read (no table); the ORG ENTITY graph is State's, not
+        Intelligence's — see navis.intelligence.graph for the boundary rationale."""
+        from navis.intelligence.graph import build_influence_graph
+
+        events = await self.repo.influence_events(org_id)
+        return build_influence_graph(events)
+
+    async def get_trends(self, org_id: uuid.UUID):
+        """The temporal dimension: per-signal/decision outcome trends (improving/degrading/
+        stable), recent vs prior window. Deterministic, derived-on-read from Learning only."""
+        from navis.intelligence.trends import build_trends
+
+        events = await self.repo.recent_events(org_id)
+        return build_trends(events)
