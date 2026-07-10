@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 
 from navis.execution.models import ExecutionRequest
-from navis.execution.status import ExecutionStatus
+from navis.execution.status import ExecutionStatus, is_terminal
 from navis.platform.monitoring import get_logger
 
 logger = get_logger("execution.dlq")
@@ -26,14 +26,23 @@ class ExecutionDeadLetterService:
 
     async def replay(self, org_id: uuid.UUID | None = None, *, limit: int = 100) -> dict:
         rows = await self.repo.unresolved_dead_letters(org_id, limit=limit)
-        replayed = 0
+        replayed = resolved = 0
         for dl in rows:
             req = await self.repo.get(dl.execution_id)
-            if req is None or req.status != ExecutionStatus.FAILED.value:
-                continue  # cancelled / gone — leave the dead letter unresolved
+            if req is None or is_terminal(ExecutionStatus(req.status)):
+                # Never replayable: the request is gone, or reached a terminal state
+                # (cancelled / rejected / eventually executed). Skipped-but-unresolved,
+                # these rows would permanently occupy the front of the LIMIT window and
+                # starve every replayable dead letter behind them (the poison-prefix
+                # failure shape). Resolve them — WITHOUT claiming a replay.
+                await self.repo.mark_dead_letter_resolved(dl.id)
+                resolved += 1
+                continue
+            if req.status != ExecutionStatus.FAILED.value:
+                continue  # in-flight (approved/executing) — genuinely pending, retry later
             req.attempts = 0  # reset retry budget; status stays FAILED -> re-claimable
             await self.repo.flush()
             await self.repo.mark_dead_letter_replayed(dl.id)
             replayed += 1
-        logger.info("replayed %d dead letters", replayed)
-        return {"replayed": replayed}
+        logger.info("replayed %d dead letters, resolved %d unreplayable", replayed, resolved)
+        return {"replayed": replayed, "resolved": resolved}

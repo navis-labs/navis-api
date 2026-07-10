@@ -2,9 +2,18 @@
 
 Retries only on retryable provider errors (transient/429/timeouts). Validation
 errors and non-retryable failures fail fast. No infinite retries.
+
+Timeout ownership lives HERE (mirrors ml's ResilientProvider owning the model-call
+timeout): a provider execute() gets a hard liveness bound. Without one, a hung real
+sender (socket with no deadline) pins a worker slot forever and pushes the request
+past the stale-recovery window — recovery then reaps it and a second worker re-runs
+it while the first is still in flight. A timeout is NOT retried in-call (the side
+effect may have fired — retrying risks a double send); the pass-level FAILED +
+attempts budget remains the retry authority.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +34,9 @@ class ExecutionRetryPolicy:
     initial_backoff: float = 0.5
     max_backoff: float = 30.0
     jitter: float = 0.5
+    # Hard liveness bound on ONE provider execute() call. Keep well under
+    # config.STALE_EXECUTING_SECONDS so an in-flight request can never look orphaned.
+    execute_timeout_s: float = 60.0
 
 
 DEFAULT_RETRY_POLICY = ExecutionRetryPolicy()
@@ -55,7 +67,17 @@ async def execute_with_retry(
     )
     async for attempt in retrying:
         with attempt:
-            result = await provider.execute(payload)
+            try:
+                result = await asyncio.wait_for(
+                    provider.execute(payload), timeout=policy.execute_timeout_s
+                )
+            except TimeoutError:
+                # Ambiguous outcome (the send may have fired) — never retried in-call.
+                # The request goes FAILED; the pass-level attempts budget governs re-drive.
+                raise ProviderError(
+                    f"{provider.name} execute timed out after {policy.execute_timeout_s}s",
+                    retryable=False,
+                )
             if not result.ok and result.retryable:
                 raise ProviderError(result.error or "retryable provider error", retryable=True)
             return result

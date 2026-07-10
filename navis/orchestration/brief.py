@@ -9,6 +9,7 @@ Exposed both as a coroutine (for the API / tests) and a Celery task (schedule).
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 
 from sqlalchemy import select
@@ -22,8 +23,51 @@ from navis.platform.monitoring import get_logger
 from navis.platform.queue import celery_app
 from navis.reasoning.v2 import REASONING_VERSION, run_reasoning_v2
 from navis.state.v2 import StateService
+from navis.state.v2.models import OrganizationalState
 
 logger = get_logger("orchestration.brief")
+
+
+def _context_layer_enabled() -> bool:
+    """USE_CONTEXT_LAYER gates the optional State -> Context -> Reasoning path. Default
+    OFF: the production flow stays State -> Reasoning, byte-identical. Read from env so no
+    frozen layer is touched, and Context stays fully removable."""
+    return os.environ.get("USE_CONTEXT_LAYER", "false").strip().lower() in ("1", "true", "yes")
+
+
+def _ai_reasoning_enabled() -> bool:
+    """USE_AI_REASONING gates the ADDITIVE AI reasoning pass (navis.reasoning.ai). Default OFF:
+    production stays deterministic-only, byte-identical. Even when ON, the AI pass is fail-open
+    ([] on any failure) and the merge is deterministic-first, so the deterministic signals are
+    always present and authoritative."""
+    return os.environ.get("USE_AI_REASONING", "false").strip().lower() in ("1", "true", "yes")
+
+
+class _PinnedState:
+    """A StateReader that returns an already-loaded state — lets Context build a bundle
+    over the SAME snapshot we already read (no second get_state, guaranteed consistency)."""
+
+    def __init__(self, state: OrganizationalState) -> None:
+        self._state = state
+
+    async def get_state(self, org_id: uuid.UUID) -> OrganizationalState:
+        return self._state
+
+
+async def _reasoning_input(
+    db: AsyncSession, org_id: uuid.UUID, state: OrganizationalState
+) -> OrganizationalState:
+    """Reasoning's input. Flag OFF -> the authoritative State (today). Flag ON -> the
+    FULL_ORG ContextBundle's scoped state (parity: bundle.state == state for FULL_ORG).
+    Context is imported lazily so the package can be deleted with the flag off."""
+    if not _context_layer_enabled():
+        return state
+    from navis.context import ContextRequest, ContextService
+
+    bundle = await ContextService(state_service=_PinnedState(state)).build(
+        ContextRequest.full_org(org_id)
+    )
+    return bundle.state
 
 
 async def build_brief(db: AsyncSession, org_id: uuid.UUID) -> DailyBrief:
@@ -42,7 +86,15 @@ async def build_brief(db: AsyncSession, org_id: uuid.UUID) -> DailyBrief:
         DomainEvent(type=EventType.STATE_UPDATED, org_id=org_id, source="state.v2",
                     payload=state.counts())
     )
-    signals = run_reasoning_v2(state)
+    reasoning_input = await _reasoning_input(db, org_id, state)
+    signals = run_reasoning_v2(reasoning_input)
+    if _ai_reasoning_enabled():
+        # Additive AI pass over the SAME state the deterministic pass consumed. Imported lazily
+        # (like Context) so the module stays fully removable with the flag off. run_ai_reasoning
+        # never raises; merge_signals keeps deterministic signals authoritative.
+        from navis.reasoning.ai import merge_signals, run_ai_reasoning
+
+        signals = merge_signals(signals, await run_ai_reasoning(reasoning_input))
     watermark = state.watermark.last_memory_id
     policy = await resolve_policy(db, org_id)
     return await DecisionService(db).decide(

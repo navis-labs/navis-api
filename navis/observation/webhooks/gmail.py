@@ -6,11 +6,10 @@ the referenced message id so the reply attaches to the original action's outcome
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from navis.observation.models import OutcomeType
-from navis.observation.webhooks.base import ObservationWebhookEvent
+from navis.observation.webhooks.base import ObservationWebhookEvent, parse_when
 
 
 def parse_gmail(body: dict[str, Any]) -> ObservationWebhookEvent | None:
@@ -18,10 +17,7 @@ def parse_gmail(body: dict[str, Any]) -> ObservationWebhookEvent | None:
     external_id = body.get("in_reply_to") or body.get("message_id")
     if not external_id:
         return None
-    ts = body.get("received_at")
-    occurred = (
-        datetime.fromisoformat(ts) if ts else datetime.now(timezone.utc)
-    )
+    occurred = parse_when(body.get("received_at"))
     return ObservationWebhookEvent(
         provider="gmail",
         external_id=str(external_id),

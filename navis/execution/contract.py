@@ -6,7 +6,6 @@ Execution exposes these so Observation can be built later WITHOUT changing Execu
 """
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,7 +39,7 @@ class OutcomeReference:
     decision_id: str
     action_type: str
     reasoning_signal_ids: list[str]
-    reasoning_version: int
+    reasoning_version: int | None  # mirrors ExecutionRequest.reasoning_version (nullable)
     state_watermark: str | None
     provider_reference: dict[str, Any]
 

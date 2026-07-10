@@ -20,6 +20,9 @@ from navis.learning.models import (
     LearningEvent,
     LearningPattern,
 )
+from navis.platform.monitoring import get_logger
+
+logger = get_logger("intelligence")
 
 _MAX_LINEAGE = 50
 _LINEAGE_SCAN_LIMIT = 20000  # bounded scan; full counts come from aggregates
@@ -86,6 +89,14 @@ class IntelligenceRepository:
                 .limit(_LINEAGE_SCAN_LIMIT)
             )
         ).all()
+        if len(events) >= _LINEAGE_SCAN_LIMIT:
+            # The lineage SAMPLE is bounded (traceability only — learning_aggregates hold the
+            # authoritative counts). Log so a large org's truncated sample is never SILENT;
+            # the insight facts and their counts are unaffected.
+            logger.info(
+                "intelligence lineage scan hit the %d-event bound org=%s; sample is partial",
+                _LINEAGE_SCAN_LIMIT, org_id,
+            )
         lineage: dict[str, list[str]] = {}
         for e in events:
             eid = str(e.id)
@@ -107,6 +118,36 @@ class IntelligenceRepository:
         )
         result = await self.db.execute(stmt)
         return (result.rowcount or 0) == 1
+
+    async def influence_events(
+        self, org_id: uuid.UUID, *, limit: int = _LINEAGE_SCAN_LIMIT
+    ) -> Sequence[LearningEvent]:
+        """Bounded, id-ordered scan of the org's learning_events for the influence graph
+        (same bound + determinism as the lineage scan). Full authoritative counts remain in
+        the aggregates; this powers the signal/decision -> outcome-type relationship view."""
+        return (
+            await self.db.scalars(
+                select(LearningEvent)
+                .where(LearningEvent.organization_id == org_id)
+                .order_by(LearningEvent.id.asc())
+                .limit(limit)
+            )
+        ).all()
+
+    async def recent_events(
+        self, org_id: uuid.UUID, *, limit: int = _LINEAGE_SCAN_LIMIT
+    ) -> Sequence[LearningEvent]:
+        """The org's most recent learning_events (occurred_at DESC, id tiebreak) for the
+        Trend Engine. Index-covered by ix_learning_events_org_time; bounded so a large org's
+        trend reads a fixed recent window rather than the whole log."""
+        return (
+            await self.db.scalars(
+                select(LearningEvent)
+                .where(LearningEvent.organization_id == org_id)
+                .order_by(LearningEvent.occurred_at.desc(), LearningEvent.id.desc())
+                .limit(limit)
+            )
+        ).all()
 
     async def get_insights(self, org_id: uuid.UUID) -> Sequence[IntelligenceInsight]:
         return (

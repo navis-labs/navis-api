@@ -24,6 +24,8 @@ class LearningService:
         if repo is not None:
             self.repo = repo
         else:
+            if db is None:
+                raise ValueError("LearningService requires `db` when `repo` is not provided")
             from navis.learning.repository import LearningRepository
 
             self.repo = LearningRepository(db)
@@ -58,7 +60,11 @@ class LearningService:
         if not signal_ids:
             return
         wanted = {str(s) for s in signal_ids}
-        sig_aggs = [a for a in await self.repo.signal_aggregates(org_id) if a.key in wanted]
+        # Fetch ONLY the signals this outcome touched. The old
+        # `[a for a in signal_aggregates(org_id) if a.key in wanted]` loaded the org's ENTIRE
+        # signal-aggregate table per outcome (O(org signals) rows + memory on a high-frequency
+        # path) to use 1-2 rows — a targeted key IN (...) query is index-covered and O(wanted).
+        sig_aggs = await self.repo.signal_aggregates_for(org_id, wanted)
         for fact in derive_signal_patterns(org_id, sig_aggs):
             await self.repo.upsert_pattern(fact)
 

@@ -13,7 +13,9 @@ class RetrievalCase:
 def recall_at_k(retrieved_ids: list[str], relevant: frozenset[str], k: int) -> float:
     if not relevant:
         return 1.0
-    top = set(retrieved_ids[:k])
+    # Guard: k<=0 retrieves nothing. A negative k must NOT become a Python negative slice
+    # (which drops from the END and silently inflates recall — a broken statistic).
+    top = set(retrieved_ids[:k]) if k > 0 else set()
     return round(len(top & relevant) / len(relevant), 4)
 
 

@@ -5,8 +5,15 @@ no LLM. The state's `as_of` is the logical time stamped on every signal, so
 replaying the same State snapshot reproduces byte-identical output (including
 signal_id and created_at). Per-engine isolation: one failing engine never blanks
 the pass.
+
+Output pipeline: engines' signals are MERGED into one list, de-duplicated by the
+content-addressed signal_id (the runner guarantees unique ids), then ordered
+deterministically (severity desc, signal_id tiebreak). A future AI runner is an
+ADDITIVE source merged at the same point — the contract and this signature never change.
 """
 from __future__ import annotations
+
+import uuid
 
 from navis.platform.monitoring import get_logger
 from navis.reasoning.v2.base import ReasoningContext
@@ -66,7 +73,15 @@ def run_reasoning_v2(
         except Exception:  # pragma: no cover - one bad engine never blanks the pass
             logger.exception("reasoning engine %s failed", engine.name)
 
-    # Deterministic order: severity desc, then signal_id for a stable tiebreak.
-    signals.sort(key=lambda s: (-s.severity, str(s.signal_id)))
-    logger.info("reasoning v2 produced %d signals org=%s", len(signals), state.org_id)
-    return signals
+    # Collapse by signal_id, then order deterministically. A ReasoningSignal is content-addressed
+    # on its identity, so the same signal_id IS the same signal; keep the first occurrence (engines
+    # run in a fixed order, so the winner is deterministic). This is a no-op for today's engines
+    # (each emits a unique id) — byte-identical output — but it makes the runner's contract
+    # "output signal_ids are unique", the invariant any future signal source (e.g. an additive AI
+    # runner merged in here) must satisfy without changing this signature.
+    unique: dict[uuid.UUID, ReasoningSignal] = {}
+    for s in signals:
+        unique.setdefault(s.signal_id, s)
+    ordered = sorted(unique.values(), key=lambda s: (-s.severity, str(s.signal_id)))
+    logger.info("reasoning v2 produced %d signals org=%s", len(ordered), state.org_id)
+    return ordered

@@ -100,6 +100,30 @@ def test_min_confidence_filters_and_max_items_caps():
     # Only very-high-confidence signals (e.g. context) survive the 0.99 filter.
 
 
+async def test_latest_brief_is_never_shadowed_by_a_null_as_of_brief():
+    """Regression: DailyBrief.as_of is nullable — an empty-state brief (new org, hourly beat
+    fires before any fact is folded) persists with as_of=None under its own watermark-keyed
+    row. Postgres sorts NULLs FIRST under DESC, so without NULLS LAST that early empty brief
+    permanently shadows every later real brief in latest_brief(): /brief/today stays empty and
+    propose-actions proposes nothing. SQLite sorts NULLs last natively, so only the compiled
+    Postgres SQL of the REAL statement pins the bug (captured from the service, not rebuilt)."""
+    from sqlalchemy.dialects import postgresql
+
+    from navis.decisions.service import DecisionService
+
+    class _CaptureDB:
+        stmt = None
+
+        async def scalar(self, stmt):
+            _CaptureDB.stmt = stmt
+            return None
+
+    await DecisionService(_CaptureDB()).latest_brief(ORG_A)
+    sql = str(_CaptureDB.stmt.compile(dialect=postgresql.dialect()))
+    assert "as_of DESC NULLS LAST" in sql
+    assert "created_at DESC" in sql  # stable read tiebreak when as_of values tie
+
+
 _FORBIDDEN_CALLS = {"now", "uuid4"}
 
 

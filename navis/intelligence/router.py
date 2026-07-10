@@ -52,3 +52,25 @@ async def project(
 ) -> dict[str, Any]:
     rows = await IntelligenceService(IntelligenceRepository(db)).project(ctx.org_id)
     return {"projected": len(rows)}
+
+
+@router.get("/graph", dependencies=[Depends(require_capability(Capability.INTELLIGENCE))])
+async def graph(
+    ctx: CurrentContext = Depends(get_current_context),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """The Learning-scoped knowledge graph (signal/decision -> outcome-type influence).
+    Facts only; the organizational entity graph lives in State, not here."""
+    g = await IntelligenceService(IntelligenceRepository(db)).get_influence_graph(ctx.org_id)
+    return g.to_dict()
+
+
+@router.get("/trends", dependencies=[Depends(require_capability(Capability.INTELLIGENCE))])
+async def trends(
+    ctx: CurrentContext = Depends(get_current_context),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Per-signal/decision outcome trends (improving/degrading/stable) — the temporal
+    dimension over Learning. Facts only, no recommendations."""
+    rows = await IntelligenceService(IntelligenceRepository(db)).get_trends(ctx.org_id)
+    return {"trends": [t.to_dict() for t in rows]}

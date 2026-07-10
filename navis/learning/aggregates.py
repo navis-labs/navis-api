@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from navis.learning.models import AggregateDimension, LearningResult
+from navis.learning.models import AggregateDimension, LearningEvent, LearningResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,12 +27,18 @@ def delta_for(result: str) -> Delta:
     return Delta(0, 0, 1, 1)  # neutral
 
 
-def aggregate_keys(learning_event) -> list[tuple[str, str, Delta]]:
+def aggregate_keys(learning_event: LearningEvent) -> list[tuple[str, str, Delta]]:
     """(dimension, key, delta) increments for one learning event."""
     delta = delta_for(learning_event.result)
     out: list[tuple[str, str, Delta]] = []
-    for sid in (learning_event.reasoning_signal_ids or []):
-        out.append((AggregateDimension.SIGNAL.value, str(sid), delta))
+    # Order-preserving dedup of the signal ids. reasoning_signal_ids is a plural JSONB
+    # list; a repeated id would fan out to TWO SIGNAL increments for ONE event, double-
+    # counting that signal's success/failure and skewing its success_rate + pattern.
+    # Upstream guarantees uniqueness today (the reasoning runner dedups by signal_id, and
+    # a decision carries one), so this is a no-op for valid input — it just makes the
+    # count invariant robust to that plural field without any behaviour change.
+    for sid in dict.fromkeys(str(s) for s in (learning_event.reasoning_signal_ids or [])):
+        out.append((AggregateDimension.SIGNAL.value, sid, delta))
     if learning_event.decision_id is not None:
         out.append((AggregateDimension.DECISION.value, str(learning_event.decision_id), delta))
     if learning_event.outcome_type:

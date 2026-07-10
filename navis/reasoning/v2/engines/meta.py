@@ -8,37 +8,26 @@ from __future__ import annotations
 
 from navis.reasoning.v2.base import ReasoningContext, ReasoningEngine, days_between
 from navis.reasoning.v2.contract import SignalDraft, SignalType
-from navis.reasoning.v2.engines.risk import (
-    COMMITMENT_SLIPPING_DAYS,
-    PROJECT_STALLED_DAYS,
-    RELATIONSHIP_COOLING_DAYS,
-)
+from navis.reasoning.v2.engines.risk import cooling_age, slipping_age, stalled_age
 from navis.state.v2.models import OrganizationalState
 
 OPPORTUNITY_RECENT_DAYS = 2.0
 LEVERAGE_MIN_PEOPLE = 2
 
 
+# Priority pressure = how many entities the entity engines would flag. Reuses the SINGLE-HOME
+# predicates (risk.slipping_age/cooling_age/stalled_age) so a count can never disagree with the
+# signals the entity engines actually emit.
 def _count_slipping(state, as_of) -> int:
-    return sum(
-        1 for c in state.commitments()
-        if c.status == "open"
-        and (days_between(as_of, c.last_seen) or 0) >= COMMITMENT_SLIPPING_DAYS
-    )
+    return sum(1 for c in state.commitments() if slipping_age(c, as_of) is not None)
 
 
 def _count_cooling(state, as_of) -> int:
-    return sum(
-        1 for r in state.relationships()
-        if (days_between(as_of, r.last_interaction_at) or 0) >= RELATIONSHIP_COOLING_DAYS
-    )
+    return sum(1 for r in state.relationships() if cooling_age(r, as_of) is not None)
 
 
 def _count_stalled(state, as_of) -> int:
-    return sum(
-        1 for p in state.projects()
-        if (days_between(as_of, p.last_seen) or 0) >= PROJECT_STALLED_DAYS
-    )
+    return sum(1 for p in state.projects() if stalled_age(p, as_of) is not None)
 
 
 class PriorityEngine(ReasoningEngine):

@@ -31,6 +31,7 @@ class OutcomeRepository:
         result = await self.db.execute(stmt)
         created = (result.rowcount or 0) == 1
         row = await self.db.get(Outcome, values["outcome_id"])
+        assert row is not None  # just inserted, or the prior row under the same id
         return row, created
 
     async def inbox_claim(self, consumer: str, event_id: str) -> bool:
@@ -52,7 +53,11 @@ class OutcomeRepository:
         )
         if org_id is not None:
             stmt = stmt.where(Outcome.organization_id == org_id)
-        stmt = stmt.order_by(Outcome.occurred_at.desc()).limit(1)
+        # Total order: occurred_at can tie (action + webhook in the same second), and an
+        # unordered tie makes the inherited-lineage pick nondeterministic across replicas.
+        stmt = stmt.order_by(
+            Outcome.occurred_at.desc(), Outcome.created_at.desc(), Outcome.outcome_id.desc()
+        ).limit(1)
         return await self.db.scalar(stmt)
 
     async def timeline(
@@ -67,7 +72,12 @@ class OutcomeRepository:
             stmt = stmt.where(Outcome.execution_id == execution_id)
         if decision_id is not None:
             stmt = stmt.where(Outcome.decision_id == decision_id)
-        stmt = stmt.order_by(Outcome.occurred_at.asc(), Outcome.created_at.asc())
+        # outcome_id is the final tiebreak: (occurred_at, created_at) can tie for rows
+        # written in one transaction, and timelines/replay must be a TOTAL deterministic
+        # order (replay feeds idempotent consumers in a stable sequence).
+        stmt = stmt.order_by(
+            Outcome.occurred_at.asc(), Outcome.created_at.asc(), Outcome.outcome_id.asc()
+        )
         return (await self.db.scalars(stmt)).all()
 
     async def for_replay(
@@ -76,5 +86,7 @@ class OutcomeRepository:
         stmt = select(Outcome).where(Outcome.organization_id == org_id)
         if since is not None:
             stmt = stmt.where(Outcome.occurred_at >= since)
-        stmt = stmt.order_by(Outcome.occurred_at.asc(), Outcome.created_at.asc()).limit(limit)
+        stmt = stmt.order_by(
+            Outcome.occurred_at.asc(), Outcome.created_at.asc(), Outcome.outcome_id.asc()
+        ).limit(limit)
         return (await self.db.scalars(stmt)).all()

@@ -23,6 +23,30 @@ def _clip(text: str | None, n: int = 80) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+# --- Slipping / cooling / stalled predicates — ONE HOME ------------------------------------
+# The "is this entity slipping/cooling/stalled?" judgment is defined ONCE here and reused by
+# BOTH the entity engines (which also need the age for the signal) and the PriorityEngine's meta
+# counts, so the two can never drift. Each returns the age in days when the condition holds (the
+# projection clock; a not-open status or a missing/invalid last_seen is never a hit), else None.
+# Deterministic and replay-safe.
+
+def slipping_age(commitment, as_of) -> float | None:
+    if commitment.status != "open":
+        return None
+    age = days_between(as_of, commitment.last_seen)
+    return age if age is not None and age >= COMMITMENT_SLIPPING_DAYS else None
+
+
+def cooling_age(relationship, as_of) -> float | None:
+    age = days_between(as_of, relationship.last_interaction_at)
+    return age if age is not None and age >= RELATIONSHIP_COOLING_DAYS else None
+
+
+def stalled_age(project, as_of) -> float | None:
+    age = days_between(as_of, project.last_seen)
+    return age if age is not None and age >= PROJECT_STALLED_DAYS else None
+
+
 class CommitmentReasoningEngine(ReasoningEngine):
     name = "commitment_reasoning"
     version = "2.0.0"
@@ -30,10 +54,8 @@ class CommitmentReasoningEngine(ReasoningEngine):
     def analyze(self, state: OrganizationalState, ctx: ReasoningContext) -> list[SignalDraft]:
         out = []
         for c in state.commitments():
-            if c.status != "open":
-                continue
-            age = days_between(ctx.as_of, c.last_seen)
-            if age is None or age < COMMITMENT_SLIPPING_DAYS:
+            age = slipping_age(c, ctx.as_of)
+            if age is None:
                 continue
             out.append(
                 SignalDraft(
@@ -58,8 +80,8 @@ class RelationshipReasoningEngine(ReasoningEngine):
     def analyze(self, state: OrganizationalState, ctx: ReasoningContext) -> list[SignalDraft]:
         out = []
         for r in state.relationships():
-            age = days_between(ctx.as_of, r.last_interaction_at)
-            if age is None or age < RELATIONSHIP_COOLING_DAYS:
+            age = cooling_age(r, ctx.as_of)
+            if age is None:
                 continue
             out.append(
                 SignalDraft(
@@ -84,8 +106,8 @@ class ProjectReasoningEngine(ReasoningEngine):
     def analyze(self, state: OrganizationalState, ctx: ReasoningContext) -> list[SignalDraft]:
         out = []
         for p in state.projects():
-            age = days_between(ctx.as_of, p.last_seen)
-            if age is None or age < PROJECT_STALLED_DAYS:
+            age = stalled_age(p, ctx.as_of)
+            if age is None:
                 continue
             out.append(
                 SignalDraft(

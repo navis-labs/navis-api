@@ -47,6 +47,19 @@ class SignalDraft:
     dedup_key: str
     evidence: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # Structural validation at the engine-output boundary (fail-closed; the runner isolates a
+        # bad engine, so the pass continues). confidence/severity feed Decision's weight
+        # (confidence * severity), so an out-of-range value would silently corrupt ranking;
+        # dedup_key anchors the content-addressed signal_id. Ranges only — no business logic. This
+        # protects the reasoning->decision contract from any engine (deterministic OR future AI).
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError(f"SignalDraft.confidence must be in [0, 1], got {self.confidence}")
+        if not 0.0 <= self.severity <= 1.0:
+            raise ValueError(f"SignalDraft.severity must be in [0, 1], got {self.severity}")
+        if not self.dedup_key:
+            raise ValueError("SignalDraft.dedup_key must be non-empty (it anchors the signal_id)")
+
 
 @dataclass(frozen=True, slots=True)
 class ReasoningSignal:

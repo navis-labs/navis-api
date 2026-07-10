@@ -7,9 +7,9 @@ Rebuild recomputes aggregates from the immutable event log.
 from __future__ import annotations
 
 import uuid
-from typing import Any, Sequence
+from typing import Any, AsyncIterator, Collection, Sequence
 
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,6 +35,7 @@ class LearningRepository:
         result = await self.db.execute(stmt)
         created = (result.rowcount or 0) == 1
         row = await self.db.get(LearningEvent, values["id"])
+        assert row is not None  # just inserted, or the prior row (events are never deleted)
         return row, created
 
     async def increment_aggregate(
@@ -82,14 +83,36 @@ class LearningRepository:
         result = await self.db.execute(stmt)
         return (result.rowcount or 0) == 1
 
-    async def all_events(self, org_id: uuid.UUID, *, limit: int = 1_000_000) -> Sequence[LearningEvent]:
-        stmt = (
-            select(LearningEvent)
-            .where(LearningEvent.organization_id == org_id)
-            .order_by(LearningEvent.occurred_at.asc(), LearningEvent.id.asc())
-            .limit(limit)
-        )
-        return (await self.db.scalars(stmt)).all()
+    async def stream_events(
+        self, org_id: uuid.UUID, *, batch: int = 5000
+    ) -> AsyncIterator[LearningEvent]:
+        """Keyset-paginated stream of the org's immutable log in (occurred_at, id) order.
+        Replay folds this — O(distinct keys) memory, never O(events), and it NEVER truncates
+        (the reason all_events, capped at 1M, was retired from the rebuild path). Mirrors
+        state.v2 MemoryReader.stream, the established streaming-rebuild pattern."""
+        last_ts = None
+        last_id = None
+        while True:
+            stmt = select(LearningEvent).where(LearningEvent.organization_id == org_id)
+            if last_ts is not None and last_id is not None:
+                # Keyset cursor: (occurred_at, id) strictly after the last row seen.
+                stmt = stmt.where(
+                    or_(
+                        LearningEvent.occurred_at > last_ts,
+                        and_(LearningEvent.occurred_at == last_ts, LearningEvent.id > last_id),
+                    )
+                )
+            stmt = stmt.order_by(
+                LearningEvent.occurred_at.asc(), LearningEvent.id.asc()
+            ).limit(batch)
+            rows = (await self.db.scalars(stmt)).all()
+            if not rows:
+                return
+            for row in rows:
+                yield row
+            if len(rows) < batch:
+                return
+            last_ts, last_id = rows[-1].occurred_at, rows[-1].id
 
     async def aggregates(
         self, org_id: uuid.UUID, *, dimension: str | None = None
@@ -101,6 +124,21 @@ class LearningRepository:
 
     async def signal_aggregates(self, org_id: uuid.UUID) -> Sequence[LearningAggregate]:
         return await self.aggregates(org_id, dimension=AggregateDimension.SIGNAL.value)
+
+    async def signal_aggregates_for(
+        self, org_id: uuid.UUID, keys: Collection[str]
+    ) -> Sequence[LearningAggregate]:
+        """Only the SIGNAL aggregates for a specific set of signal ids — the per-outcome
+        pattern refresh reads just the few signals that outcome touched, never the org's
+        entire signal table. Index-covered by the (org, dimension, key) PK prefix + key IN."""
+        if not keys:
+            return []
+        stmt = select(LearningAggregate).where(
+            LearningAggregate.organization_id == org_id,
+            LearningAggregate.dimension == AggregateDimension.SIGNAL.value,
+            LearningAggregate.key.in_(list(keys)),
+        )
+        return (await self.db.scalars(stmt)).all()
 
     async def delete_projections(self, org_id: uuid.UUID) -> None:
         await self.db.execute(

@@ -27,9 +27,20 @@ async def relay_signals_pass(repo: Any, *, limit: int = 500) -> int:
     rows = await repo.pending_outbox(limit=limit)
     published_ids = []
     for row in rows:
+        try:
+            etype = EventType(row.event_type)
+        except ValueError:
+            # Poison row (event-type enum drift across deploys): left pending it would sit
+            # at the front of every oldest-first batch and wedge the signal->memory pointer
+            # relay for EVERY org. Drain it (mark published) with a loud error; the row
+            # stays for audit. Transient publish failures keep abort-and-retry semantics.
+            logger.error("unpublishable signal outbox row %s type=%r — drained", row.id, row.event_type)
+            metrics.incr("signals.outbox.poisoned")
+            published_ids.append(row.id)
+            continue
         await event_bus.publish(
             DomainEvent(
-                type=EventType(row.event_type),
+                type=etype,
                 org_id=row.organization_id,
                 source="signals",
                 payload=row.payload,  # pointer + lineage; event_id inside for dedupe

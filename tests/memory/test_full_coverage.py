@@ -101,3 +101,27 @@ def test_memory_erasure_matcher_and_registration():
     assert _references_subject({"attendees": ["b@x.com", "a@x.com"]}, email="a@x.com", slack_user_id=None)
     assert _references_subject({"slack_user_id": "U1"}, email=None, slack_user_id="U1")
     assert not _references_subject({"person_email": "a@x.com.evil"}, email="a@x.com", slack_user_id=None)
+
+
+# ---- Signal pointer routing <-> Memory subscription: the seam that broke ----
+
+def test_memory_subscribes_to_every_signal_pointer_route():
+    """Regression (production fix in memory/service.py): the signals layer routes each
+    ingested signal's pointer to a bus event (_BUS_EVENT_FOR_TYPE, else SIGNAL_INGESTED).
+    Memory's subscription tuple silently drifted from that table — CALENDAR_EVENT_UPDATED
+    and CALENDAR_EVENT_CANCELLED pointers had NO Memory consumer, so a meeting cancelled
+    or rescheduled in Calendar never updated organizational truth (State kept it
+    "confirmed"; MEETING_OVERLOAD counted it forever; the Meet deriver covers only
+    conference events and skips cancellations). Every routable pointer event must have
+    Memory's _on_signal_pointer subscribed, so the two files can never drift again."""
+    import navis.memory.service as mem_service  # noqa: F401  (registers subscribers)
+    from navis.platform.events import EventType, event_bus
+    from navis.signals.service import _BUS_EVENT_FOR_TYPE
+
+    routable = set(_BUS_EVENT_FOR_TYPE.values()) | {EventType.SIGNAL_INGESTED}
+    for et in routable:
+        handlers = event_bus._handlers.get(et, [])
+        assert any(h.__name__ == "_on_signal_pointer" for h in handlers), (
+            f"signal pointers routed to {et} have no Memory consumer — "
+            "signals reaching this event type silently never become memories"
+        )

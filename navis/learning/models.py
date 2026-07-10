@@ -20,6 +20,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
@@ -59,6 +60,14 @@ class LearningEvent(Base):
     """Immutable attribution fact: an outcome, classified, with full lineage."""
 
     __tablename__ = "learning_events"
+    __table_args__ = (
+        # Serves the replay rebuild's dominant read: keyset-stream ALL of an org's events in
+        # (occurred_at, id) fold order (repository.stream_events). The single-column
+        # organization_id index can't provide that ordering, so without this composite the
+        # keyset paginator re-sorts every page — quadratic at scale. Mirrors State's
+        # ix_mem_org_time (migration 0028). Pure-additive.
+        Index("ix_learning_events_org_time", "organization_id", "occurred_at", "id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     organization_id: Mapped[uuid.UUID] = mapped_column(

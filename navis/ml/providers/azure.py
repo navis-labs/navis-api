@@ -16,15 +16,36 @@ class AzureProvider(MLProvider):
         model = deployment or settings.azure_openai_deployment or DEFAULT_DEPLOYMENT
         self._deployment = model
         self.info = ProviderInfo("azure", model, EMBED_DEPLOYMENT, EMBED_DIM, online=True)
+        self._client_obj = None
+        self._client_loop = None
 
     def _client(self):
+        # Reuse one AsyncAzureOpenAI (and its httpx connection pool) per event loop: reused
+        # across all calls on a long-lived server loop (pooling), and rebuilt if the running
+        # loop changed (e.g. a Celery asyncio.run task on a fresh loop) so a client bound to a
+        # closed loop is never reused.
+        import asyncio
+
         from openai import AsyncAzureOpenAI
 
-        return AsyncAzureOpenAI(
-            api_key=settings.azure_openai_api_key,
-            azure_endpoint=settings.azure_openai_endpoint or "",
-            api_version=settings.azure_openai_api_version,
-        )
+        loop = asyncio.get_running_loop()
+        if self._client_obj is None or self._client_loop is not loop:
+            self._client_obj = AsyncAzureOpenAI(
+                api_key=settings.azure_openai_api_key,
+                azure_endpoint=settings.azure_openai_endpoint or "",
+                api_version=settings.azure_openai_api_version,
+                # ResilientProvider (registry) is the SOLE retry owner. The openai SDK defaults
+                # to max_retries=2; leaving it would DOUBLE-retry (up to 3x3 = 9 provider calls
+                # per logical call during an incident — retry amplification).
+                max_retries=0,
+            )
+            self._client_loop = loop
+        return self._client_obj
+
+    async def aclose(self) -> None:
+        client, self._client_obj, self._client_loop = self._client_obj, None, None
+        if client is not None:
+            await client.close()
 
     async def generate(self, req: GenRequest) -> GenResult:
         client = self._client()

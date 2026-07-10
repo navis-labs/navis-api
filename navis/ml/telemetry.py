@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from navis.ml.providers.base import GenResult
 from navis.platform.monitoring import get_logger
@@ -69,7 +69,11 @@ class MLTelemetry:
         return cost
 
     def usage(self, org_id: uuid.UUID) -> OrgUsage:
-        return self._by_org.get(org_id, OrgUsage())
+        # Defensive copy: never hand out the internal accounting object (a caller could otherwise
+        # mutate live per-org totals through it). `.get` (not the defaultdict's __getitem__) so
+        # reading an unknown org never creates an entry.
+        current = self._by_org.get(org_id)
+        return replace(current) if current is not None else OrgUsage()
 
 
 telemetry = MLTelemetry()

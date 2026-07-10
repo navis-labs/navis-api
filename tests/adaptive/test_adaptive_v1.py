@@ -184,6 +184,32 @@ def test_validate_change_rejects_out_of_bounds():
         P.validate_change("execution_retry_limit", 5, 50)
 
 
+def test_merge_defaults_is_total_and_fail_safe():
+    """Regression: merge_defaults is the READ seam producing the effective policy the
+    pipeline consumes (resolve_policy documents "never raises"). Sanctioned writers all
+    validate, but a corrupt or historical stored value must DEGRADE, never propagate:
+    out-of-bounds numbers clamp to the schema's declared safe bounds and un-castable
+    values fall back to the field default. Without this, one bad stored value either
+    crashes brief assembly for the org (ValueError) or silently empties its briefs
+    (brief_min_confidence=5.0 filters every signal)."""
+    # Valid payload: identical to the pre-hardening cast behavior.
+    ok = P.merge_defaults({"brief_max_items": 9, "brief_min_confidence": 0.5})
+    assert ok["brief_max_items"] == 9 and ok["brief_min_confidence"] == 0.5
+
+    # Out-of-bounds numerics clamp to the declared safe bounds.
+    clamped = P.merge_defaults({"brief_min_confidence": 5.0, "brief_max_items": -3})
+    assert clamped["brief_min_confidence"] == 0.95  # can no longer filter every signal
+    assert clamped["brief_max_items"] == 1
+
+    # Un-castable values degrade to the safe code default instead of raising.
+    corrupt = P.merge_defaults({"brief_min_confidence": "abc", "brief_max_items": None})
+    assert corrupt["brief_min_confidence"] == P.DEFAULT_POLICY["brief_min_confidence"]
+    assert corrupt["brief_max_items"] == P.DEFAULT_POLICY["brief_max_items"]
+
+    # Unknown fields are still dropped (unchanged behavior).
+    assert "mystery" not in P.merge_defaults({"mystery": 1})
+
+
 def test_proposed_changes_never_exceed_caps():
     # Even with a wildly positive org, capping keeps each change within 25%.
     view = make_view(insights=[org_insight(positive=999, negative=1)])

@@ -17,10 +17,20 @@ logger = get_logger("ml.embeddings.jobs")
 
 
 async def _embed_org(org_id: uuid.UUID, version: int) -> int:
-    async with session_scope() as db:
-        count = await EmbeddingService(db).embed_org(org_id, version=version)
-    logger.info("embedded org=%s version=%d new=%d", org_id, version, count)
-    return count
+    from navis.ml.providers import get_embedding_provider
+
+    try:
+        async with session_scope() as db:
+            count = await EmbeddingService(db).embed_org(org_id, version=version)
+        logger.info("embedded org=%s version=%d new=%d", org_id, version, count)
+        return count
+    finally:
+        # This coroutine owns the per-task asyncio.run() loop; close the embedding provider's
+        # pooled client so the loop's HTTP connections don't leak across Celery tasks (a
+        # client is loop-bound and cannot be reused on the next task's fresh loop anyway).
+        closer = getattr(get_embedding_provider(), "aclose", None)
+        if closer is not None:
+            await closer()
 
 
 @celery_app.task(name="navis.ml.embeddings.jobs.embed_org")
