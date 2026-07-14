@@ -774,25 +774,39 @@ async def sync_google_integration(
         total_ingested += int(outcome.get("ingested") or 0)
         results.append(outcome)
 
-    # Drain the outbox in the background so the just-ingested signals
+    # Drain both outboxes in the background so the just-ingested signals
     # get published to the bus (advancing onboarding stage / lighting up
     # capabilities) even without a Celery worker running. Same rationale
     # as the seed endpoint — real Celery relay would eventually catch up
     # anyway; this just makes local dev demos feel live.
-    if total_ingested > 0:
-        import asyncio
+    #
+    # Order matters: draining signals runs the in-process memory subscriber,
+    # which STAGES memory outbox pointers in its own commit. The memory relay
+    # then publishes those, which is what advances the onboarding funnel from
+    # `first_signal` to `memory_ready` (and further). Skipping the memory pass
+    # was the reason the pipeline stalled at Building Memory in dev.
+    #
+    # We also drain memory unconditionally: earlier syncs may have staged
+    # pointers that never published because that session's Celery relay
+    # wasn't running — a fresh press should clear the backlog.
+    import asyncio
 
-        async def _drain() -> None:
-            try:
-                from navis.platform.database import session_scope
-                from navis.signals.outbox import relay_signals_pass
-                from navis.signals.repository import SignalRepository
+    async def _drain() -> None:
+        try:
+            from navis.memory.outbox import relay_memory_pass
+            from navis.memory.repository import MemoryRepository
+            from navis.platform.database import session_scope
+            from navis.signals.outbox import relay_signals_pass
+            from navis.signals.repository import SignalRepository
 
+            if total_ingested > 0:
                 async with session_scope() as bg_db:
                     await relay_signals_pass(SignalRepository(bg_db))
-            except Exception:
-                logger.exception("sync background outbox drain failed org=%s", ctx.org_id)
+            async with session_scope() as bg_db:
+                await relay_memory_pass(MemoryRepository(bg_db))
+        except Exception:
+            logger.exception("sync background outbox drain failed org=%s", ctx.org_id)
 
-        asyncio.create_task(_drain())
+    asyncio.create_task(_drain())
 
     return {"synced": len(results), "total_ingested": total_ingested, "results": results}

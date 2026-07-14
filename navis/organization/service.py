@@ -21,6 +21,7 @@ from navis.organization.lifecycle import LifecycleService
 from navis.organization.metrics import MetricsService
 from navis.organization.onboarding import OnboardingService
 from navis.organization.repository import OrganizationRepository
+from navis.platform.config import settings
 from navis.platform.database.base import utcnow
 
 # Minimum fields required to advance to PROFILE_COMPLETE.
@@ -42,12 +43,18 @@ class OrganizationService:
         self.metrics = MetricsService(self.repo)
 
     # ---- provisioning ----
-    async def bootstrap(self, org_id: uuid.UUID, *, plan: Plan = Plan.FREE, actor_id=None) -> None:
+    async def bootstrap(self, org_id: uuid.UUID, *, plan: Plan | None = None, actor_id=None) -> None:
         """Idempotent. Triggered by the ORG_CREATED event (never imported by Identity).
 
         Stamps the CREATED clock for TTFI but does NOT re-emit ORG_CREATED — Identity
         already published it at signup, so re-emitting would loop the provisioner.
+
+        Default plan is FREE in production; in non-production environments new orgs are
+        provisioned with ENTERPRISE so the full pipeline (decision, execution,
+        intelligence) is exercisable end-to-end without an out-of-band plan bump.
         """
+        if plan is None:
+            plan = Plan.FREE if settings.is_production else Plan.ENTERPRISE
         await self.repo.ensure_lifecycle(org_id)
         onboarding = await self.repo.ensure_onboarding(org_id)
         if OnboardingStage.CREATED.value not in (onboarding.stage_timestamps or {}):

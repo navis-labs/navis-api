@@ -5,6 +5,9 @@ REASONING_VERSION.
 """
 from __future__ import annotations
 
+import re
+from html import unescape
+
 from navis.reasoning.v2.base import ReasoningContext, ReasoningEngine, days_between
 from navis.reasoning.v2.contract import SignalDraft, SignalType
 from navis.state.v2.models import OrganizationalState
@@ -17,9 +20,22 @@ DECISION_UNRESOLVED_DAYS = 7.0
 CUSTOMER_DROP_DAYS = 14.0
 MEETING_OVERLOAD_COUNT = 5
 
+# Defensive scrub for legacy Memory rows written before the extractor learned
+# to strip HTML from Gmail bodies (extractors/email.py). New rows are already
+# clean; this exists so 5+ day old commitments don't render <td> markup in
+# today's brief title.
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _plain(text: str | None) -> str:
+    if not text:
+        return ""
+    stripped = _HTML_TAG_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", unescape(stripped)).strip()
+
 
 def _clip(text: str | None, n: int = 80) -> str:
-    text = (text or "").strip().replace("\n", " ")
+    text = _plain(text).replace("\n", " ")
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
@@ -34,6 +50,12 @@ class CommitmentReasoningEngine(ReasoningEngine):
                 continue
             age = days_between(ctx.as_of, c.last_seen)
             if age is None or age < COMMITMENT_SLIPPING_DAYS:
+                continue
+            clean = _plain(c.text)
+            if not clean:
+                # Legacy row whose entire `text` was HTML markup — nothing
+                # meaningful to surface. Skip rather than showing an empty
+                # "Commitment slipping: " card. New rows never hit this path.
                 continue
             out.append(
                 SignalDraft(

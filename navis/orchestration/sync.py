@@ -11,7 +11,6 @@ Signals capture; orchestration persists cursors/tokens/watch. Clean seam.
 """
 from __future__ import annotations
 
-import asyncio
 import uuid
 from typing import Any
 
@@ -20,7 +19,7 @@ from sqlalchemy import select
 from navis.identity.models import Integration, IntegrationProvider
 from navis.platform.database import session_scope
 from navis.platform.monitoring import get_logger
-from navis.platform.queue import celery_app
+from navis.platform.queue import celery_app, run_async
 from navis.signals.base import SignalContext, WorkspaceConnector
 from navis.signals.calendar import CalendarClient, CalendarConnector
 from navis.signals.crypto import token_cipher
@@ -271,7 +270,7 @@ async def _process_slack_event(team_id: str | None, envelope: dict) -> dict:
 
 @celery_app.task(name="navis.orchestration.sync.process_slack_event")
 def process_slack_event(team_id: str | None = None, envelope: dict | None = None) -> dict:
-    return asyncio.run(_process_slack_event(team_id, envelope or {}))
+    return run_async(_process_slack_event(team_id, envelope or {}))
 
 
 async def _run_retention_purge() -> dict:
@@ -284,24 +283,24 @@ async def _run_retention_purge() -> dict:
 @celery_app.task(name="navis.orchestration.sync.retention_purge")
 def retention_purge() -> dict:
     """Periodic content-retention enforcement (M-1) — tombstone expired content, keep skeleton."""
-    return asyncio.run(_run_retention_purge())
+    return run_async(_run_retention_purge())
 
 
 @celery_app.task(name="navis.orchestration.sync.sync_one_integration")
 def sync_one_integration(integration_id: str) -> dict:
-    return asyncio.run(_sync_by_id(uuid.UUID(integration_id)))
+    return run_async(_sync_by_id(uuid.UUID(integration_id)))
 
 
 @celery_app.task(name="navis.orchestration.sync.sync_all_sources")
 def sync_all_sources() -> dict:
-    return {"dispatched": asyncio.run(_dispatch_all())}
+    return {"dispatched": run_async(_dispatch_all())}
 
 
 @celery_app.task(name="navis.orchestration.sync.renew_watches")
 def renew_watches() -> dict:
-    return asyncio.run(_renew_all_watches())
+    return run_async(_renew_all_watches())
 
 
 @celery_app.task(name="navis.orchestration.sync.sync_google_account")
 def sync_google_account(provider: str, email: str | None = None, history_id: str | None = None) -> dict:
-    return asyncio.run(_sync_account(provider, email, history_id))
+    return run_async(_sync_account(provider, email, history_id))

@@ -8,6 +8,9 @@ from __future__ import annotations
 import hashlib
 import re
 from email.utils import parseaddr
+from html import unescape
+from html.parser import HTMLParser
+from io import StringIO
 
 from navis.memory.confidence import HEURISTIC, HIGH, LOW, MEDIUM, STRUCTURAL
 from navis.memory.envelope import EntityType
@@ -55,6 +58,68 @@ def _addresses(payload: dict) -> list[tuple[str, str, str]]:
                 seen.add((role, email))
                 out.append((role, name or "", email))
     return out
+
+
+class _TextOnly(HTMLParser):
+    """Collect visible text; drop <script>/<style> content entirely."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._out = StringIO()
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in ("script", "style", "head"):
+            self._skip_depth += 1
+        elif tag in ("br", "p", "div", "tr", "td", "li"):
+            self._out.write(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style", "head") and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0:
+            self._out.write(data)
+
+    def value(self) -> str:
+        return self._out.getvalue()
+
+
+def _html_to_text(html: str) -> str:
+    """Strip HTML tags/entities to plain text. Permissive on malformed markup."""
+    parser = _TextOnly()
+    try:
+        parser.feed(html)
+        parser.close()
+        text = parser.value()
+    except Exception:
+        # Fall back to a plain regex strip; HTMLParser is permissive but not
+        # infallible on truly pathological input.
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# Any signal that HTML is embedded in what was claimed to be text/plain.
+# Newsletters and marketing mail routinely mis-declare the mime type.
+_HTML_HEURISTIC_RE = re.compile(r"<(?:td|tr|table|div|p|span|a|br|img)\b", re.IGNORECASE)
+
+
+def _body_as_text(payload: dict) -> str:
+    """Return the email body as plain text.
+
+    The Gmail parser stores raw HTML in `body_text` when no text/plain part
+    exists (see signals/gmail/parser.py — de-noising is Memory's job). Also
+    catches senders that stuff HTML into a mis-declared text/plain part.
+    """
+    body = payload.get("body_text") or payload.get("snippet") or ""
+    if not body:
+        return ""
+    mime = payload.get("body_mime")
+    if mime == "text/html" or _HTML_HEURISTIC_RE.search(body):
+        return _html_to_text(body)
+    return body
 
 
 def _sentences(body: str) -> list[str]:
@@ -173,11 +238,11 @@ class RelationshipExtractor(Extractor):
 
 class CommitmentExtractor(Extractor):
     name = "email_commitment"
-    version = "1.0.0"
+    version = "1.1.0"
     sources = _GMAIL
 
     def extract(self, signal: SignalView) -> list[MemoryDraft]:
-        body = signal.payload.get("body_text") or signal.payload.get("snippet") or ""
+        body = _body_as_text(signal.payload)
         if not body:
             return []
         _name, speaker = parseaddr(str(signal.payload.get("from", "")))
@@ -207,11 +272,11 @@ class CommitmentExtractor(Extractor):
 
 class DecisionExtractor(Extractor):
     name = "email_decision"
-    version = "1.0.0"
+    version = "1.1.0"
     sources = _GMAIL
 
     def extract(self, signal: SignalView) -> list[MemoryDraft]:
-        body = signal.payload.get("body_text") or ""
+        body = _body_as_text(signal.payload)
         if not body:
             return []
         ver = current_version(EntityType.DECISION)

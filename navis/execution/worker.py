@@ -10,7 +10,6 @@ The HTTP API never runs a provider — it changes state + enqueues this worker.
 """
 from __future__ import annotations
 
-import asyncio
 from time import monotonic
 
 from navis.execution.config import MAX_EXECUTION_ATTEMPTS
@@ -144,19 +143,19 @@ async def _recover() -> dict:
 
 
 def _register_tasks():
-    from navis.platform.queue import celery_app
+    from navis.platform.queue import celery_app, run_async
 
     @celery_app.task(name="navis.execution.worker.execute_approved_actions")
     def execute_approved_actions() -> dict:
-        return asyncio.run(_execute())
+        return run_async(_execute())
 
     @celery_app.task(name="navis.execution.worker.relay_execution_outbox")
     def relay_execution_outbox() -> int:
-        return asyncio.run(_relay())
+        return run_async(_relay())
 
     @celery_app.task(name="navis.execution.worker.recover_stale_executions")
     def recover_stale_executions() -> dict:
-        return asyncio.run(_recover())
+        return run_async(_recover())
 
     return execute_approved_actions, relay_execution_outbox, recover_stale_executions
 

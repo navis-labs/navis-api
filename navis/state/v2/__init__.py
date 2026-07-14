@@ -18,6 +18,25 @@ Module map (to the requested layout):
     service.py    -> service/   (StateService is the sole interface)
 """
 from navis.state.v2.models import OrganizationalState, Watermark
+from navis.state.v2.scope import (
+    Citation,
+    EntityRef,
+    Intent,
+    MorningBrief,
+    ScopedView,
+    scope_for,
+)
 from navis.state.v2.service import StateService
 
-__all__ = ["OrganizationalState", "Watermark", "StateService"]
+__all__ = [
+    "OrganizationalState",
+    "Watermark",
+    "StateService",
+    # Scoping utility — read-only over State (see scope.py header).
+    "Intent",
+    "MorningBrief",
+    "ScopedView",
+    "EntityRef",
+    "Citation",
+    "scope_for",
+]

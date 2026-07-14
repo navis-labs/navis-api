@@ -10,7 +10,6 @@ Wired as a Celery task (registered via navis.registry) + a beat schedule entry.
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from navis.platform.events import DomainEvent, EventType, event_bus
@@ -68,15 +67,15 @@ async def _purge() -> int:
 
 
 def _register_tasks():
-    from navis.platform.queue import celery_app
+    from navis.platform.queue import celery_app, run_async
 
     @celery_app.task(name="navis.signals.outbox.relay_signal_outbox")
     def relay_signal_outbox() -> int:
-        return asyncio.run(_relay())
+        return run_async(_relay())
 
     @celery_app.task(name="navis.signals.outbox.purge_signal_outbox")
     def purge_signal_outbox() -> int:
-        return asyncio.run(_purge())
+        return run_async(_purge())
 
     return relay_signal_outbox, purge_signal_outbox
 

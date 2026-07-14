@@ -18,6 +18,7 @@ from navis.organization.contract import (
 )
 from navis.organization.feature_flags import FeatureFlagService, kill_switch_flag
 from navis.organization.repository import OrganizationRepository
+from navis.platform.config import settings
 
 
 class EntitlementService:
@@ -43,6 +44,13 @@ class EntitlementService:
             return False
         if killed:
             return False
+        # Non-production: grant every capability that isn't explicitly killed / suspended.
+        # Pre-launch dev / staging must be able to exercise the full pipeline
+        # (decision, execution, intelligence) end-to-end without an out-of-band plan
+        # bump for every existing FREE-seeded org. Production still enforces the
+        # plan/explicit resolution below.
+        if not settings.is_production:
+            return True
         if explicit is not None:
             return bool(explicit)
         p = Plan(plan) if plan else Plan.FREE

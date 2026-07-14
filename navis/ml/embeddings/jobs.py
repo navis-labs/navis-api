@@ -5,13 +5,12 @@ audit/rollback. Wired as a Celery task; fan-out per org mirrors the brief schedu
 """
 from __future__ import annotations
 
-import asyncio
 import uuid
 
 from navis.ml.embeddings.service import EMBEDDING_VERSION, EmbeddingService
 from navis.platform.database import session_scope
 from navis.platform.monitoring import get_logger
-from navis.platform.queue import celery_app
+from navis.platform.queue import celery_app, run_async
 
 logger = get_logger("ml.embeddings.jobs")
 
@@ -25,4 +24,4 @@ async def _embed_org(org_id: uuid.UUID, version: int) -> int:
 
 @celery_app.task(name="navis.ml.embeddings.jobs.embed_org")
 def embed_org(org_id: str, version: int = EMBEDDING_VERSION) -> dict:
-    return {"embedded": asyncio.run(_embed_org(uuid.UUID(org_id), version))}
+    return {"embedded": run_async(_embed_org(uuid.UUID(org_id), version))}

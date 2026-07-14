@@ -8,7 +8,6 @@ Exposed both as a coroutine (for the API / tests) and a Celery task (schedule).
 """
 from __future__ import annotations
 
-import asyncio
 import uuid
 
 from sqlalchemy import select
@@ -19,7 +18,7 @@ from navis.decisions.service import DecisionService
 from navis.platform.database import session_scope
 from navis.platform.events import DomainEvent, EventType, event_bus
 from navis.platform.monitoring import get_logger
-from navis.platform.queue import celery_app
+from navis.platform.queue import celery_app, run_async
 from navis.reasoning.v2 import REASONING_VERSION, run_reasoning_v2
 from navis.state.v2 import StateService
 
@@ -34,7 +33,13 @@ async def build_brief(db: AsyncSession, org_id: uuid.UUID) -> DailyBrief:
     """
     from navis.orchestration.runtime_policy import resolve_policy
 
-    state = await StateService(db).get_state(org_id)
+    # incremental_update (not get_state) so the brief's as_of reflects the
+    # NEWEST memory_records, not whatever snapshot happens to be cached.
+    # get_state serves reads from cache and would freeze as_of at the last
+    # rebuild — leaving today's brief permanently stamped "Thursday 9 Jul"
+    # even after new signals land. Incremental only folds records past the
+    # snapshot watermark, so cost is O(delta) not O(all-memory).
+    state = await StateService(db).incremental_update(org_id)
     # Announce that State V2 is current for this org (re-homed from the retired V1
     # state service). Drives the onboarding STATE_READY milestone; State itself stays
     # a pure read model and never touches the event bus.
@@ -117,9 +122,9 @@ async def _dispatch_all() -> int:
 
 @celery_app.task(name="navis.orchestration.brief.build_brief_for_org")
 def build_brief_for_org(org_id: str) -> dict:
-    return asyncio.run(run_brief_for_org(uuid.UUID(org_id)))
+    return run_async(run_brief_for_org(uuid.UUID(org_id)))
 
 
 @celery_app.task(name="navis.orchestration.brief.build_all_briefs")
 def build_all_briefs() -> dict:
-    return {"dispatched": asyncio.run(_dispatch_all())}
+    return {"dispatched": run_async(_dispatch_all())}

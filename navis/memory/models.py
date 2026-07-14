@@ -21,11 +21,12 @@ from sqlalchemy import (
     Integer,
     String,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from navis.platform.database.base import Base
+from navis.platform.database.base import Base, UUIDPrimaryKey
 
 # --- Legacy re-exports (FROZEN; state/intelligence still import these) ---
 from navis.memory.legacy_models import (  # noqa: F401
@@ -90,6 +91,43 @@ class MemoryRecord(Base):
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
     # Ingest time (operational metadata — NOT part of identity, varies across replays).
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MemoryOutbox(UUIDPrimaryKey, Base):
+    """Transactional outbox for memory-derived domain events.
+
+    Memory extractors produce facts (PERSON, COMMITMENT, DECISION, ...) that
+    downstream domains need to react to — the onboarding funnel advances to
+    MEMORY_READY on the first PersonDetected/CommitmentDetected, State V2 folds
+    on RelationshipUpdated, and Learning tracks DecisionDetected. Writing straight
+    to the bus after commit is a dual write that can lose events on a crash. Instead
+    we stage a pointer row here in the SAME transaction as the memory_records append,
+    and a relay worker publishes pending rows (`published_at IS NULL`) to the bus
+    at-least-once. Consumers dedupe on the payload identity (memory_id) — idempotent.
+
+    Mirrors `signal_outbox`. Same partial-index + retention-purge pattern.
+    """
+
+    __tablename__ = "memory_outbox"
+    __table_args__ = (
+        Index(
+            "ix_memory_outbox_unpublished", "created_at",
+            postgresql_where=text("published_at IS NULL"),
+        ),
+    )
+
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    # The memory_id this pointer announces — consumer dedupe key.
+    aggregate_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)  # platform EventType value
+    entity_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)  # pointer + lineage, never the raw body
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

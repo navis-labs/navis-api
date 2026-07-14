@@ -28,6 +28,7 @@ from navis.identity_resolution import service as _identity_resolution_service  #
 from navis.learning import subscribers as _learning_subscribers  # noqa: F401  (OUTCOME_OBSERVED)
 from navis.execution import worker as _execution_worker  # noqa: F401  (registers tasks)
 from navis.signals import outbox as _signal_outbox  # noqa: F401  (registers the outbox relay task)
+from navis.memory import outbox as _memory_outbox  # noqa: F401  (registers the memory outbox relay task)
 from navis.identity import maintenance as _identity_maintenance  # noqa: F401  (registers purge tasks)
 from navis.observation import subscribers as _observation_subscribers  # noqa: F401  (closes the loop)
 from navis.orchestration import org_provisioning as _org_provisioning  # noqa: F401  (ORG_CREATED + onboarding funnel)
