@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     signals_dlq_max_replay_attempts: int = 5
     # Outbox retention: published pointer rows older than this are purged (bounds growth).
     signals_outbox_retention_seconds: int = 7 * 24 * 60 * 60
+    # Memory outbox retention — mirrors the signal outbox (same rationale: bound growth
+    # of the published-pointer backlog without dropping unpublished rows).
+    memory_outbox_retention_seconds: int = 7 * 24 * 60 * 60
     # Calendar capture: how far back a full sync reaches (future events are unbounded), and
     # the page-drain safety cap (exceeding it fails LOUD/retryable, never silently truncates).
     calendar_full_sync_window_days: int = 60

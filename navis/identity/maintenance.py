@@ -13,8 +13,6 @@ sync Celery worker drives the async DB work in its own transaction.
 """
 from __future__ import annotations
 
-import asyncio
-
 from navis.platform.monitoring import get_logger
 
 logger = get_logger("identity.maintenance")
@@ -41,15 +39,15 @@ async def _purge_tokens() -> int:
 
 
 def _register_tasks():
-    from navis.platform.queue import celery_app
+    from navis.platform.queue import celery_app, run_async
 
     @celery_app.task(name="navis.identity.maintenance.purge_expired_sessions")
     def purge_expired_sessions() -> int:
-        return asyncio.run(_purge_sessions())
+        return run_async(_purge_sessions())
 
     @celery_app.task(name="navis.identity.maintenance.purge_expired_tokens")
     def purge_expired_tokens() -> int:
-        return asyncio.run(_purge_tokens())
+        return run_async(_purge_tokens())
 
     return purge_expired_sessions, purge_expired_tokens
 

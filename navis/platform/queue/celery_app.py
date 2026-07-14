@@ -5,9 +5,37 @@ never here. This module only configures the broker.
 """
 from __future__ import annotations
 
+import asyncio
+from typing import Any, Coroutine, TypeVar
+
 from celery import Celery
 
 from navis.platform.config import settings
+
+_T = TypeVar("_T")
+
+_worker_loop: asyncio.AbstractEventLoop | None = None
+
+
+def run_async(coro: Coroutine[Any, Any, _T]) -> _T:
+    """Drive a task coroutine on the worker's persistent event loop.
+
+    Every Celery task in this repo unwraps an async body — the natural pattern
+    is ``asyncio.run(coro)``. But ``asyncio.run`` creates AND closes a fresh
+    loop per call, and SQLAlchemy's async engine caches asyncpg connections
+    against the loop that first touched them. On task #2, the pooled connection
+    points at a closed loop and asyncpg raises "Event loop is closed" from
+    ``BaseProtocol._new_waiter``. Windows + Python 3.13 makes this fail loudly.
+
+    Keeping ONE loop for the worker's lifetime means the pool binds to it once
+    and stays valid across every task. Lazy init covers --pool=solo, threads,
+    and (via first-use) prefork worker children — no signal wiring needed.
+    """
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_loop)
+    return _worker_loop.run_until_complete(coro)
 
 celery_app = Celery(
     "navis",
@@ -74,6 +102,18 @@ celery_app.conf.beat_schedule = {
         "task": "navis.signals.outbox.purge_signal_outbox",
         "schedule": 60 * 60,  # hourly
     },
+    # Memory: relay the transactional outbox (staged domain events) to the bus. Same
+    # cadence as the signal outbox — a signal ingested at t drives a memory write and a
+    # memory pointer within one relay tick, so the onboarding funnel advances end-to-end
+    # within ~10s of the sync completing.
+    "relay-memory-outbox": {
+        "task": "navis.memory.outbox.relay_memory_outbox",
+        "schedule": 5,
+    },
+    "purge-memory-outbox": {
+        "task": "navis.memory.outbox.purge_memory_outbox",
+        "schedule": 60 * 60,  # hourly
+    },
     # Recover orphaned EXECUTING requests (dead workers).
     "recover-stale-executions": {
         "task": "navis.execution.worker.recover_stale_executions",
@@ -91,3 +131,25 @@ celery_app.conf.beat_schedule = {
         "schedule": 60 * 60,
     },
 }
+
+
+# Composition-root registration (matches main.py:14). Without this the worker
+# registers its Celery tasks but NOT the event subscribers in navis.memory.service
+# / navis.identity_resolution.service / etc. Consequence: the outbox relay task
+# publishes SIGNAL_INGESTED / MEMORY_APPENDED events into a bus with no handlers,
+# so new Gmail messages never extract into memory_records and the pipeline
+# silently stalls at Layer 1 → Layer 2.
+#
+# Deferred via worker_process_init because a top-level `import navis.registry`
+# hits a real circular-import: registry imports navis.execution.worker (etc.)
+# whose module body calls _register_tasks() which does
+# `from navis.platform.queue import celery_app, run_async` — but at that instant
+# navis.platform.queue.__init__ is still executing its one and only import line
+# and `run_async` is not yet in its namespace. Signal-based init runs AFTER
+# celery has fully wired the queue package.
+from celery.signals import worker_process_init  # noqa: E402
+
+
+@worker_process_init.connect
+def _register_event_subscribers(**_kwargs) -> None:
+    import navis.registry  # noqa: F401  (subscribe side-effects)

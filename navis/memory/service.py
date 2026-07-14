@@ -12,8 +12,9 @@ replayability — and is unit-tested without any database.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
-from navis.memory.envelope import MemoryRecord
+from navis.memory.envelope import EntityType, MemoryRecord
 from navis.memory.extractors import SignalView, extractors_for
 from navis.memory.ids import entity_id, memory_record_id
 from navis.memory.repository import MemoryRepository
@@ -23,6 +24,18 @@ from navis.platform.monitoring import get_logger
 from navis.platform.monitoring.metrics import metrics
 from navis.platform.security import FieldDecryptError, field_cipher
 from navis.signals.base import SignalEventType, SignalSource
+
+# Route a newly-written memory fact to the platform bus event that consumers
+# subscribe to. Anything unmapped stays out of the outbox (writing an
+# unroutable event would produce a permanently-unpublishable row). RELATIONSHIP
+# updates use the RELATIONSHIP_UPDATED event that state/reasoning folds on.
+_BUS_EVENT_FOR_ENTITY: dict[EntityType, EventType] = {
+    EntityType.PERSON: EventType.PERSON_DETECTED,
+    EntityType.PROJECT: EventType.PROJECT_DETECTED,
+    EntityType.COMMITMENT: EventType.COMMITMENT_DETECTED,
+    EntityType.DECISION: EventType.DECISION_DETECTED,
+    EntityType.RELATIONSHIP: EventType.RELATIONSHIP_UPDATED,
+}
 
 logger = get_logger("memory")
 
@@ -123,11 +136,50 @@ class MemoryIngestionService:
             logger.warning("memory: signal %s not found in log", event_id)
             return 0
         written = 0
+        outbox_rows: list[dict[str, Any]] = []
         for record in build_memory_records(view):
-            if await self.memory_repo.append(record):
-                written += 1
-        logger.info("memory: signal %s -> %d new facts", event_id, written)
+            if not await self.memory_repo.append(record):
+                continue
+            written += 1
+            # Only stage a pointer for entity types that have a bus event downstream
+            # consumers subscribe to. Unmapped types (COMPANY, THREAD, CHANNEL,
+            # DOCUMENT, MEETING, CUSTOMER) stay memory-only and would produce a
+            # permanently-unpublishable row if written here.
+            bus_event = _BUS_EVENT_FOR_ENTITY.get(record.entity_type)
+            if bus_event is not None:
+                outbox_rows.append(self._outbox_row(record, bus_event))
+        # Append pointers in the SAME transaction as the memory rows so the
+        # signal → memory → domain-event chain commits atomically (commit-before-
+        # publish; a crash between write and publish just re-publishes on the
+        # next relay pass, and consumers dedupe by memory_id).
+        await self.memory_repo.append_outbox(outbox_rows)
+        logger.info(
+            "memory: signal %s -> %d new facts, %d bus pointers",
+            event_id, written, len(outbox_rows),
+        )
         return written
+
+    @staticmethod
+    def _outbox_row(record: MemoryRecord, event_type: EventType) -> dict[str, Any]:
+        # Pointer + lineage — never the raw body. Downstream fetches by memory_id
+        # if it needs the fact detail. Mirrors SignalIngestionService._pointer_payload.
+        return {
+            "organization_id": record.org_id,
+            "aggregate_id": record.memory_id,
+            "event_type": event_type.value,
+            "entity_type": record.entity_type.value,
+            "payload": {
+                "memory_id": str(record.memory_id),
+                "entity_type": record.entity_type.value,
+                "entity_id": str(record.entity_id),
+                "source_signal_event_id": str(record.source_signal_event_id),
+                "extractor_name": record.extractor_name,
+                "extractor_version": record.extractor_version,
+                "schema_version": record.schema_version,
+                "confidence": record.confidence,
+                "event_timestamp": record.event_timestamp.isoformat(),
+            },
+        }
 
 
 # --- Subscriber: react to the signal pointer events --------------------------

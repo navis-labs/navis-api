@@ -146,11 +146,16 @@ def meet_view(**overrides) -> SignalView:
 
 
 class FakeMemoryRepo:
-    """Append-only with idempotent dedup on memory_id (mimics ON CONFLICT)."""
+    """Append-only with idempotent dedup on memory_id (mimics ON CONFLICT).
+
+    Also captures outbox pointer rows so tests can assert that memory-derived
+    domain events would be staged for publish (mirrors the real repo's
+    transactional-outbox contract without needing a DB session)."""
 
     def __init__(self) -> None:
         self.seen: set[uuid.UUID] = set()
         self.records: list[MemoryRecord] = []
+        self.outbox: list[dict[str, Any]] = []
 
     async def append(self, record: MemoryRecord) -> bool:
         if record.memory_id in self.seen:
@@ -158,3 +163,6 @@ class FakeMemoryRepo:
         self.seen.add(record.memory_id)
         self.records.append(record)
         return True
+
+    async def append_outbox(self, rows) -> None:
+        self.outbox.extend(rows)

@@ -8,14 +8,15 @@ the same rows without duplicates or races.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.memory.envelope import EntityType, MemoryRecord
-from navis.memory.models import MemoryRecord as MemoryRecordRow
+from navis.memory.models import MemoryOutbox, MemoryRecord as MemoryRecordRow
 
 
 class MemoryRepository:
@@ -94,3 +95,44 @@ class MemoryRepository:
             .where(MemoryRecordRow.memory_id == memory_id)
             .values(payload=payload)
         )
+
+    # ---- transactional outbox (memory-derived domain events) ----
+    async def append_outbox(self, rows: Sequence[dict[str, Any]]) -> None:
+        """Append pointer rows IN THE CALLER'S TRANSACTION (no commit) — atomic with the
+        memory append. Flush so they share the same durable commit."""
+        if not rows:
+            return
+        self.db.add_all([MemoryOutbox(**r) for r in rows])
+        await self.db.flush()
+
+    async def pending_outbox(self, *, limit: int = 500) -> Sequence[MemoryOutbox]:
+        """Claim unpublished pointers FOR UPDATE SKIP LOCKED so concurrent relay workers
+        never publish the same row (oldest-first)."""
+        stmt = (
+            select(MemoryOutbox)
+            .where(MemoryOutbox.published_at.is_(None))
+            .order_by(MemoryOutbox.created_at.asc())
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        return (await self.db.scalars(stmt)).all()
+
+    async def mark_outbox_published(self, ids: Sequence[uuid.UUID]) -> None:
+        if not ids:
+            return
+        await self.db.execute(
+            update(MemoryOutbox)
+            .where(MemoryOutbox.id.in_(list(ids)))
+            .values(published_at=datetime.now(timezone.utc))
+        )
+
+    async def purge_published_outbox(self, *, before: datetime) -> int:
+        """Delete PUBLISHED outbox rows older than `before` (bounds outbox growth). Unpublished
+        rows are never purged. Returns the count removed."""
+        result = await self.db.execute(
+            delete(MemoryOutbox).where(
+                MemoryOutbox.published_at.is_not(None),
+                MemoryOutbox.published_at < before,
+            )
+        )
+        return result.rowcount or 0

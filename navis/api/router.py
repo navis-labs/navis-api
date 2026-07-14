@@ -5,6 +5,8 @@ from fastapi import APIRouter
 
 from navis.adaptive.router import router as adaptive_router
 from navis.api.brief_router import router as brief_router
+from navis.api.compat_router import router as compat_router
+from navis.api.context_router import router as context_router
 from navis.execution.router import router as execution_router
 from navis.identity.admin_router import router as identity_admin_router
 from navis.identity.router import router as identity_router
@@ -23,8 +25,10 @@ api_router.include_router(organization_router)
 api_router.include_router(signals_router)
 api_router.include_router(identity_resolution_router)
 api_router.include_router(brief_router)
+api_router.include_router(context_router)
 api_router.include_router(execution_router)
 api_router.include_router(intelligence_router)
 api_router.include_router(adaptive_router)
 api_router.include_router(observation_webhooks_router)
+api_router.include_router(compat_router)
 
