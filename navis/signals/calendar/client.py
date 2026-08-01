@@ -55,3 +55,76 @@ class CalendarClient:
         return await self._t.request(
             "POST", f"{_BASE}/channels/stop", json={"id": channel_id, "resourceId": resource_id}
         )
+
+    async def freebusy(
+        self,
+        *,
+        time_min: str,
+        time_max: str,
+        calendar_ids: list[str] | None = None,
+        time_zone: str = "UTC",
+    ) -> dict[str, Any]:
+        """Query blocks of busy time in the given window.
+
+        Returns the raw Google freeBusy response — callers subtract busy blocks from
+        the window to derive open slots. `calendar_ids` defaults to the client's
+        primary calendar so a single OAuth grant covers the common "one founder,
+        one calendar" case; consumers with delegated / shared calendars can pass
+        the full list.
+        """
+        body: dict[str, Any] = {
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "timeZone": time_zone,
+            "items": [{"id": cid} for cid in (calendar_ids or [self._cal])],
+        }
+        return await self._t.request("POST", "https://www.googleapis.com/calendar/v3/freeBusy", json=body)
+
+    async def create_event(
+        self,
+        *,
+        summary: str,
+        start_iso: str,
+        end_iso: str,
+        attendees: list[str] | None = None,
+        description: str | None = None,
+        location: str | None = None,
+        time_zone: str = "UTC",
+        send_updates: str = "all",
+        conference: bool = False,
+    ) -> dict[str, Any]:
+        """Create a calendar event on the client's calendar.
+
+        `send_updates='all'` mails every attendee; pass `'none'` for silent creation
+        (useful when the caller sends its own confirmation via Gmail so recipients
+        don't see two notifications). `conference=True` requests Google Meet by
+        binding a conferenceData block — the API returns the Meet link on the
+        created event's `hangoutLink` field.
+        """
+        body: dict[str, Any] = {
+            "summary": summary,
+            "start": {"dateTime": start_iso, "timeZone": time_zone},
+            "end": {"dateTime": end_iso, "timeZone": time_zone},
+        }
+        if description:
+            body["description"] = description
+        if location:
+            body["location"] = location
+        if attendees:
+            body["attendees"] = [{"email": a} for a in attendees]
+        if conference:
+            body["conferenceData"] = {
+                "createRequest": {
+                    "requestId": f"navis-{hash(start_iso) & 0xFFFFFFFF:x}",
+                    "conferenceSolutionKey": {"type": "hangoutsMeet"},
+                }
+            }
+        params = {"sendUpdates": send_updates}
+        if conference:
+            params["conferenceDataVersion"] = "1"
+        return await self._t.request(
+            "POST",
+            f"{_BASE}/calendars/{self._cal}/events",
+            params=params,
+            json=body,
+        )

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import AsyncIterator
 
 from sqlalchemy import delete as sa_delete, literal, or_, select, tuple_
@@ -38,6 +39,29 @@ class MemoryReader:
             schema_version=row.schema_version,
             confidence=row.confidence,
         )
+
+    async def has_records_after(
+        self, org_id: uuid.UUID, watermark: Watermark
+    ) -> bool:
+        """True iff any memory_record exists strictly past `watermark`.
+
+        Cheaper than a streaming fold: one round-trip returning at most a
+        single sentinel row. Used by StateService's cache short-circuit to
+        confirm the deserialized snapshot in-process is still authoritative
+        before returning it without re-folding.
+        """
+        stmt = (
+            select(literal(1))
+            .select_from(MemoryRecord)
+            .where(MemoryRecord.organization_id == org_id)
+        )
+        if watermark.last_timestamp is not None:
+            stmt = stmt.where(
+                tuple_(MemoryRecord.event_timestamp, MemoryRecord.memory_id)
+                > tuple_(watermark.last_timestamp, watermark.last_memory_id)
+            )
+        stmt = stmt.limit(1)
+        return (await self.db.scalar(stmt)) is not None
 
     async def stream(
         self, org_id: uuid.UUID, *, after: Watermark | None = None, batch: int = 5000
@@ -77,6 +101,28 @@ class SnapshotRepository:
                 StateSnapshot.projection_version == projection_version,
             )
         )
+
+    async def watermark_only(
+        self, org_id: uuid.UUID, *, projection_version: int
+    ) -> tuple[datetime | None, uuid.UUID | None] | None:
+        """Return just the snapshot's watermark cursor without the JSONB payload.
+
+        Used by StateService's cache short-circuit: the watermark is all we
+        need to compute the in-process cache key, and skipping the ~22KB
+        `full_projection` column shaves both the JSONB fetch and the Python
+        deserialization from a warm /context call — the two dominant costs on
+        that hot path.
+
+        Returns None if the snapshot row is absent for (org, projection_version).
+        """
+        stmt = select(
+            StateSnapshot.watermark_timestamp, StateSnapshot.watermark_memory_id
+        ).where(
+            StateSnapshot.organization_id == org_id,
+            StateSnapshot.projection_version == projection_version,
+        )
+        row = (await self.db.execute(stmt)).one_or_none()
+        return None if row is None else (row[0], row[1])
 
     async def save(self, state: OrganizationalState) -> None:
         """Upsert the cache for (org, projection_version). Caches are disposable."""

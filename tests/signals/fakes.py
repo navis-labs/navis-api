@@ -76,7 +76,18 @@ class FakeGmailClient:
     async def get_profile(self) -> dict:
         return {"historyId": self._profile_history_id, "emailAddress": "u@org.com"}
 
-    async def list_messages(self, page_token: str | None = None, max_results: int = 100) -> dict:
+    async def list_messages(
+        self,
+        page_token: str | None = None,
+        max_results: int = 100,
+        query: str | None = None,
+    ) -> dict:
+        # `query` is accepted so the fake matches GmailClient's real signature —
+        # full_sync passes `q=newer_than:{N}d` to server-side date-bound the
+        # onboarding backfill. The fake ignores it (the caller-supplied
+        # `messages` list is already the scoped fixture set); recording it lets
+        # tests assert on it if they want to.
+        self.last_list_query = query
         start = int(page_token or 0)
         ids = [{"id": m["id"]} for m in self._messages[start : start + self._page_size]]
         nxt = start + self._page_size

@@ -9,7 +9,9 @@ revoked access token cannot resolve a Principal.
 """
 from __future__ import annotations
 
+import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -29,6 +31,91 @@ from navis.platform.security import TokenError, decode_token
 
 logger = get_logger("identity.authz")
 _bearer = HTTPBearer(auto_error=False)
+
+# ── Principal cache (JWT auth hot path) ─────────────────────────────────────
+# Every authenticated request currently pays 4 sequential Neon round-trips
+# under `_principal_from_jwt`: jti-denylist, user, membership, grants. On a
+# serverless Postgres those alone dominate the /context tail latency
+# (measured ~1.5-2s per request before this cache).
+#
+# The cache stores the resolved Principal (already-validated: not revoked,
+# user active, membership present, grants materialized) keyed by the JWT
+# `jti` — one entry per issued access token. Bounded LRU + TTL, both
+# short-window so revocations propagate within the TTL. Explicit
+# invalidation hooks in TokenRevocationService.revoke_jti /
+# revoke_all_for_user shorten that window to zero on logout / bulk-revoke.
+#
+# Security posture (why 30s is defensible):
+#   * JWT expiry is still checked every request (decode_token runs before
+#     the cache lookup) — an expired token can NEVER hit the cache.
+#   * revoke_jti evicts the entry synchronously → logout is immediate.
+#   * revoke_all_for_user evicts every entry for that user → bulk revoke
+#     (deactivation, "log out everywhere") is immediate.
+#   * The remaining window (30s) covers passive role/grant changes and
+#     the tokens_valid_from watermark being bumped by out-of-band code
+#     paths. This is the same trade-off AWS STS credential caching uses.
+#
+# Cached User objects are session-detached (db.expunge) before caching so
+# downstream column reads work but no lazy load can trigger against a
+# closed session.
+_PRINCIPAL_CACHE_MAX = 1024
+_PRINCIPAL_CACHE_TTL_S = 30.0
+_PRINCIPAL_CACHE: "OrderedDict[str, tuple[float, uuid.UUID, Principal]]" = OrderedDict()
+
+
+def _principal_cache_get(jti: str | None) -> "Principal | None":
+    if not jti:
+        return None
+    entry = _PRINCIPAL_CACHE.get(jti)
+    if entry is None:
+        return None
+    expires_at, _user_id, principal = entry
+    if time.monotonic() >= expires_at:
+        # Expired — evict lazily; next request pays the DB cost.
+        _PRINCIPAL_CACHE.pop(jti, None)
+        return None
+    _PRINCIPAL_CACHE.move_to_end(jti)  # LRU touch
+    return principal
+
+
+def _principal_cache_put(jti: str | None, principal: "Principal") -> None:
+    if not jti:
+        return
+    expires_at = time.monotonic() + _PRINCIPAL_CACHE_TTL_S
+    # Track the user_id alongside the entry so evict_user can drop all
+    # tokens for a user without walking their JWT payloads.
+    user_id = principal.subject_id if principal.kind == PrincipalKind.USER else uuid.UUID(int=0)
+    _PRINCIPAL_CACHE[jti] = (expires_at, user_id, principal)
+    _PRINCIPAL_CACHE.move_to_end(jti)
+    while len(_PRINCIPAL_CACHE) > _PRINCIPAL_CACHE_MAX:
+        _PRINCIPAL_CACHE.popitem(last=False)
+
+
+def principal_cache_evict_jti(jti: str | None) -> None:
+    """Called by TokenRevocationService.revoke_jti — logout must propagate
+    immediately, not on the 30s TTL boundary."""
+    if not jti:
+        return
+    if _PRINCIPAL_CACHE.pop(jti, None) is not None:
+        metrics.incr("auth.cache.evict", labels={"reason": "revoke_jti"})
+
+
+def principal_cache_evict_user(user_id: uuid.UUID) -> None:
+    """Called by TokenRevocationService.revoke_all_for_user — deactivation,
+    membership removal, and 'log out everywhere' MUST invalidate every
+    outstanding session for that user, not just the one presenting a jti."""
+    victims = [k for k, (_exp, uid, _p) in _PRINCIPAL_CACHE.items() if uid == user_id]
+    for k in victims:
+        _PRINCIPAL_CACHE.pop(k, None)
+    if victims:
+        metrics.incr(
+            "auth.cache.evict", value=len(victims), labels={"reason": "revoke_user"}
+        )
+
+
+def principal_cache_clear() -> None:
+    """Public-in-tests helper. Only auth-cache tests should call this."""
+    _PRINCIPAL_CACHE.clear()
 
 
 class PrincipalKind(StrEnum):
@@ -77,8 +164,23 @@ async def _principal_from_jwt(db: AsyncSession, token: str) -> Principal:
     if not user_id:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "malformed token")
 
+    # Fast path — decoded JWT is valid, its jti has been seen recently, and
+    # the resolved Principal is still within its short TTL. Skip the 4 DB
+    # round-trips (revocation, user, membership, grants). Correctness: token
+    # expiry was just re-verified by decode_token; revoke_jti /
+    # revoke_all_for_user evict this cache synchronously on logout /
+    # deactivation, so the residual staleness window is bounded to
+    # _PRINCIPAL_CACHE_TTL_S for slow-path invariants (passive role edits,
+    # bulk-revoke watermark bumps by out-of-band code paths).
+    jti = payload.get("jti")
+    cached = _principal_cache_get(jti)
+    if cached is not None:
+        metrics.incr("auth.cache.hit")
+        return cached
+    metrics.incr("auth.cache.miss")
+
     revocation = TokenRevocationService(db)
-    if await revocation.is_jti_revoked(payload.get("jti")):
+    if await revocation.is_jti_revoked(jti):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token revoked")
 
     user = await db.get(User, uuid.UUID(user_id))
@@ -105,7 +207,18 @@ async def _principal_from_jwt(db: AsyncSession, token: str) -> Principal:
 
     role = membership.role.value if membership.role else None
     grants = await _grants_for(db, membership.organization_id, role or "")
-    return Principal(
+
+    # Detach the User row from this request's session before caching so a
+    # future cache hit — served under a DIFFERENT session — can safely read
+    # its column attributes without accidentally lazy-loading against a
+    # closed session. Detach is best-effort: it only makes sense when the
+    # instance is in this session; if it isn't, expunge is a no-op we ignore.
+    try:
+        db.sync_session.expunge(user)
+    except Exception:
+        pass
+
+    principal = Principal(
         kind=PrincipalKind.USER,
         org_id=membership.organization_id,
         subject_id=user.id,
@@ -113,6 +226,8 @@ async def _principal_from_jwt(db: AsyncSession, token: str) -> Principal:
         role=role,
         user=user,
     )
+    _principal_cache_put(jti, principal)
+    return principal
 
 
 async def _principal_from_api_key(db: AsyncSession, plaintext: str) -> Principal:

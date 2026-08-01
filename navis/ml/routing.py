@@ -25,6 +25,7 @@ class Task(str, enum.Enum):
     DRAFT = "draft"
     BRIEF_NARRATIVE = "brief_narrative"
     EXPLANATION = "explanation"
+    RECOMMENDATION = "recommendation"
 
 
 TASK_TIER: dict[Task, Tier] = {
@@ -32,6 +33,8 @@ TASK_TIER: dict[Task, Tier] = {
     Task.DRAFT: Tier.FAST,
     Task.BRIEF_NARRATIVE: Tier.DEEP,
     Task.EXPLANATION: Tier.DEEP,
+    # Prioritization weighs urgency vs impact across the whole context — deep tier.
+    Task.RECOMMENDATION: Tier.DEEP,
 }
 
 

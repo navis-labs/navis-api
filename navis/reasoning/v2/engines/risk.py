@@ -20,6 +20,16 @@ DECISION_UNRESOLVED_DAYS = 7.0
 CUSTOMER_DROP_DAYS = 14.0
 MEETING_OVERLOAD_COUNT = 5
 
+# Upper age cap — anything older than this is beyond the founder's
+# actionable window (roughly one month). Past that horizon the entity
+# is history, not "slipping / cooling / stalled" — surfacing it on the
+# daily brief just clutters the surface with items the founder can
+# neither salvage nor act on quickly. Frontend applies a tighter 15-day
+# display filter on top of this; the engine still emits up to 30 days
+# so callers that want a broader operational view (audit, reporting)
+# can read the raw signal stream.
+MAX_SURFACE_AGE_DAYS = 30.0
+
 # Defensive scrub for legacy Memory rows written before the extractor learned
 # to strip HTML from Gmail bodies (extractors/email.py). New rows are already
 # clean; this exists so 5+ day old commitments don't render <td> markup in
@@ -49,7 +59,7 @@ class CommitmentReasoningEngine(ReasoningEngine):
             if c.status != "open":
                 continue
             age = days_between(ctx.as_of, c.last_seen)
-            if age is None or age < COMMITMENT_SLIPPING_DAYS:
+            if age is None or age < COMMITMENT_SLIPPING_DAYS or age > MAX_SURFACE_AGE_DAYS:
                 continue
             clean = _plain(c.text)
             if not clean:
@@ -81,7 +91,7 @@ class RelationshipReasoningEngine(ReasoningEngine):
         out = []
         for r in state.relationships():
             age = days_between(ctx.as_of, r.last_interaction_at)
-            if age is None or age < RELATIONSHIP_COOLING_DAYS:
+            if age is None or age < RELATIONSHIP_COOLING_DAYS or age > MAX_SURFACE_AGE_DAYS:
                 continue
             out.append(
                 SignalDraft(
@@ -107,7 +117,7 @@ class ProjectReasoningEngine(ReasoningEngine):
         out = []
         for p in state.projects():
             age = days_between(ctx.as_of, p.last_seen)
-            if age is None or age < PROJECT_STALLED_DAYS:
+            if age is None or age < PROJECT_STALLED_DAYS or age > MAX_SURFACE_AGE_DAYS:
                 continue
             out.append(
                 SignalDraft(
@@ -133,7 +143,7 @@ class CustomerReasoningEngine(ReasoningEngine):
         out = []
         for cu in state.customers():
             age = days_between(ctx.as_of, cu.last_seen)
-            if age is None or age < CUSTOMER_DROP_DAYS:
+            if age is None or age < CUSTOMER_DROP_DAYS or age > MAX_SURFACE_AGE_DAYS:
                 continue
             out.append(
                 SignalDraft(
@@ -161,7 +171,7 @@ class DecisionReasoningEngine(ReasoningEngine):
             if d.status != "open":
                 continue
             age = days_between(ctx.as_of, d.last_seen)
-            if age is None or age < DECISION_UNRESOLVED_DAYS:
+            if age is None or age < DECISION_UNRESOLVED_DAYS or age > MAX_SURFACE_AGE_DAYS:
                 continue
             out.append(
                 SignalDraft(

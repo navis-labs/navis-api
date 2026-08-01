@@ -76,6 +76,13 @@ class FakeReader:
             if after is None or after.passed(r.event_timestamp, r.memory_id):
                 yield r
 
+    async def has_records_after(self, org_id, watermark) -> bool:
+        """Mirror MemoryReader.has_records_after: True iff any record past `watermark`."""
+        return any(
+            r.org_id == org_id and watermark.passed(r.event_timestamp, r.memory_id)
+            for r in self._records
+        )
+
 
 class _Snap:
     def __init__(self, full_projection: dict) -> None:
@@ -88,6 +95,22 @@ class FakeSnapshots:
 
     async def latest(self, org_id, *, projection_version):
         return self.store.get((org_id, projection_version))
+
+    async def watermark_only(self, org_id, *, projection_version):
+        """Mirror SnapshotRepository.watermark_only — return (ts, mid) or None."""
+        import uuid as _uuid
+        from datetime import datetime as _dt
+
+        snap = self.store.get((org_id, projection_version))
+        if snap is None:
+            return None
+        wm = (snap.full_projection or {}).get("watermark") or {}
+        ts_str = wm.get("last_timestamp")
+        mid_str = wm.get("last_memory_id")
+        return (
+            _dt.fromisoformat(ts_str) if ts_str else None,
+            _uuid.UUID(mid_str) if mid_str else None,
+        )
 
     async def save(self, state: OrganizationalState) -> None:
         self.store[(state.org_id, state.projection_version)] = _Snap(state.to_dict())

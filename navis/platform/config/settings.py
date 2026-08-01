@@ -85,6 +85,13 @@ class Settings(BaseSettings):
     # the cursor — silently stopping mid-drain would skip messages forever (the cursor
     # would jump past unread history pages).
     gmail_onboard_message_cap: int = 500
+    # Onboarding backfill window (in days). full_sync passes this as
+    # Gmail's `q=newer_than:{N}d` query so we only pull recent mail —
+    # older messages stay in the user's inbox but never enter our
+    # signal log, memory, or state. Prevents the dashboard from
+    # surfacing 3-week-old threads as "slipping commitments" on first
+    # connect. Frontend surface filters (15 days) sit on top of this.
+    gmail_onboard_lookback_days: int = 30
     gmail_max_history_pages: int = 200
     # Slack capture: the signing secret verifies inbound Events API webhooks (HMAC-SHA256);
     # the timestamp window rejects replayed captures. Backfill caps bound onboarding REST
@@ -105,6 +112,16 @@ class Settings(BaseSettings):
     azure_openai_endpoint: str | None = None
     azure_openai_api_key: str | None = None
     azure_openai_deployment: str | None = None
+    # Embeddings live behind their OWN Azure deployment (chat and embedding
+    # models are different SKUs in Azure — one deployment cannot serve both).
+    # Leave unset to fall back to the deterministic hash-based embedder, which
+    # keeps chat working offline without touching Azure at all. When set, this
+    # value MUST be the deployment name in your Azure OpenAI resource, not the
+    # underlying model name — Azure routes by deployment. The model column in
+    # `memory_embeddings` will be recorded as this string, so changing it will
+    # transparently invalidate old embeddings (the version-and-model index
+    # keeps them isolated — no bad hits, just a re-embed on the next backfill).
+    azure_openai_embed_deployment: str | None = None
     azure_openai_api_version: str = "2024-12-01-preview"
 
     # ---- OAuth ----

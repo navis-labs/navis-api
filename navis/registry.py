@@ -32,3 +32,5 @@ from navis.memory import outbox as _memory_outbox  # noqa: F401  (registers the 
 from navis.identity import maintenance as _identity_maintenance  # noqa: F401  (registers purge tasks)
 from navis.observation import subscribers as _observation_subscribers  # noqa: F401  (closes the loop)
 from navis.orchestration import org_provisioning as _org_provisioning  # noqa: F401  (ORG_CREATED + onboarding funnel)
+from navis.ml.embeddings import subscribers as _ml_embedding_subscribers  # noqa: F401  (real-time embed of new memory)
+from navis.ml.embeddings import jobs as _ml_embedding_jobs  # noqa: F401  (embed_org backfill task)

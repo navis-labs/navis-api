@@ -40,11 +40,19 @@ class GmailClient:
         return await self._t.request("GET", f"{_BASE}/history", params=params)
 
     async def list_messages(
-        self, page_token: str | None = None, max_results: int = 100
+        self,
+        page_token: str | None = None,
+        max_results: int = 100,
+        query: str | None = None,
     ) -> dict[str, Any]:
+        # `query` accepts Gmail search syntax (newer_than:30d, after:YYYY/MM/DD,
+        # from:@example.com, ...). Used by full_sync to bound the onboarding
+        # backfill by date so we don't ingest months of historical mail.
         params: dict[str, Any] = {"maxResults": max_results}
         if page_token:
             params["pageToken"] = page_token
+        if query:
+            params["q"] = query
         return await self._t.request("GET", f"{_BASE}/messages", params=params)
 
     async def get_message(self, message_id: str) -> dict[str, Any]:
@@ -84,3 +92,25 @@ class GmailClient:
 
     async def stop_watch(self) -> dict[str, Any]:
         return await self._t.request("POST", f"{_BASE}/stop")
+
+    async def send_message(
+        self,
+        *,
+        raw_rfc822_base64url: str,
+        thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Send an outbound message via users.messages.send.
+
+        `raw_rfc822_base64url` is a base64url-encoded RFC 2822 message (headers +
+        body). Callers build the MIME (see workspace_router._encode_message) and
+        pass it in; this method is a pure transport wrapper so quota + retry come
+        from GoogleTransport rather than re-implemented here.
+
+        When `thread_id` is provided, Gmail attaches the outbound message to that
+        existing thread — used for reply flows so the recipient sees a normal
+        reply instead of a brand-new conversation.
+        """
+        body: dict[str, Any] = {"raw": raw_rfc822_base64url}
+        if thread_id:
+            body["threadId"] = thread_id
+        return await self._t.request("POST", f"{_BASE}/messages/send", json=body)

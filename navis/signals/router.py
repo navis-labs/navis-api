@@ -77,6 +77,22 @@ _REQUIRED_SCOPES: dict[IntegrationProvider, tuple[str, ...]] = {
     IntegrationProvider.GMAIL: ("https://www.googleapis.com/auth/gmail.readonly",),
 }
 
+# ---- Per-provider activation scopes -----------------------------------------
+# The Google consent flow requests Gmail + Calendar + Drive at once, but the
+# callback historically only wrote a `gmail` Integration row. That silently
+# starved the Calendar and Drive sync loops (orchestration/sync.py dispatches
+# per Integration.provider) and made /workspace/calendar/available-slots
+# always 409 because there was no `google_calendar` row to look up.
+#
+# We now upsert one row per Google-family provider whose scope the user
+# actually granted, sharing the same tokens and external_account. Missing a
+# scope just means we skip that provider's row — no fake rows.
+_GOOGLE_FAMILY_ACTIVATION_SCOPES: tuple[tuple[IntegrationProvider, str], ...] = (
+    (IntegrationProvider.GMAIL,            "https://www.googleapis.com/auth/gmail.readonly"),
+    (IntegrationProvider.GOOGLE_CALENDAR,  "https://www.googleapis.com/auth/calendar.readonly"),
+    (IntegrationProvider.DRIVE,            "https://www.googleapis.com/auth/drive.metadata.readonly"),
+)
+
 
 async def _create_oauth_state(*, org_id: uuid.UUID, user_id: uuid.UUID, provider: str) -> str:
     """Mint a 256-bit random state and bind (org, user, provider, created_at) to it in
@@ -132,6 +148,61 @@ def _email_from_id_token(id_token: str | None) -> str | None:
 def _missing_scopes(provider: IntegrationProvider, granted: str | None) -> list[str]:
     have = set((granted or "").split())
     return [s for s in _REQUIRED_SCOPES.get(provider, ()) if s not in have]
+
+
+async def _backfill_google_family(
+    db: AsyncSession,
+    *,
+    org_id: uuid.UUID,
+) -> list[str]:
+    """One-shot self-heal for orgs that connected Google BEFORE the callback
+    started writing separate Calendar/Drive rows. Reads the Gmail row's
+    granted scopes and clones it (same tokens, same account) into whichever
+    Google-family provider rows are missing.
+
+    Idempotent (ON CONFLICT DO NOTHING — never clobbers a row that already
+    exists), and shares tokens on purpose because a single Google OAuth
+    grant covers every scope in the request. Returns the provider values
+    that were freshly inserted so the caller can log / metric.
+    """
+    gmail_row = await db.scalar(
+        select(Integration).where(
+            Integration.organization_id == org_id,
+            Integration.provider == IntegrationProvider.GMAIL,
+            Integration.is_active.is_(True),
+        )
+    )
+    if gmail_row is None:
+        return []
+    granted_set = set((gmail_row.scopes or "").split())
+    inserted: list[str] = []
+    for family_provider, activation_scope in _GOOGLE_FAMILY_ACTIVATION_SCOPES:
+        if family_provider is IntegrationProvider.GMAIL:
+            continue  # Gmail row is the source of truth we're copying from.
+        if activation_scope not in granted_set:
+            continue  # scope not granted → nothing to clone (correct: user
+            # never authorised this service, so we shouldn't fake a row).
+        stmt = (
+            pg_insert(Integration)
+            .values(
+                organization_id=org_id,
+                user_id=gmail_row.user_id,
+                provider=family_provider.value,
+                external_account=gmail_row.external_account,
+                access_token=gmail_row.access_token,
+                refresh_token=gmail_row.refresh_token,
+                token_expires_at=gmail_row.token_expires_at,
+                scopes=gmail_row.scopes,
+                is_active=True,
+                sync_state={},
+            )
+            .on_conflict_do_nothing(constraint="uq_org_provider_account")
+            .returning(Integration.id)
+        )
+        result = await db.execute(stmt)
+        if result.scalar() is not None:
+            inserted.append(family_provider.value)
+    return inserted
 
 
 @router.get(
@@ -215,44 +286,62 @@ async def google_callback(
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
-    # 5) UPSERT — uniqueness enforced at the DB on (org, provider, external_account). A
-    # reconnect (same account) UPDATES the existing row: no duplicate integrations, no
-    # duplicate watches/sync streams/signals. Race-safe (ON CONFLICT, not read-then-insert).
+    # 5) UPSERT one row PER Google-family provider whose scope was granted.
+    # Uniqueness enforced at the DB on (org, provider, external_account) — a
+    # reconnect (same account) UPDATES each row: no duplicate integrations, no
+    # duplicate watches/sync streams/signals. Race-safe (ON CONFLICT, not
+    # read-then-insert). Sharing tokens across rows is correct because a single
+    # Google OAuth grant covers every scope in the request; each provider row
+    # just makes its service independently addressable to the sync orchestrator
+    # and the per-provider workspace endpoints.
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(tokens.get("expires_in", 3600)))
     enc_access = token_cipher.encrypt(tokens.get("access_token"))
     enc_refresh = token_cipher.encrypt(tokens.get("refresh_token"))
-    stmt = (
-        pg_insert(Integration)
-        .values(
-            organization_id=org_id,
-            user_id=user_id,
-            provider=provider.value,
-            external_account=email,
-            access_token=enc_access,
-            refresh_token=enc_refresh,
-            token_expires_at=expires_at,
-            scopes=granted,
-            is_active=True,
-            sync_state={},
+    granted_set = set((granted or "").split())
+
+    activated: list[str] = []
+    for family_provider, activation_scope in _GOOGLE_FAMILY_ACTIVATION_SCOPES:
+        if activation_scope not in granted_set:
+            continue  # user didn't grant this service — skip; no fake row.
+        stmt = (
+            pg_insert(Integration)
+            .values(
+                organization_id=org_id,
+                user_id=user_id,
+                provider=family_provider.value,
+                external_account=email,
+                access_token=enc_access,
+                refresh_token=enc_refresh,
+                token_expires_at=expires_at,
+                scopes=granted,
+                is_active=True,
+                sync_state={},
+            )
+            .on_conflict_do_update(
+                constraint="uq_org_provider_account",
+                set_={
+                    "user_id": user_id,
+                    "access_token": enc_access,
+                    # Google omits a refresh_token on re-consent — keep the stored one if so.
+                    "refresh_token": func.coalesce(enc_refresh, Integration.refresh_token),
+                    "token_expires_at": expires_at,
+                    "scopes": granted,
+                    "is_active": True,
+                    "updated_at": func.now(),
+                },
+            )
+            .returning(Integration.id)
         )
-        .on_conflict_do_update(
-            constraint="uq_org_provider_account",
-            set_={
-                "user_id": user_id,
-                "access_token": enc_access,
-                # Google omits a refresh_token on re-consent — keep the stored one if so.
-                "refresh_token": func.coalesce(enc_refresh, Integration.refresh_token),
-                "token_expires_at": expires_at,
-                "scopes": granted,
-                "is_active": True,
-                "updated_at": func.now(),
-            },
+        await db.execute(stmt)
+        activated.append(family_provider.value)
+        metrics.incr(
+            "signals.integration.connected", labels={"provider": family_provider.value}
         )
-        .returning(Integration.id)
+
+    logger.info(
+        "google integrations upserted org=%s user=%s account=%s providers=%s",
+        org_id, user_id, email, activated,
     )
-    await db.execute(stmt)
-    metrics.incr("signals.integration.connected", labels={"provider": provider.value})
-    logger.info("google integration upserted org=%s user=%s account=%s", org_id, user_id, email)
     return RedirectResponse(
         _frontend_return_url(ok=True, provider=provider.value),
         status_code=status.HTTP_303_SEE_OTHER,
@@ -420,6 +509,11 @@ async def list_integrations(
         .where(Integration.organization_id == ctx.org_id)
         .order_by(Integration.provider, Integration.updated_at.desc())
     )
+    # Third counter (no filter) = all-time ingestion for this integration.
+    # The Account page's "Signals contributed · today / total" chip reads it
+    # so the total isn't a hardcoded frontend mock (it was 1247 in
+    # mockConnections). Same query, same index scan, one extra aggregate —
+    # no additional round-trip.
     ingest_counts_result = await db.execute(
         select(
             SignalEventRecord.integration_id,
@@ -429,6 +523,7 @@ async def list_integrations(
             func.count()
                 .filter(SignalEventRecord.captured_at >= last_hour)
                 .label("ingested_last_hour"),
+            func.count().label("ingested_total"),
         )
         .where(SignalEventRecord.organization_id == ctx.org_id)
         .where(SignalEventRecord.integration_id.is_not(None))
@@ -445,9 +540,9 @@ async def list_integrations(
         .group_by(SignalDeadLetter.integration_id)
     )
 
-    ingest_by_integration: dict[uuid.UUID, tuple[int, int]] = {
-        integration_id: (int(today or 0), int(last_hour_count or 0))
-        for integration_id, today, last_hour_count in ingest_counts_result.all()
+    ingest_by_integration: dict[uuid.UUID, tuple[int, int, int]] = {
+        integration_id: (int(today or 0), int(last_hour_count or 0), int(total or 0))
+        for integration_id, today, last_hour_count, total in ingest_counts_result.all()
     }
     dlq_by_integration: dict[uuid.UUID, int] = {
         integration_id: int(count or 0)
@@ -462,7 +557,9 @@ async def list_integrations(
         # opaque but sensitive).
         state = r.sync_state or {}
         last_synced_at = state.get("last_synced_at") if isinstance(state, dict) else None
-        ingested_today, ingested_last_hour = ingest_by_integration.get(r.id, (0, 0))
+        ingested_today, ingested_last_hour, ingested_total = ingest_by_integration.get(
+            r.id, (0, 0, 0)
+        )
         integrations.append({
             "integration_id":     str(r.id),
             "provider":           r.provider.value if hasattr(r.provider, "value") else str(r.provider),
@@ -477,9 +574,11 @@ async def list_integrations(
             "last_synced_at":     last_synced_at,
             # Per-connector ingestion counters — zero when the connector
             # has never produced a signal (or when the events are older
-            # than the time window we count).
+            # than the time window we count). `ingested_total` is all-time
+            # for this integration (no time filter).
             "ingested_today":     ingested_today,
             "ingested_last_hour": ingested_last_hour,
+            "ingested_total":     ingested_total,
             "dead_letter_count":  dlq_by_integration.get(r.id, 0),
         })
     return {"integrations": integrations}
@@ -711,6 +810,149 @@ async def slack_disconnect(
     return {"disconnected": True, "count": len(deactivated)}
 
 
+@router.delete("/integrations/google/disconnect")
+async def google_disconnect(
+    ctx: CurrentContext = Depends(get_current_context),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Soft-disconnect all Google-family integrations for this org.
+
+    Mirrors the Slack disconnect contract:
+      * flips is_active=False on every Google-family row (Gmail /
+        Google Calendar / Drive) so the sync engine's is_active filter
+        stops touching the account without a redeploy;
+      * revokes the refresh token at Google (best-effort — failure is
+        logged but does NOT block the local disconnect, because our DB
+        row is already dead);
+      * clears access_token / refresh_token bytes so a subsequent leak
+        or dump doesn't expose credentials for a connection the user
+        no longer wants;
+      * clears sync_state cursors so a reconnect starts a clean window
+        instead of resuming a historyId the user thought they wiped;
+      * publishes INTEGRATION_DISCONNECTED per row so onboarding /
+        capability gates recompute and dependents (memory, brief,
+        actions) recompute their pipelines.
+
+    The Integration row itself is NOT deleted — historical SignalEvents
+    reference it via FK, and a re-connect UPSERTs into the same row to
+    avoid duplicate history / dangling references. Same rationale as
+    Slack.
+    """
+    from sqlalchemy import update
+
+    from navis.signals.crypto import token_cipher
+    from navis.signals.google.oauth import revoke_token as revoke_google_token
+
+    GOOGLE_FAMILY = (
+        IntegrationProvider.GMAIL,
+        IntegrationProvider.GOOGLE_CALENDAR,
+        IntegrationProvider.DRIVE,
+    )
+
+    # Collect refresh tokens BEFORE zeroing them — we need the plaintext
+    # to revoke at Google's endpoint. Best-effort decrypt; a failure here
+    # (rotated-out key, corrupted token) still lets the local disconnect
+    # proceed. The user's ground truth is our DB, not Google's grant.
+    rows = (
+        await db.scalars(
+            select(Integration).where(
+                Integration.organization_id == ctx.org_id,
+                Integration.provider.in_(GOOGLE_FAMILY),
+                Integration.is_active.is_(True),
+            )
+        )
+    ).all()
+
+    if not rows:
+        return {"disconnected": True, "count": 0, "revoked": 0}
+
+    refresh_tokens: list[str] = []
+    for row in rows:
+        try:
+            plaintext = token_cipher.decrypt(row.refresh_token)
+        except Exception:
+            logger.exception(
+                "could not decrypt refresh_token for revoke integration=%s (continuing)",
+                row.id,
+            )
+            plaintext = None
+        if plaintext:
+            refresh_tokens.append(plaintext)
+
+    # Flip is_active + zero tokens + clear cursors, atomically per row.
+    # Using a bulk update means the sync worker sees the flip in the
+    # same transaction the API caller commits — no race window where
+    # a scheduled sync fires on a "disconnected" row.
+    stmt = (
+        update(Integration)
+        .where(
+            Integration.organization_id == ctx.org_id,
+            Integration.provider.in_(GOOGLE_FAMILY),
+            Integration.is_active.is_(True),
+        )
+        .values(
+            is_active=False,
+            access_token=None,
+            refresh_token=None,
+            sync_state={},
+            updated_at=func.now(),
+        )
+        .returning(Integration.id, Integration.provider)
+    )
+    result = await db.execute(stmt)
+    deactivated = list(result.all())
+    await db.commit()
+
+    # Revoke at Google — best-effort, deduplicated by token. Multiple
+    # Google-family rows on a single account will share one refresh
+    # token, so revoking once kills the whole grant. Dedup avoids a
+    # second call that would return HTTP 400 "already invalid".
+    revoked_count = 0
+    seen: set[str] = set()
+    for token in refresh_tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        ok = await revoke_google_token(token)
+        if ok:
+            revoked_count += 1
+
+    # Broadcast per-row so downstream subscribers (onboarding gate,
+    # capability recomputer, cache-invalidation SSE fanout) all fire.
+    if deactivated:
+        from navis.platform.events import DomainEvent, EventType, event_bus
+
+        for integration_id, provider in deactivated:
+            await event_bus.publish(
+                DomainEvent(
+                    type=EventType.INTEGRATION_DISCONNECTED,
+                    org_id=ctx.org_id,
+                    source="signals.router",
+                    payload={
+                        "integration_id": str(integration_id),
+                        "provider": provider.value,
+                    },
+                )
+            )
+        metrics.incr(
+            "signals.integration.disconnected",
+            labels={"provider": "google"},
+            value=len(deactivated),
+        )
+        logger.info(
+            "google integrations disconnected org=%s count=%d revoked=%d",
+            ctx.org_id,
+            len(deactivated),
+            revoked_count,
+        )
+
+    return {
+        "disconnected": True,
+        "count": len(deactivated),
+        "revoked": revoked_count,
+    }
+
+
 @router.post(
     "/integrations/google/sync",
     dependencies=[Depends(require_capability(Capability.GMAIL))],
@@ -732,6 +974,21 @@ async def sync_google_integration(
     lock, so concurrent presses are single-flighted rather than racing.
     """
     from navis.orchestration.sync import sync_integration
+
+    # Self-heal legacy orgs that connected Google before the callback started
+    # writing per-provider rows: if the Gmail row grants calendar/drive
+    # scopes but the matching rows are missing, create them from the Gmail
+    # row's tokens. Idempotent — no-op once the rows exist.
+    backfilled = await _backfill_google_family(db, org_id=ctx.org_id)
+    if backfilled:
+        await db.commit()
+        logger.info(
+            "google family backfilled org=%s providers=%s", ctx.org_id, backfilled
+        )
+        for provider_value in backfilled:
+            metrics.incr(
+                "signals.integration.backfilled", labels={"provider": provider_value}
+            )
 
     rows = (
         await db.scalars(

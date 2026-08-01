@@ -14,7 +14,9 @@ from datetime import datetime
 from typing import Any
 
 # Bump when ANY engine's logic/thresholds change → signals get new ids, replay-safe.
-REASONING_VERSION = 1
+# v2: added MAX_SURFACE_AGE_DAYS cap to risk.py engines so signals aren't
+#     emitted for entities silent > 30 days (see engines/risk.py header).
+REASONING_VERSION = 2
 
 _REASONING_NAMESPACE = uuid.UUID("7a2b9c14-3d5e-5f60-8b1a-9c0d2e4f6a81")
 

@@ -22,6 +22,7 @@ logger = get_logger("signals.google.oauth")
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 
 # Read-only Workspace scopes. Signals never write to Google.
 GOOGLE_SCOPES = [
@@ -117,6 +118,41 @@ async def refresh_access_token(refresh_token: str) -> dict:
                 raise ReconsentRequired("google refresh rejected (invalid_grant)")
         resp.raise_for_status()
         return resp.json()
+
+
+async def revoke_token(token: str) -> bool:
+    """Revoke a Google OAuth token (access OR refresh) at Google's endpoint.
+
+    Google's `/revoke` invalidates the token and, when passed a refresh_token,
+    invalidates the entire consent grant — every access token derived from it
+    becomes unusable server-side. This is what makes "disconnect" mean
+    disconnect: without a call here, our DB says the integration is inactive
+    but Google still shows us on the user's third-party apps page and could
+    hand out fresh access tokens on a re-consent bounce.
+
+    Returns True if Google acknowledged the revocation, False on soft failure
+    (network / 4xx). Never raises — a failed revoke should NOT block the
+    local disconnect from proceeding. The token is already logically dead in
+    our DB; a Google-side dangling grant is a minor loose end the user can
+    also clean up in their Google account settings.
+    """
+    import httpx
+
+    if not token:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                GOOGLE_REVOKE_URL,
+                data={"token": token},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        # Google returns 200 on success, 400 if token is already invalid.
+        # Both mean "the grant is gone" from the user's perspective.
+        return resp.status_code in (200, 400)
+    except Exception:
+        logger.exception("google token revoke failed (soft, disconnect continues)")
+        return False
 
 
 # A refresher takes a refresh_token and returns Google's token response dict.

@@ -4,11 +4,16 @@ Pulls retrieved Memory facts (+ optionally State/Learning/Intelligence facts pas
 in) into a token-budgeted, cited bundle. Compression strategy: rank by relevance,
 then greedily admit facts until the token budget is hit (drop the tail, never
 summarize away the citation). The model only ever sees what survives this budget.
+
+When the question names a time range (e.g. "this week"), pass `since` / `until`
+to scope the retriever — semantic similarity alone can't distinguish "meetings
+this week" from meetings mentioned three months ago.
 """
 from __future__ import annotations
 
 import re
 import uuid
+from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,10 +40,21 @@ class ContextBuilder:
         k: int = 8,
         token_budget: int = 1500,
         extra: list[Grounding] | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        now: datetime | None = None,
     ) -> GroundedContext:
-        hits = await MemoryRetriever(self.db).search(org_id, question, k=k)
+        hits = await MemoryRetriever(self.db).search(
+            org_id, question, k=k, since=since, until=until
+        )
         candidates: list[Grounding] = [
-            Grounding(kind="memory", source=str(h.memory_id), text=h.source_text) for h in hits
+            Grounding(
+                kind="memory",
+                source=str(h.memory_id),
+                text=h.source_text,
+                occurred_at=h.event_timestamp,
+            )
+            for h in hits
         ]
         # Caller-supplied State/Learning/Intelligence facts rank after memory hits.
         candidates += list(extra or [])
@@ -53,5 +69,9 @@ class ContextBuilder:
             used += cost
 
         return GroundedContext(
-            org_id=str(org_id), question=question, facts=admitted, token_estimate=used
+            org_id=str(org_id),
+            question=question,
+            facts=admitted,
+            token_estimate=used,
+            as_of=now,
         )

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 
 from sqlalchemy import text
@@ -50,12 +51,90 @@ logger = get_logger("state.v2")
 # personalization), so a State per-org lock never collides with another domain's lock.
 _LOCK_NAMESPACE = b"navis.state"
 
+# ── In-process cache of deserialized OrganizationalState ────────────────────
+# Keyed by (org_id, projection_version, watermark_memory_id) so that a
+# snapshot whose watermark hasn't moved since the last request short-circuits
+# both the JSONB payload fetch and the Python-side ~O(entities) re-parse of
+# `full_projection`. Those two steps are the dominant cost on the /context hot
+# path — measured p50 ~12s on a warm org before this cache; the same call
+# returns in <100ms once the deserialized state is in-process.
+#
+# Correctness (this cache never returns a stale projection):
+#   * Any new memory record past the current watermark advances
+#     state.watermark.last_memory_id, which changes the cache key. The old
+#     entry becomes unreachable and eventually LRU-evicts.
+#   * Every call still verifies via MemoryReader.has_records_after() that
+#     nothing new has landed since the cached watermark — a cheap EXISTS
+#     query. When new records exist, the fast path falls through to the
+#     original fold-from-snapshot flow.
+#   * Snapshot disposal (corruption / schema drift) evicts the org from the
+#     cache too, so the next call rebuilds from Memory.
+#   * `projection_version` is part of the key: a bump automatically misses
+#     any in-flight caches without touching this file.
+#
+# Bounded LRU (32 orgs — a single-tenant / small-team deployment fits in
+# under 10 MB assuming ~200 KB per deserialized projection). Uvicorn workers
+# each own their own cache; concurrent access within an event loop is safe
+# because dict ops don't await.
+_STATE_CACHE_MAX = 32
+_STATE_CACHE: "OrderedDict[tuple[uuid.UUID, int, uuid.UUID], OrganizationalState]" = OrderedDict()
+
 
 def _org_lock_key(org_id: uuid.UUID) -> int:
     """Deterministic signed-bigint advisory-lock key for an org (full-uuid blake2b,
     State-namespaced). Stable across processes; ~2^-64 collision probability."""
     digest = hashlib.blake2b(org_id.bytes, digest_size=8, person=_LOCK_NAMESPACE).digest()
     return int.from_bytes(digest, "big", signed=True)
+
+
+def _cache_key(
+    org_id: uuid.UUID,
+    projection_version: int,
+    watermark_memory_id: uuid.UUID | None,
+) -> tuple[uuid.UUID, int, uuid.UUID] | None:
+    """Cache key or None for empty projections (never worth caching)."""
+    if watermark_memory_id is None:
+        return None
+    return (org_id, projection_version, watermark_memory_id)
+
+
+def _cache_get(
+    org_id: uuid.UUID,
+    projection_version: int,
+    watermark_memory_id: uuid.UUID | None,
+) -> OrganizationalState | None:
+    key = _cache_key(org_id, projection_version, watermark_memory_id)
+    if key is None:
+        return None
+    state = _STATE_CACHE.get(key)
+    if state is not None:
+        _STATE_CACHE.move_to_end(key)  # LRU touch
+    return state
+
+
+def _cache_put(state: OrganizationalState) -> None:
+    key = _cache_key(
+        state.org_id, state.projection_version, state.watermark.last_memory_id
+    )
+    if key is None:
+        return
+    _STATE_CACHE[key] = state
+    _STATE_CACHE.move_to_end(key)
+    while len(_STATE_CACHE) > _STATE_CACHE_MAX:
+        _STATE_CACHE.popitem(last=False)
+
+
+def _cache_evict_org(org_id: uuid.UUID) -> None:
+    """Drop every cached projection for an org. Called on snapshot disposal so a
+    forced rebuild is never served the pre-disposal state."""
+    stale = [k for k in _STATE_CACHE if k[0] == org_id]
+    for k in stale:
+        del _STATE_CACHE[k]
+
+
+def _cache_clear() -> None:
+    """Public-in-tests helper. Not exported from the module __init__."""
+    _STATE_CACHE.clear()
 
 
 class StateService:
@@ -101,11 +180,31 @@ class StateService:
         state, facts = await self._fold_stream(org_id, as_of=as_of)
         assert state is not None  # base=None always yields a (possibly empty) projection
         await self.snapshots.save(state)
+        _cache_put(state)
         metrics.incr("state.rebuild")
         logger.info("state rebuilt org=%s facts=%d %s", org_id, facts, state.counts())
         return state
 
     async def incremental_update(self, org_id: uuid.UUID) -> OrganizationalState:
+        # Warm-cache fast path — the /context hot path. If we already have the
+        # deserialized snapshot in-process AND nothing new has landed past its
+        # watermark, we can skip both the JSONB payload fetch and the Python
+        # deserialize (the two dominant costs, together ~10s on a warm org).
+        #
+        # Correctness gate: an EXISTS check against `memory_records` past the
+        # cached watermark. If any row landed, we fall through to the original
+        # fold-from-snapshot flow and re-derive state deterministically.
+        wm = await self.snapshots.watermark_only(
+            org_id, projection_version=PROJECTION_VERSION
+        )
+        if wm is not None:
+            cached = _cache_get(org_id, PROJECTION_VERSION, wm[1])
+            if cached is not None and not await self.reader.has_records_after(
+                org_id, cached.watermark
+            ):
+                metrics.incr("state.cache.warm_hit")
+                return cached
+
         snap = await self.snapshots.latest(org_id, projection_version=PROJECTION_VERSION)
         prev = self._deserialize(snap)
         if prev is None:
@@ -115,16 +214,34 @@ class StateService:
 
         state, facts = await self._fold_stream(org_id, after=prev.watermark, base=prev)
         if state is None:  # nothing past the watermark
+            # Populate the warm cache so the next call takes the fast path
+            # above; on cold Uvicorn workers this is the first time we've
+            # paid the deserialize cost for this (org, watermark).
+            _cache_put(prev)
             return prev
         await self.snapshots.save(state)
+        _cache_put(state)
         metrics.incr("state.incremental")
         logger.info("state incremental org=%s +%d facts %s", org_id, facts, state.counts())
         return state
 
     async def get_state(self, org_id: uuid.UUID) -> OrganizationalState:
+        # Warm-cache fast path — mirrors incremental_update. `get_state` is
+        # allowed to serve a snapshot even without a fresh-memory check,
+        # since the caller has already opted into "cached projection is fine".
+        wm = await self.snapshots.watermark_only(
+            org_id, projection_version=PROJECTION_VERSION
+        )
+        if wm is not None:
+            cached = _cache_get(org_id, PROJECTION_VERSION, wm[1])
+            if cached is not None:
+                metrics.incr("state.cache.warm_hit")
+                return cached
+
         snap = await self.snapshots.latest(org_id, projection_version=PROJECTION_VERSION)
         state = self._deserialize(snap)
         if state is not None:
+            _cache_put(state)
             metrics.incr("state.cache_hit")
             return state
         if snap is not None:  # present but unusable (corrupt / version drift) -> dispose
@@ -161,6 +278,9 @@ class StateService:
 
     async def _dispose(self, org_id: uuid.UUID) -> None:
         await self.snapshots.delete(org_id, projection_version=PROJECTION_VERSION)
+        # Evict from the in-process cache too — otherwise a post-dispose
+        # `get_state` fast path could still serve the pre-dispose projection.
+        _cache_evict_org(org_id)
         metrics.incr("state.snapshot.disposed")
 
     async def _fold_stream(

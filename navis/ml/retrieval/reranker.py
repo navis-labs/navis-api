@@ -21,9 +21,24 @@ def _overlap(query: str, text: str) -> float:
     return len(q & d) / len(q)
 
 
-def rerank(query: str, hits: list[Hit], *, alpha: float = 0.7) -> list[Hit]:
-    """Blend vector score (alpha) with lexical overlap (1-alpha). Stable order."""
+def rerank(
+    query: str,
+    hits: list[Hit],
+    *,
+    alpha: float = 0.7,
+    min_score: float = 0.15,
+) -> list[Hit]:
+    """Blend vector score (alpha) with lexical overlap (1-alpha). Stable order.
+
+    Hits scoring below `min_score` are dropped: without this, top-K always
+    returns something, so unrelated memories (e.g. a generic commitment whose
+    embedding lifts on many queries) leak into "related knowledge" on every
+    turn. The default is intentionally conservative — tune from telemetry.
+    """
     def blended(h: Hit) -> float:
         return alpha * h.score + (1 - alpha) * _overlap(query, h.source_text)
 
-    return sorted(hits, key=lambda h: (-blended(h), str(h.memory_id)))
+    scored = [(blended(h), h) for h in hits]
+    scored = [(s, h) for s, h in scored if s >= min_score]
+    scored.sort(key=lambda sh: (-sh[0], str(sh[1].memory_id)))
+    return [h for _, h in scored]

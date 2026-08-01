@@ -23,6 +23,7 @@ _TASK_PROMPT = {
     Task.SUMMARY: "summary",
     Task.DRAFT: "draft",
     Task.EXPLANATION: "explanation",
+    Task.RECOMMENDATION: "recommendation",
 }
 
 
@@ -57,7 +58,8 @@ async def generate(org_id: uuid.UUID, task: Task, context: GroundedContext) -> N
 
 # Thin, named entry points (briefs.py / summaries.py / drafts.py / explanations.py
 # collapse here — one grounded generator, four tasks; no duplication).
-async def brief(org_id, context):       return await generate(org_id, Task.BRIEF_NARRATIVE, context)
-async def summary(org_id, context):     return await generate(org_id, Task.SUMMARY, context)
-async def draft(org_id, context):       return await generate(org_id, Task.DRAFT, context)
-async def explanation(org_id, context): return await generate(org_id, Task.EXPLANATION, context)
+async def brief(org_id, context):          return await generate(org_id, Task.BRIEF_NARRATIVE, context)
+async def summary(org_id, context):        return await generate(org_id, Task.SUMMARY, context)
+async def draft(org_id, context):          return await generate(org_id, Task.DRAFT, context)
+async def explanation(org_id, context):    return await generate(org_id, Task.EXPLANATION, context)
+async def recommendation(org_id, context): return await generate(org_id, Task.RECOMMENDATION, context)

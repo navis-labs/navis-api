@@ -230,3 +230,133 @@ async def test_concurrent_rebuild_contention_serves_existing_snapshot():
     svc = StateService(db=_LockDenyDB(), reader=FakeReader([]), snapshots=snaps)  # type: ignore[arg-type]
     out = await svc.rebuild_org(ORG_A)
     assert out.to_dict() == cached.to_dict()  # served the snapshot, did not rebuild from empty
+
+
+# --- in-process warm cache: fast path bypasses deserialize + fold ------------
+
+class _CountingSnaps(FakeSnapshots):
+    """Snapshot store that records which endpoint was hit — used to prove the
+    warm-cache fast path skips `latest()` (the JSONB payload fetch) and only
+    calls the lightweight `watermark_only()`."""
+    def __init__(self):
+        super().__init__()
+        self.latest_calls = 0
+        self.watermark_only_calls = 0
+
+    async def latest(self, org_id, *, projection_version):
+        self.latest_calls += 1
+        return await super().latest(org_id, projection_version=projection_version)
+
+    async def watermark_only(self, org_id, *, projection_version):
+        self.watermark_only_calls += 1
+        return await super().watermark_only(org_id, projection_version=projection_version)
+
+
+class _CountingReader(FakeReader):
+    def __init__(self, records=None):
+        super().__init__(records)
+        self.has_records_after_calls = 0
+        self.stream_calls = 0
+
+    async def has_records_after(self, org_id, watermark) -> bool:
+        self.has_records_after_calls += 1
+        return await super().has_records_after(org_id, watermark)
+
+    async def stream(self, org_id, *, after=None, batch=5000):
+        self.stream_calls += 1
+        async for r in super().stream(org_id, after=after, batch=batch):
+            yield r
+
+
+async def test_incremental_warm_cache_hits_skip_snapshot_payload_fetch():
+    from navis.state.v2.service import _cache_clear
+
+    _cache_clear()
+    reader = _CountingReader(corpus())
+    snaps = _CountingSnaps()
+    svc = StateService(reader=reader, snapshots=snaps)  # type: ignore[arg-type]
+
+    # First call — populates snapshot AND the in-process cache.
+    first = await svc.rebuild_org(ORG_A)
+    assert snaps.latest_calls == 0  # rebuild bypasses latest() by design
+
+    # Reset counters and take the fast path.
+    snaps.latest_calls = 0
+    snaps.watermark_only_calls = 0
+    reader.has_records_after_calls = 0
+    reader.stream_calls = 0
+
+    again = await svc.incremental_update(ORG_A)
+    assert again.to_dict() == first.to_dict()               # projection identity preserved
+    assert snaps.latest_calls == 0                          # JSONB payload NOT fetched
+    assert snaps.watermark_only_calls == 1                  # only the cheap watermark probe ran
+    assert reader.has_records_after_calls == 1              # correctness gate consulted
+    assert reader.stream_calls == 0                         # no fold at all
+
+
+async def test_incremental_falls_back_to_slow_path_when_new_records_arrive():
+    from navis.state.v2.service import _cache_clear
+
+    _cache_clear()
+    records = sorted(corpus(), key=lambda r: order_key(r.event_timestamp, r.memory_id))
+    half = len(records) // 2
+    reader = _CountingReader(records[:half])
+    snaps = _CountingSnaps()
+    svc = StateService(reader=reader, snapshots=snaps)  # type: ignore[arg-type]
+
+    await svc.rebuild_org(ORG_A)                    # warm cache
+    reader.add(records[half:])                      # new memory lands
+
+    snaps.latest_calls = 0
+    snaps.watermark_only_calls = 0
+    reader.has_records_after_calls = 0
+    reader.stream_calls = 0
+
+    incr = await svc.incremental_update(ORG_A)
+    # Correctness: incremental result == full rebuild from the whole corpus.
+    assert incr.to_dict() == build_projection(ORG_A, records).to_dict()
+    # Fast path checked, then bailed to the slow path (fold from snapshot).
+    assert snaps.watermark_only_calls == 1
+    assert reader.has_records_after_calls == 1
+    assert snaps.latest_calls == 1                  # JSONB payload fetched for the fold
+    assert reader.stream_calls == 1                 # fold ran
+
+
+async def test_dispose_evicts_the_warm_cache():
+    from navis.state.v2.service import _cache_clear, _STATE_CACHE
+
+    _cache_clear()
+    svc, _, snaps = _svc(corpus())
+    await svc.rebuild_org(ORG_A)
+    assert any(k[0] == ORG_A for k in _STATE_CACHE)     # populated by rebuild
+
+    # Force a dispose via the corrupt-snapshot recovery path.
+    _inject(snaps, {"corrupt": 1})
+    await svc.get_state(ORG_A)                          # triggers dispose + rebuild
+    # After dispose+rebuild there IS a fresh entry, but the OLD key (pre-dispose)
+    # is gone. The invariant we assert is looser: no dangling entry with a
+    # stale watermark_memory_id lingers. Since the rebuild produced identical
+    # bytes, cheapest post-condition check is that only the "current" key exists.
+    cur = build_projection(ORG_A, corpus())
+    expected_key = (ORG_A, cur.projection_version, cur.watermark.last_memory_id)
+    org_a_keys = [k for k in _STATE_CACHE if k[0] == ORG_A]
+    assert org_a_keys == [expected_key]
+
+
+async def test_cache_is_bounded_lru():
+    from navis.state.v2.service import _cache_clear, _cache_put, _STATE_CACHE, _STATE_CACHE_MAX
+
+    _cache_clear()
+    base_state = build_projection(ORG_A, corpus())
+    # Synthesize N > cap distinct cache entries by varying watermark_memory_id.
+    from dataclasses import replace
+    from navis.state.v2.models import Watermark
+
+    for i in range(_STATE_CACHE_MAX + 8):
+        wm = Watermark(
+            last_timestamp=base_state.watermark.last_timestamp,
+            last_memory_id=uuid.uuid5(uuid.NAMESPACE_DNS, f"fake-wm-{i}"),
+        )
+        variant = replace(base_state, watermark=wm)
+        _cache_put(variant)
+    assert len(_STATE_CACHE) == _STATE_CACHE_MAX

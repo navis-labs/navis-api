@@ -47,11 +47,18 @@ def get_provider(name: str | None = None) -> MLProvider:
 
 @lru_cache(maxsize=1)
 def get_embedding_provider() -> MLProvider:
-    """Embeddings: Azure if configured (real vectors), else deterministic.
+    """Embeddings: Azure if BOTH api key AND an embed deployment are configured
+    (real vectors), else deterministic. Requiring the embed deployment — not
+    just the api key — avoids the failure mode where Azure is set up for chat
+    only and the embed call 404s on every request.
 
     Pinned independently so the stored embedding `model`/`version` is stable and
     re-embedding is a deliberate migration, never an accidental drift.
     """
-    if settings.azure_openai_api_key and settings.azure_openai_endpoint:
+    if (
+        settings.azure_openai_api_key
+        and settings.azure_openai_endpoint
+        and settings.azure_openai_embed_deployment
+    ):
         return _build("azure")
     return DeterministicProvider()

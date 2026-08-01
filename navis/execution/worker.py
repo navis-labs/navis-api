@@ -58,7 +58,22 @@ async def execute_pass(
         await svc.begin_execution(req)  # -> EXECUTING, attempts += 1
         t0 = monotonic()
         try:
-            result = await execute_with_retry(provider, req.payload, policy)
+            # Thread execution context (org_id, execution_id) into the
+            # payload under a reserved key so providers whose real senders
+            # need to resolve org-scoped resources (e.g. CalendarProvider
+            # resolving the org's Google Calendar Integration) can do it
+            # without extending the Provider.execute() signature. Keys are
+            # stripped by providers that don't care; unknown callers just
+            # ignore the reserved namespace.
+            augmented = {
+                **(req.payload or {}),
+                "__ctx__": {
+                    "org_id": str(req.organization_id),
+                    "execution_id": str(req.id),
+                    "decision_id": str(req.decision_id),
+                },
+            }
+            result = await execute_with_retry(provider, augmented, policy)
             tel.record(provider.name, ok=result.ok, retried=False, latency_s=monotonic() - t0)
             if result.ok:
                 await svc.complete_execution(req, result)
@@ -120,11 +135,19 @@ def _repo(db):
 
 
 async def _execute() -> dict:
+    from navis.execution.providers import production_providers
     from navis.execution.ratelimit import default_rate_limiter
     from navis.platform.database import session_scope
 
+    # Production path: real Google Calendar + Gmail senders wired in.
+    # Tests that call execute_pass() directly still get the dry-run
+    # defaults (see providers/__init__.py) so no test hits Google APIs.
     async with session_scope() as db:
-        return await execute_pass(_repo(db), rate_limiter=default_rate_limiter())
+        return await execute_pass(
+            _repo(db),
+            providers=production_providers(),
+            rate_limiter=default_rate_limiter(),
+        )
 
 
 async def _relay() -> int:
