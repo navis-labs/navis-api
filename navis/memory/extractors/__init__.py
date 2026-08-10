@@ -18,6 +18,7 @@ from navis.memory.extractors.email import (
     CommitmentExtractor,
     CompanyExtractor,
     DecisionExtractor,
+    DecisionRequestExtractor,
     PersonExtractor,
     RelationshipExtractor,
     ThreadExtractor,
@@ -43,6 +44,10 @@ for _ext in (
     RelationshipExtractor(),
     CommitmentExtractor(),
     DecisionExtractor(),
+    # Someone asking THIS org to decide. Shares EntityType.DECISION with the
+    # extractor above, discriminated by payload `kind` — one decision history,
+    # not two stores.
+    DecisionRequestExtractor(),
     MeetingExtractor(),
     CalendarAttendeeExtractor(),
     DriveProjectExtractor(),

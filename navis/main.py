@@ -33,9 +33,19 @@ async def lifespan(app: FastAPI):
     logger.info(
         "Navis %s starting (env=%s debug=%s)",
         settings.app_version,
-        settings.environment,
+        settings.environment.value,
         settings.debug,
     )
+    # An unrecognised ENVIRONMENT is now a startup error, but an UNSET one still
+    # defaults to development — so a production box that forgot the variable would
+    # run with every control relaxed. Say so, loudly, once per boot.
+    relaxed = settings.relaxed_controls()
+    if relaxed:
+        logger.warning(
+            "ENVIRONMENT=%s — the following are NOT enforced: %s",
+            settings.environment.value,
+            "; ".join(relaxed),
+        )
     yield
     logger.info("Navis shutting down — draining connections")
     await aclose_google_oauth_client()

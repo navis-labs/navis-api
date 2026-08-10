@@ -36,12 +36,42 @@ PAYLOAD_FIELDS_V1: dict[EntityType, tuple[str, ...]] = {
     EntityType.PROJECT: ("folder_id", "name", "owners", "shared", "mime_type", "drive_id"),
     EntityType.MEETING: ("title", "starts_at", "ends_at", "attendees", "status",
                          "has_conference", "organizer", "is_recurring", "conference_id"),
+    # participants / snippet / category / is_automated are ADDITIVE (see the note
+    # above — no version bump). They exist so a thread fact has something
+    # semantically meaningful to embed; before them the only embeddable field was
+    # the opaque thread_id. `category` is one of: personal | promotional | social |
+    # forum | update | automated | spam.
+    # `direction` / `from_email` / `from_name` are ADDITIVE (no version bump).
+    # They are what makes "is someone waiting on a reply?" answerable WITHOUT an
+    # LLM: State folds thread records in ascending time order with latest-wins,
+    # so the surviving `direction` is simply the direction of the newest message
+    # in the thread. inbound => the other party spoke last => nobody has replied.
     EntityType.THREAD: ("thread_id", "subject", "message_id",
-                        "rfc_message_id", "in_reply_to", "references", "channel_id"),
+                        "rfc_message_id", "in_reply_to", "references", "channel_id",
+                        "participants", "snippet", "category", "is_automated",
+                        "direction", "from_email", "from_name",
+                        # STICKY thread markers (see extractors/email.py):
+                        # somebody claimed delivery / recorded a decision at
+                        # some point in this thread's history. Null is never
+                        # written, so State's latest-non-null fold makes them
+                        # persist once set — which is what lets a follow-up be
+                        # suppressed by a LATER message.
+                        "fulfilment_at", "fulfilment_from",
+                        "resolution_at", "resolution_from"),
     EntityType.RELATIONSHIP: ("person_email", "direction", "via", "slack_user_id", "channel_id"),
-    EntityType.COMMITMENT: ("text", "speaker_email", "speaker_slack_user_id", "subject",
-                            "thread_id", "channel_id", "via"),
-    EntityType.DECISION: ("text", "subject", "channel_id", "via"),
+    # due_at / due_text / promised_at are ADDITIVE. `due_at` is present ONLY
+    # when the sentence stated a deadline — a null means "no date given", never
+    # "we could not parse one", so nothing downstream may invent it.
+    EntityType.COMMITMENT: ("text", "speaker_email", "speaker_name",
+                            "speaker_slack_user_id", "subject",
+                            "thread_id", "channel_id", "via",
+                            "due_at", "due_text", "promised_at"),
+    # `kind` discriminates a decision RECORDED ("we decided to raise") from one
+    # REQUESTED of the founder ("can you approve the budget?"). One entity type,
+    # one history per decision — not a second decision store.
+    EntityType.DECISION: ("text", "subject", "channel_id", "via",
+                          "kind", "asked_by", "asked_by_name", "asked_at",
+                          "thread_id", "rfc_message_id"),
     EntityType.CHANNEL: ("channel_id", "name", "visibility", "workspace_id"),
     EntityType.DOCUMENT: ("document_id", "title", "owners", "parents", "drive_id", "source"),
 }

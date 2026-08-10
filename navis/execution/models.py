@@ -16,11 +16,13 @@ from datetime import datetime
 from sqlalchemy import (
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -30,9 +32,40 @@ from navis.platform.database.base import Base, Timestamped, UUIDPrimaryKey
 
 class ActionType(str, enum.Enum):
     SEND_EMAIL = "send_email"
+    # A REPLY into an existing Gmail thread. Distinct from SEND_EMAIL: it needs
+    # the thread it answers, and it is the shape a PROACTIVE proposal takes —
+    # proposed before its body exists, and unable to execute until one does.
+    REPLY_TO_EMAIL = "reply_to_email"
+    # Retained but UNSUPPORTED — there is no task system. See providers/tasks.py.
     CREATE_TASK = "create_task"
     SCHEDULE_MEETING = "schedule_meeting"
+    # Moving and cancelling an EXISTING meeting are distinct action types, not
+    # variants of SCHEDULE_MEETING: they carry a different payload (an existing
+    # `event_id`), a different provider call (PATCH / DELETE vs POST), and a
+    # different governance story (cancelling notifies attendees of a removal).
+    # `action_type` is a String(40) column, so adding members needs no migration.
+    RESCHEDULE_MEETING = "reschedule_meeting"
+    CANCEL_MEETING = "cancel_meeting"
     SEND_SLACK = "send_slack"
+
+
+class ExecutionOrigin(str, enum.Enum):
+    """WHO decided this action should exist. Not how it executes — that is
+    identical for both — but which product surface owns reviewing it.
+
+    CHAT      the founder asked for it explicitly and is already looking at the
+              proposal in the conversation. Chat owns it end to end.
+    PROACTIVE Navis discovered it from signals the founder has not seen. The
+              Action Center is the review queue for exactly these.
+
+    Without this distinction `GET /actions` returned every REQUESTED row, so a
+    meeting proposed in chat ALSO appeared on the Action Center board — two
+    surfaces racing to approve one row, and a "proactive" queue full of things
+    the user had just typed.
+    """
+
+    CHAT = "chat"
+    PROACTIVE = "proactive"
 
 
 class ExecutionRequest(Timestamped, Base):
@@ -40,6 +73,21 @@ class ExecutionRequest(Timestamped, Base):
     __table_args__ = (
         # Idempotency: one request per (org, deterministic key).
         UniqueConstraint("organization_id", "idempotency_key", name="uq_execution_idempotency"),
+        # ONE inbound message = ONE reply obligation = at most ONE execution.
+        #
+        # THE guarantee, enforced by the database rather than by an
+        # if-exists-return-existing read, which two concurrent proposals would
+        # both lose. PARTIAL because action types with no message-level
+        # identity legitimately carry NULL and must not collide with each
+        # other. Mirrored in migration 0035; kept here so `create_all` (used by
+        # the Postgres integration suite) builds the same schema.
+        Index(
+            "uq_execution_obligation",
+            "organization_id",
+            "obligation_key",
+            unique=True,
+            postgresql_where=text("obligation_key IS NOT NULL"),
+        ),
     )
 
     # Deterministic UUIDv5 of (org, idempotency_key) — replay/retry reproduce it.
@@ -56,7 +104,29 @@ class ExecutionRequest(Timestamped, Base):
 
     action_type: Mapped[str] = mapped_column(String(40), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    # Which surface owns reviewing this. See ExecutionOrigin.
+    #
+    # Server default is 'chat' so pre-existing rows (written before this column
+    # existed, by both surfaces) stay OUT of the proactive queue. Wrongly
+    # hiding an old proactive row is a missed nudge; wrongly showing a chat row
+    # resurrects the duplicate-surface bug this column exists to kill.
+    origin: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default=ExecutionOrigin.CHAT.value,
+        default=ExecutionOrigin.CHAT.value,
+        index=True,
+    )
     idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The stable natural key of the underlying obligation, when the action has
+    # one — currently reply_to_email: "reply|{kind}|{thread_id}|{message_id}".
+    #
+    # Stored as a readable column rather than left inside the idempotency hash
+    # so the guarantee is inspectable ("show me every execution for this
+    # message") and so the database itself can enforce it: see the partial
+    # unique index in migration 0035. NULL for action types that have no
+    # message-level identity, which is why the index is partial.
+    obligation_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
 
     # --- Approval (human-in-the-loop) ---

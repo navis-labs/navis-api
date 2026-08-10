@@ -43,6 +43,33 @@ class CalendarClient:
             params["pageToken"] = page_token
         return await self._t.request("GET", f"{_BASE}/calendars/{self._cal}/events", params=params)
 
+    async def list_events_expanded(
+        self,
+        *,
+        time_min: str,
+        time_max: str,
+        max_results: int = 50,
+    ) -> dict[str, Any]:
+        """List events in a time window, expanded for recurring instances.
+
+        Unlike `list_events` (sync-oriented, keeps recurring MASTER rows),
+        this method sets `singleEvents=True` + `orderBy=startTime` so each
+        occurrence in the window shows up as its own event with a real
+        `start`/`end`. Suitable for the chat "what meetings do I have
+        today?" query flow — the caller renders these events verbatim.
+        """
+        params: dict[str, Any] = {
+            "maxResults": max_results,
+            "singleEvents": True,
+            "orderBy": "startTime",
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "showDeleted": False,
+        }
+        return await self._t.request(
+            "GET", f"{_BASE}/calendars/{self._cal}/events", params=params
+        )
+
     async def watch(self, channel_id: str, address: str, token: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {"id": channel_id, "type": "web_hook", "address": address}
         if token:
@@ -92,6 +119,7 @@ class CalendarClient:
         time_zone: str = "UTC",
         send_updates: str = "all",
         conference: bool = False,
+        event_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a calendar event on the client's calendar.
 
@@ -100,12 +128,22 @@ class CalendarClient:
         don't see two notifications). `conference=True` requests Google Meet by
         binding a conferenceData block — the API returns the Meet link on the
         created event's `hangoutLink` field.
+
+        `event_id` supplies a CLIENT-GENERATED event id. Google enforces
+        uniqueness per calendar, so passing a deterministic id turns
+        events.insert into an idempotent operation: a replayed insert returns
+        409 instead of creating a second event. Callers that want at-most-once
+        semantics (the execution worker does) MUST pass one — see
+        `navis.execution.providers._senders.calendar_sender`. The id must be
+        5-1024 chars from the base32hex alphabet (a-v, 0-9).
         """
         body: dict[str, Any] = {
             "summary": summary,
             "start": {"dateTime": start_iso, "timeZone": time_zone},
             "end": {"dateTime": end_iso, "timeZone": time_zone},
         }
+        if event_id:
+            body["id"] = event_id
         if description:
             body["description"] = description
         if location:
@@ -128,3 +166,65 @@ class CalendarClient:
             params=params,
             json=body,
         )
+
+    async def get_event(self, event_id: str) -> dict[str, Any]:
+        """Fetch one event by id. Raises GoogleAPIError(404) when absent."""
+        return await self._t.request(
+            "GET", f"{_BASE}/calendars/{self._cal}/events/{event_id}"
+        )
+
+    async def patch_event(
+        self,
+        event_id: str,
+        *,
+        start_iso: str | None = None,
+        end_iso: str | None = None,
+        time_zone: str = "UTC",
+        summary: str | None = None,
+        description: str | None = None,
+        location: str | None = None,
+        send_updates: str = "all",
+    ) -> dict[str, Any]:
+        """Partial-update an existing event (the reschedule path).
+
+        PATCH, not PUT: only the supplied fields change, so a reschedule keeps
+        the attendee list, conference data, and any edits the user made in
+        Google's own UI. Naturally idempotent — applying the same new start/end
+        twice converges on the same event.
+        """
+        body: dict[str, Any] = {}
+        if start_iso:
+            body["start"] = {"dateTime": start_iso, "timeZone": time_zone}
+        if end_iso:
+            body["end"] = {"dateTime": end_iso, "timeZone": time_zone}
+        if summary is not None:
+            body["summary"] = summary
+        if description is not None:
+            body["description"] = description
+        if location is not None:
+            body["location"] = location
+        if not body:
+            raise ValueError("patch_event called with no fields to change")
+        return await self._t.request(
+            "PATCH",
+            f"{_BASE}/calendars/{self._cal}/events/{event_id}",
+            params={"sendUpdates": send_updates},
+            json=body,
+        )
+
+    async def delete_event(self, event_id: str, *, send_updates: str = "all") -> None:
+        """Cancel an event. A 404/410 means it is ALREADY gone — the caller's
+        desired end state — so both are swallowed here rather than surfaced as
+        an execution failure. Every other status still raises."""
+        from navis.signals.google.transport import GoogleAPIError
+
+        try:
+            await self._t.request(
+                "DELETE",
+                f"{_BASE}/calendars/{self._cal}/events/{event_id}",
+                params={"sendUpdates": send_updates},
+            )
+        except GoogleAPIError as exc:
+            if exc.is_not_found or exc.is_gone:
+                return
+            raise

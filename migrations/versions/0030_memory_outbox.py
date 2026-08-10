@@ -1,7 +1,7 @@
 """Memory — transactional outbox for domain events
 
 Revision ID: 0030_memory_outbox
-Revises: 0029_identity_resolution_and_dismissals
+Revises: 0029_identity_res_dismissals
 Create Date: 2026-07-07
 
 Adds `memory_outbox`. The memory ingestion path writes a pointer row here IN THE SAME
@@ -20,7 +20,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0030_memory_outbox"
-down_revision: Union[str, Sequence[str], None] = "0029_identity_resolution_and_dismissals"
+down_revision: Union[str, Sequence[str], None] = "0029_identity_res_dismissals"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

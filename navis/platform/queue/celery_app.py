@@ -140,16 +140,35 @@ celery_app.conf.beat_schedule = {
 # so new Gmail messages never extract into memory_records and the pipeline
 # silently stalls at Layer 1 → Layer 2.
 #
-# Deferred via worker_process_init because a top-level `import navis.registry`
-# hits a real circular-import: registry imports navis.execution.worker (etc.)
-# whose module body calls _register_tasks() which does
+# Deferred via signal hooks because a top-level `import navis.registry` hits a
+# real circular-import: registry imports navis.execution.worker (etc.) whose
+# module body calls _register_tasks() which does
 # `from navis.platform.queue import celery_app, run_async` — but at that instant
 # navis.platform.queue.__init__ is still executing its one and only import line
 # and `run_async` is not yet in its namespace. Signal-based init runs AFTER
 # celery has fully wired the queue package.
-from celery.signals import worker_process_init  # noqa: E402
+#
+# BOTH signals are connected because they cover different pools, and connecting
+# only one leaves a pool silently unwired:
+#   * worker_process_init — fires in each prefork CHILD, and in the solo pool.
+#     Does NOT fire for --pool=threads / gevent / eventlet.
+#   * worker_init         — fires once in the main worker process, which is
+#     exactly where threads/gevent/eventlet execute their tasks.
+# Registration is memoized in navis.platform.composition, so being called twice
+# (e.g. solo fires both) costs nothing. The relay tasks ALSO call the guard at
+# execution time, so delivery no longer depends on how the worker was started.
+from celery.signals import worker_init, worker_process_init  # noqa: E402
 
 
 @worker_process_init.connect
-def _register_event_subscribers(**_kwargs) -> None:
-    import navis.registry  # noqa: F401  (subscribe side-effects)
+def _register_subscribers_in_child(**_kwargs) -> None:
+    from navis.platform.composition import ensure_subscribers
+
+    ensure_subscribers()
+
+
+@worker_init.connect
+def _register_subscribers_in_main(**_kwargs) -> None:
+    from navis.platform.composition import ensure_subscribers
+
+    ensure_subscribers()

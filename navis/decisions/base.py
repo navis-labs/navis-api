@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import enum
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -24,6 +24,17 @@ _DECISION_NAMESPACE = uuid.UUID("c4f1e2d3-5a6b-5c8d-9e0f-1a2b3c4d5e6f")
 
 class DecisionCategory(str, enum.Enum):
     PRIORITY = "priority"
+    # Its OWN category, not RISK: it is the only one the proposer can
+    # currently turn into a real, targeted action, and collapsing it into
+    # RISK would re-inherit the blank-email mapping that category used to
+    # carry. Distinct category => distinct, explicit handling.
+    WAITING_REPLY = "waiting_reply"
+    # Each obligation category is its OWN, for the same reason WAITING_REPLY
+    # is: the proposer can author a real, targeted follow-up for these, and
+    # folding them into RISK would re-inherit that category's (removed)
+    # blank-email mapping.
+    FOLLOW_UP = "follow_up"
+    DECISION_OWED = "decision_owed"
     RISK = "risk"
     DELEGATION = "delegation"
     OPPORTUNITY = "opportunity"
@@ -35,6 +46,9 @@ _CATEGORY_FOR_SIGNAL = {
     SignalType.RELATIONSHIP_COOLING: DecisionCategory.RISK,
     SignalType.PROJECT_STALLED: DecisionCategory.RISK,
     SignalType.DECISION_UNRESOLVED: DecisionCategory.RISK,
+    SignalType.WAITING_ON_USER_REPLY: DecisionCategory.WAITING_REPLY,
+    SignalType.COMMITMENT_FOLLOW_UP: DecisionCategory.FOLLOW_UP,
+    SignalType.DECISION_OWED: DecisionCategory.DECISION_OWED,
     SignalType.CUSTOMER_ENGAGEMENT_DROP: DecisionCategory.RISK,
     SignalType.MEETING_OVERLOAD: DecisionCategory.RISK,
     SignalType.OPPORTUNITY: DecisionCategory.OPPORTUNITY,

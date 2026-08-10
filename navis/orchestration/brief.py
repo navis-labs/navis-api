@@ -74,6 +74,7 @@ async def propose_actions(db: AsyncSession, org_id: uuid.UUID) -> int:
     """Decision -> Execution bridge: turn the latest brief's decisions into
     REQUESTED ExecutionRequests (idempotent; human approval still required)."""
     from navis.decisions.service import DecisionService
+    from navis.execution.models import ExecutionOrigin
     from navis.execution.proposer import propose_from_decisions
     from navis.execution.service import ExecutionService
 
@@ -89,6 +90,9 @@ async def propose_actions(db: AsyncSession, org_id: uuid.UUID) -> int:
             reasoning_signal_ids=p.reasoning_signal_ids,
             reasoning_version=p.reasoning_version,
             state_watermark=p.state_watermark,
+            # THE proactive producer: these come from reasoning over signals the
+            # founder has not seen, so the Action Center owns reviewing them.
+            origin=ExecutionOrigin.PROACTIVE,
         )
         created += int(was_created)
     return created

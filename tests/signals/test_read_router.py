@@ -331,3 +331,44 @@ def test_row_shim_proxies_dict_lookups_as_attributes():
     assert shim.payload == {"k": "v"}
     with pytest.raises(AttributeError):
         _ = shim.does_not_exist
+
+
+# ── Version collapse ordering ──────────────────────────────────────────
+#
+# `_latest_per_external_id_stmt` picks ONE row per external_id via DISTINCT ON,
+# and which row it picks is decided entirely by the ORDER BY. Getting that
+# wrong is silent: no error, no empty list — just a permanently stale meeting
+# on the dashboard. So the ordering itself is asserted here.
+
+
+def test_version_collapse_orders_by_ingestion_not_meeting_start():
+    """THE bug: for a calendar signal `occurred_at` is the MEETING'S START TIME
+    (CalendarConnector._to_event), not when we learned about it.
+
+    Cancelling a meeting three weeks out writes a cancellation row stamped
+    `now`, which is EARLIER than the original row's start — so ordering by
+    occurred_at picked the stale CREATED row, and the caller's
+    `event_type != CANCELLED` filter had nothing left to catch. The cancelled
+    meeting stayed on the dashboard forever, even after a full sync.
+    """
+    import uuid as _uuid
+
+    from navis.signals.base import SignalSource
+    from navis.signals.read_router import _latest_per_external_id_stmt
+
+    stmt = _latest_per_external_id_stmt(
+        org_id=_uuid.uuid4(), source=SignalSource.CALENDAR
+    )
+    order_sql = " ".join(str(c) for c in stmt.element._order_by_clauses).lower()
+
+    assert "created_at desc" in order_sql, (
+        "collapse must pick the newest INGESTED version; ordering by "
+        "occurred_at hides cancellations of future meetings"
+    )
+    assert "occurred_at" not in order_sql, (
+        "occurred_at is the meeting start — it cannot order versions of the "
+        "same meeting, since every version shares it"
+    )
+    # Deterministic tie-break: signal ids are UUIDv5, so two rows written in the
+    # same transaction still collapse to a replay-identical pick.
+    assert "id desc" in order_sql

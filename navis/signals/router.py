@@ -51,6 +51,7 @@ from navis.signals.base import (
 from navis.signals.crypto import token_cipher
 from navis.signals.models import SignalDeadLetter, SignalEventRecord
 from navis.signals.google import oauth as google_oauth
+from navis.signals.google.oauth import calendar_write_granted
 from navis.signals.google.pubsub_auth import (
     PubSubAuthError,
     pubsub_auth_configured,
@@ -85,13 +86,43 @@ _REQUIRED_SCOPES: dict[IntegrationProvider, tuple[str, ...]] = {
 # always 409 because there was no `google_calendar` row to look up.
 #
 # We now upsert one row per Google-family provider whose scope the user
-# actually granted, sharing the same tokens and external_account. Missing a
-# scope just means we skip that provider's row — no fake rows.
-_GOOGLE_FAMILY_ACTIVATION_SCOPES: tuple[tuple[IntegrationProvider, str], ...] = (
-    (IntegrationProvider.GMAIL,            "https://www.googleapis.com/auth/gmail.readonly"),
-    (IntegrationProvider.GOOGLE_CALENDAR,  "https://www.googleapis.com/auth/calendar.readonly"),
-    (IntegrationProvider.DRIVE,            "https://www.googleapis.com/auth/drive.metadata.readonly"),
+# actually granted, sharing the same tokens and external_account. Missing
+# ALL of a provider's activation scopes means we skip that provider's row —
+# no fake rows.
+#
+# Calendar accepts either the new `calendar.events` (v2 grant used by the
+# Ask Navis scheduling flow) or the legacy `calendar.readonly` — an org
+# that connected under v1 keeps its read-only Calendar integration active
+# until the user reconnects to grant write. The sender-side scope check
+# in _senders.calendar_sender surfaces reconsent BEFORE any Google call
+# when write is required, so a stale read-only row never silently 403s.
+_GOOGLE_FAMILY_ACTIVATION_SCOPES: tuple[tuple[IntegrationProvider, tuple[str, ...]], ...] = (
+    (IntegrationProvider.GMAIL,            ("https://www.googleapis.com/auth/gmail.readonly",)),
+    (
+        IntegrationProvider.GOOGLE_CALENDAR,
+        (
+            "https://www.googleapis.com/auth/calendar.events",
+            "https://www.googleapis.com/auth/calendar",
+            "https://www.googleapis.com/auth/calendar.readonly",
+        ),
+    ),
+    (IntegrationProvider.DRIVE,            ("https://www.googleapis.com/auth/drive.metadata.readonly",)),
 )
+
+
+def _first_activation_scope_present(
+    granted_set: set[str], activation_scopes: tuple[str, ...]
+) -> str | None:
+    """Return the first activation scope actually granted, or None if none are.
+
+    Used at OAuth-callback / backfill time to decide whether to create a
+    per-provider Integration row. Keeping the "found" scope lets us log which
+    variant was accepted (useful for tracking the v1→v2 Calendar migration).
+    """
+    for scope in activation_scopes:
+        if scope in granted_set:
+            return scope
+    return None
 
 
 async def _create_oauth_state(*, org_id: uuid.UUID, user_id: uuid.UUID, provider: str) -> str:
@@ -176,10 +207,10 @@ async def _backfill_google_family(
         return []
     granted_set = set((gmail_row.scopes or "").split())
     inserted: list[str] = []
-    for family_provider, activation_scope in _GOOGLE_FAMILY_ACTIVATION_SCOPES:
+    for family_provider, activation_scopes in _GOOGLE_FAMILY_ACTIVATION_SCOPES:
         if family_provider is IntegrationProvider.GMAIL:
             continue  # Gmail row is the source of truth we're copying from.
-        if activation_scope not in granted_set:
+        if _first_activation_scope_present(granted_set, activation_scopes) is None:
             continue  # scope not granted → nothing to clone (correct: user
             # never authorised this service, so we shouldn't fake a row).
         stmt = (
@@ -300,8 +331,8 @@ async def google_callback(
     granted_set = set((granted or "").split())
 
     activated: list[str] = []
-    for family_provider, activation_scope in _GOOGLE_FAMILY_ACTIVATION_SCOPES:
-        if activation_scope not in granted_set:
+    for family_provider, activation_scopes in _GOOGLE_FAMILY_ACTIVATION_SCOPES:
+        if _first_activation_scope_present(granted_set, activation_scopes) is None:
             continue  # user didn't grant this service — skip; no fake row.
         stmt = (
             pg_insert(Integration)
@@ -560,9 +591,19 @@ async def list_integrations(
         ingested_today, ingested_last_hour, ingested_total = ingest_by_integration.get(
             r.id, (0, 0, 0)
         )
+        provider_value = r.provider.value if hasattr(r.provider, "value") else str(r.provider)
+        # Capability flags derived from the stored grant. Frontend uses
+        # these to gate features that need a specific write scope without
+        # having to parse the raw scope string. Currently only Calendar
+        # write matters — Gmail send is deliberately not requested by
+        # this iteration (see CLAUDE.md scope narrowing).
+        calendar_can_write = (
+            provider_value == IntegrationProvider.GOOGLE_CALENDAR.value
+            and calendar_write_granted(r.scopes)
+        )
         integrations.append({
             "integration_id":     str(r.id),
-            "provider":           r.provider.value if hasattr(r.provider, "value") else str(r.provider),
+            "provider":           provider_value,
             "external_account":   r.external_account,
             "is_active":          r.is_active,
             "connected_at":       r.created_at.isoformat() if r.created_at else None,
@@ -570,6 +611,10 @@ async def list_integrations(
             "token_expires_at":   r.token_expires_at.isoformat() if r.token_expires_at else None,
             # Space-separated scope string — the frontend can split for display.
             "scopes":             r.scopes,
+            # True when this integration carries a Calendar write scope.
+            # False on legacy `calendar.readonly` grants — the frontend
+            # surfaces a reconsent prompt before allowing scheduling.
+            "calendar_write_scope": calendar_can_write,
             # Opportunistic; may be None until the sync engine writes it.
             "last_synced_at":     last_synced_at,
             # Per-connector ingestion counters — zero when the connector

@@ -61,22 +61,62 @@ def test_org_id_propagation_and_tenant_isolation():
     assert {s.signal_id for s in a}.isdisjoint({s.signal_id for s in b})
 
 
-def test_all_eleven_engines_registered():
+def test_all_engines_registered():
+    """The registry is the contract: a signal type with no engine is dead code,
+    and an engine missing from ENGINES silently stops producing."""
     names = {e.name for e in ENGINES}
     assert names == {
         "commitment_reasoning", "relationship_reasoning", "project_reasoning",
         "customer_reasoning", "decision_reasoning", "meeting_reasoning",
+        # Proactive obligation engines — see engines/waiting.py and
+        # engines/obligations.py.
+        "waiting_reply_reasoning", "commitment_follow_up", "decision_owed",
         "priority", "opportunity", "leverage", "trend", "context",
     }
 
 
-def test_expected_signal_types_fire_on_stale_state():
+def test_obligation_signals_survive_a_stale_window_but_decay_signals_do_not():
+    """The deliberate split between the two upper age ceilings.
+
+    `_state()` pushes as_of ~40 days past the corpus, which is beyond the
+    30-day DECAY window and inside the 90-day OBLIGATION window. That is the
+    whole point of the split:
+
+      * an unmet promise or an unresolved decision does not stop being owed
+        because a month went by — a Chief of Staff that forgets promises past
+        an arbitrary horizon has the worst failure mode this product can have;
+      * silence, by contrast, genuinely stops being "cooling" and becomes a
+        lapsed relationship, which a daily brief should not keep re-raising.
+
+    This test previously asserted BOTH kinds fire at 40 days and had been
+    failing since MAX_SURFACE_AGE_DAYS was introduced — the failure was real,
+    and it was the commitment half that was wrong.
+    """
     types = {s.signal_type for s in run_reasoning_v2(_state())}
+    # Obligations — still owed at 40 days.
     assert SignalType.COMMITMENT_SLIPPING in types
-    assert SignalType.RELATIONSHIP_COOLING in types
     assert SignalType.DECISION_UNRESOLVED in types
+    # Decay — past the actionable window at 40 days.
+    assert SignalType.RELATIONSHIP_COOLING not in types
+    # Always-on meta signals.
     assert SignalType.PRIORITY_LOAD in types
     assert SignalType.CONTEXT_SUMMARY in types
+
+
+def test_decay_signals_fire_inside_their_own_window():
+    """Guards the other side: the 30-day ceiling must not be so tight that
+    decay signals stop working altogether."""
+    import datetime as _dt
+
+    from navis.state.v2.builders import build_projection
+    from tests.state.fakes import corpus
+
+    records = corpus(ORG_A)
+    as_of = max(r.event_timestamp for r in records) + _dt.timedelta(days=10)
+    types = {
+        s.signal_type for s in run_reasoning_v2(build_projection(ORG_A, records, as_of=as_of))
+    }
+    assert SignalType.RELATIONSHIP_COOLING in types
 
 
 def test_fresh_state_has_no_risk_signals():

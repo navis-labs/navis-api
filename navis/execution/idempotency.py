@@ -27,5 +27,21 @@ def idempotency_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def obligation_idempotency_key(org_id: uuid.UUID, obligation_key: str) -> str:
+    """Idempotency for an action whose identity is a stable natural key.
+
+    Deliberately takes NEITHER decision_id NOR the payload. Both are
+    observation-scoped for a reply — decision_id moves with the state watermark
+    and the payload carries a drifting `waiting_days` — so including either
+    would reintroduce the duplicate this exists to prevent. See
+    execution/obligation.py for the measured evidence.
+
+    Disjoint from `idempotency_key` by the "obligation" tag, so an obligation
+    key can never collide with a payload hash.
+    """
+    raw = f"{org_id}|obligation|{obligation_key}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def execution_id(org_id: uuid.UUID, key: str) -> uuid.UUID:
     return uuid.uuid5(_EXECUTION_NAMESPACE, f"{org_id}|{key}")

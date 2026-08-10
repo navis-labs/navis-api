@@ -134,6 +134,37 @@ class ThreadState(_BaseView):
     def message_ids(self): return self.lists.get("message_ids", [])
     @property
     def participants(self): return self.lists.get("participants", [])
+    # Records fold in ascending (event_timestamp, memory_id) order with
+    # latest-non-null-wins, so these describe the NEWEST message in the thread —
+    # not the thread as a whole. `direction == "inbound"` therefore means "the
+    # other party spoke last", i.e. nobody has replied yet, and `last_seen` is
+    # when they spoke. That is the entire mechanism behind WAITING_ON_USER_REPLY,
+    # and it needs no extra state, no new table and no LLM.
+    @property
+    def direction(self): return self.fields.get("direction")
+    @property
+    def last_message_from(self): return self.fields.get("from_email")
+    @property
+    def last_message_from_name(self): return self.fields.get("from_name")
+    @property
+    def rfc_message_id(self): return self.fields.get("rfc_message_id")
+    @property
+    def category(self): return self.fields.get("category")
+    @property
+    def is_automated(self): return bool(self.fields.get("is_automated"))
+    @property
+    def thread_id(self): return self.fields.get("thread_id")
+    # STICKY history markers — set once and never cleared, because the fold
+    # skips nulls. "Someone said they delivered" / "someone recorded a
+    # decision" are facts about the whole thread, not about its newest message.
+    @property
+    def fulfilment_at(self): return self.fields.get("fulfilment_at")
+    @property
+    def fulfilment_from(self): return self.fields.get("fulfilment_from")
+    @property
+    def resolution_at(self): return self.fields.get("resolution_at")
+    @property
+    def resolution_from(self): return self.fields.get("resolution_from")
 
 
 class RelationshipState(_BaseView):
@@ -153,6 +184,21 @@ class CommitmentState(_BaseView):
     @property
     def speaker_email(self): return self.fields.get("speaker_email")
     @property
+    def speaker_name(self): return self.fields.get("speaker_name")
+    @property
+    def thread_id(self): return self.fields.get("thread_id")
+    @property
+    def subject(self): return self.fields.get("subject")
+    # ISO deadline, present ONLY when the promise stated one. None means "no
+    # date given" — it is never a parse failure, and nothing may substitute a
+    # guess for it.
+    @property
+    def due_at(self): return self.fields.get("due_at")
+    @property
+    def due_text(self): return self.fields.get("due_text")
+    @property
+    def promised_at(self): return self.fields.get("promised_at")
+    @property
     def status(self): return self.fields.get("status", "open")  # fact-derived, no calc
     @property
     def owner_id(self): return (self.links.get("owner") or [None])[0]
@@ -163,6 +209,22 @@ class DecisionState(_BaseView):
     def text(self): return self.fields.get("text")
     @property
     def status(self): return self.fields.get("status", "open")
+    # "record" (a decision the org made) or "request" (one the org owes). Older
+    # facts predate the discriminator and are records by construction.
+    @property
+    def kind(self): return self.fields.get("kind", "record")
+    @property
+    def asked_by(self): return self.fields.get("asked_by")
+    @property
+    def asked_by_name(self): return self.fields.get("asked_by_name")
+    @property
+    def asked_at(self): return self.fields.get("asked_at")
+    @property
+    def thread_id(self): return self.fields.get("thread_id")
+    @property
+    def subject(self): return self.fields.get("subject")
+    @property
+    def rfc_message_id(self): return self.fields.get("rfc_message_id")
 
 
 class ChannelState(_BaseView):

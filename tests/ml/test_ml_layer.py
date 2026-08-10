@@ -246,11 +246,33 @@ def test_routing_tiers():
 
 # ---- THE invariant: the deterministic pipeline never imports ML ----
 
+# Narrowly-scoped, deliberate exceptions. The invariant protects TRUTH: no fact
+# about the organisation may be authored by a model. A module earns a place here
+# only when it uses an LLM to interpret the USER'S OWN words — never to produce
+# a fact — and when everything it extracts is either regex-derivable or shown to
+# the user for confirmation before it can cause a side effect.
+#
+# `reasoning/scheduling/extract.py`: slot-fills a scheduling utterance
+# ("fix a call with Rahul at 3") into date/time/attendee fields. Every slot has
+# a deterministic regex path that WINS over the model's answer (see
+# `extract_constraints`'s merge), the LLM only fills what regex left null, and
+# nothing reaches Google without an explicit human approval of a rendered card.
+_ML_IMPORT_EXCEPTIONS = {
+    "reasoning/extract.py",
+}
+
+
 def test_no_pipeline_domain_imports_ml():
     violations = []
     for domain in PIPELINE:
         for py in (NAVIS / domain).rglob("*.py"):
-            for node in ast.walk(ast.parse(py.read_text(), filename=str(py))):
+            # Python source is UTF-8 by definition (PEP 3120). `read_text()`
+            # with no encoding uses the platform default, which is cp1252 on
+            # Windows — so any source file containing a character outside that
+            # codepage failed this test with a UnicodeDecodeError that had
+            # nothing to do with the invariant being checked.
+            source = py.read_text(encoding="utf-8")
+            for node in ast.walk(ast.parse(source, filename=str(py))):
                 mods = []
                 if isinstance(node, ast.Import):
                     mods = [a.name for a in node.names]
@@ -258,8 +280,31 @@ def test_no_pipeline_domain_imports_ml():
                     mods = [node.module]
                 for m in mods:
                     if m == "navis.ml" or m.startswith("navis.ml."):
-                        violations.append(f"{domain}/{py.name} imports {m}")
+                        where = f"{domain}/{py.name}"
+                        if where in _ML_IMPORT_EXCEPTIONS:
+                            continue
+                        violations.append(f"{where} imports {m}")
     assert not violations, "ML must not enter the truth pipeline:\n" + "\n".join(violations)
+
+
+def test_ml_import_exceptions_are_all_still_real():
+    """An exception that no longer applies is a hole in the invariant.
+
+    If a listed module stops importing navis.ml (or is deleted), this fails so
+    the entry gets removed rather than quietly widening what's allowed.
+    """
+    stale = []
+    for entry in _ML_IMPORT_EXCEPTIONS:
+        domain, _, name = entry.partition("/")
+        matches = list((NAVIS / domain).rglob(name))
+        if not matches:
+            stale.append(f"{entry}: no such file")
+            continue
+        if not any(
+            "navis.ml" in m.read_text(encoding="utf-8") for m in matches
+        ):
+            stale.append(f"{entry}: no longer imports navis.ml")
+    assert not stale, "stale ML-import exceptions:\n" + "\n".join(stale)
 
 
 def test_ml_does_not_import_to_influence_decision_or_reasoning():
@@ -318,8 +363,19 @@ def test_azure_provider_gates_embedding_on_separate_deployment():
     from navis.ml.providers.registry import get_embedding_provider
     from navis.platform.config import settings
 
-    az_chat_only = AzureProvider(deployment="gpt", embed_deployment=None)
-    assert az_chat_only.has_embedding() is False
+    # `embed_deployment=None` means "fall back to configuration", so the
+    # chat-only case must be built with the setting cleared — otherwise this
+    # assertion silently depends on the deploying environment and starts failing
+    # the moment a real embed deployment is configured.
+    get_embedding_provider.cache_clear()
+    configured = settings.azure_openai_embed_deployment
+    try:
+        settings.azure_openai_embed_deployment = None
+        az_chat_only = AzureProvider(deployment="gpt", embed_deployment=None)
+        assert az_chat_only.has_embedding() is False
+    finally:
+        settings.azure_openai_embed_deployment = configured
+        get_embedding_provider.cache_clear()
 
     az_both = AzureProvider(deployment="gpt", embed_deployment="my-embed")
     assert az_both.has_embedding() is True

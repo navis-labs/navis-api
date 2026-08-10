@@ -5,11 +5,32 @@ imports `settings`.
 """
 from __future__ import annotations
 
+import enum
 from functools import lru_cache
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Environment(str, enum.Enum):
+    """The deployment environment. A CLOSED set, deliberately.
+
+    `is_production` gates six independent controls — production config checks,
+    field-encryption fail-fast, OAuth-token-encryption fail-fast, entitlement
+    enforcement, the capability guard, and plan defaults. It was previously a
+    free-form string compared with `== "production"`, so `ENVIRONMENT=prod`, a
+    trailing space, or a misspelling silently took the PERMISSIVE branch of all
+    six at once: credentials stored unencrypted, every capability granted, and
+    the startup safety net skipped — with no error and no log line.
+
+    Making it an enum means an unrecognised value fails at import, before the
+    process can serve a request. Wrong config now cannot masquerade as dev.
+    """
+
+    DEVELOPMENT = "development"
+    STAGING = "staging"
+    PRODUCTION = "production"
 
 
 class Settings(BaseSettings):
@@ -124,6 +145,28 @@ class Settings(BaseSettings):
     azure_openai_embed_deployment: str | None = None
     azure_openai_api_version: str = "2024-12-01-preview"
 
+    # ---- Embedding read pin (migration control) ----
+    # Retrieval reads a SPECIFIC (model, version) index. Writes go to whatever
+    # the configured embedding provider produces. Keeping the two independent is
+    # what makes a re-embed safe: the new index is built to completion in the
+    # background while every query keeps hitting the old, complete one.
+    #
+    # Both unset (the default) => reads follow writes, i.e. exactly today's
+    # behaviour. During a migration, pin reads to the CURRENT index first, then
+    # switch the write provider, backfill, verify, and finally move the pin.
+    # Rollback is moving the pin back — the old vectors are never deleted.
+    #
+    # `embedding_read_model` must name an index that exists: either the
+    # deterministic embedder's model or the configured Azure embed deployment.
+    embedding_read_model: str | None = None
+    embedding_read_version: int | None = None
+
+    # ---- Embedding backfill ----
+    # Records claimed per keyset page, and texts per provider embed call. The
+    # embed batch is bounded well under Azure's 2048-inputs-per-request limit.
+    embedding_backfill_page_size: int = 500
+    embedding_backfill_batch_size: int = 128
+
     # ---- OAuth ----
     google_client_id: str | None = None
     google_client_secret: str | None = None
@@ -142,6 +185,15 @@ class Settings(BaseSettings):
     # ---- Background tasks ----
     celery_broker_url: str = "redis://localhost:6379/2"
     celery_result_backend: str = "redis://localhost:6379/3"
+    # When True, POST /actions/{id}/approve schedules an INLINE execution
+    # pass (asyncio.create_task) alongside the Celery enqueue. This lets
+    # meeting scheduling work end-to-end WITHOUT a running Celery worker
+    # — the approve endpoint returns immediately, and the execution
+    # (real Google Calendar events.insert) runs in the same FastAPI
+    # process seconds later. Suitable for local dev / demos. In
+    # production, run a real Celery worker and set this to False so
+    # retry / rate-limiting / dead-letter policies are honoured.
+    execution_inline_fallback: bool = True
 
     # ---- Feature flags ----
     enable_google_auth: bool = True
@@ -153,7 +205,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # ---- Environment ----
-    environment: str = "development"  # development | staging | production
+    # Validated against the Environment enum below — an unknown value is a startup
+    # error, never a silent downgrade to permissive behaviour.
+    environment: Environment = Environment.DEVELOPMENT
 
     # ---- Database pool ----
     db_pool_size: int = 10
@@ -225,9 +279,63 @@ class Settings(BaseSettings):
             return self.jwt_public_key
         return self.secret_key
 
+    @field_validator("environment", mode="before")
+    @classmethod
+    def _normalize_environment(cls, value: object) -> object:
+        """Accept ` Production ` / `PRODUCTION`, reject `prod`.
+
+        Case and surrounding whitespace are deployment noise and are forgiven.
+        Anything else is rejected with the allowed values named, because the
+        alternative — guessing — is what made this fail open. Notably `prod` is
+        NOT accepted: silently treating an abbreviation as production would be
+        the same class of guess in the opposite direction.
+        """
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().lower()
+        allowed = {e.value for e in Environment}
+        if normalized not in allowed:
+            raise ValueError(
+                f"ENVIRONMENT={value!r} is not recognised. "
+                f"Use one of: {', '.join(sorted(allowed))}. "
+                "This gates encryption enforcement, entitlements and the "
+                "production config checks — it must never be guessed."
+            )
+        return normalized
+
     @property
     def is_production(self) -> bool:
-        return self.environment.lower() == "production"
+        """True only in production.
+
+        Compares by VALUE rather than enum identity. The field is validated at
+        startup so it can only hold one of three values, but pydantic does not
+        re-validate plain attribute assignment — and tests monkeypatch this
+        attribute with a raw string. An identity check would quietly report
+        "not production" for `settings.environment = "production"`, which is the
+        same fail-open this enum exists to remove, just moved to runtime.
+        """
+        env = self.environment
+        value = env.value if isinstance(env, Environment) else str(env).strip().lower()
+        return value == Environment.PRODUCTION.value
+
+    def relaxed_controls(self) -> list[str]:
+        """Security/billing controls NOT enforced in this environment.
+
+        Surfaced at startup so a machine running with development defaults says
+        so out loud. An unset ENVIRONMENT still defaults to development — the
+        remaining fail-open path — and this is what makes that visible instead
+        of silent. Empty in production.
+        """
+        if self.is_production:
+            return []
+        return [
+            "production config safety checks (SECRET_KEY strength, DEBUG, /docs)",
+            "field-encryption fail-fast (PII may be stored unencrypted if keys are unset)",
+            "OAuth-token-encryption fail-fast (tokens may be stored plaintext if keys are unset)",
+            "organization entitlement enforcement (every capability granted)",
+            "capability guard on API routes",
+            "plan defaults (new orgs get ENTERPRISE, not FREE)",
+        ]
 
     @property
     def db_is_pooled(self) -> bool:

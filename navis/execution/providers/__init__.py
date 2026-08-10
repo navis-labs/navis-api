@@ -16,8 +16,13 @@ Tasks stay dry-run today, but drop in their real senders here without touching
 the worker code or the test suite).
 """
 from navis.execution.providers.base import Provider, ProviderError, ProviderValidationError
-from navis.execution.providers.calendar import CalendarProvider
+from navis.execution.providers.calendar import (
+    CalendarProvider,
+    CancelMeetingProvider,
+    RescheduleMeetingProvider,
+)
 from navis.execution.providers.gmail import GmailProvider
+from navis.execution.providers.reply import ReplyToEmailProvider
 from navis.execution.providers.slack import SlackProvider
 from navis.execution.providers.tasks import TasksProvider
 
@@ -26,7 +31,10 @@ from navis.execution.providers.tasks import TasksProvider
 # below to go live.
 _DEFAULT_PROVIDERS: dict[str, Provider] = {
     GmailProvider.action_type: GmailProvider(),
+    ReplyToEmailProvider.action_type: ReplyToEmailProvider(),
     CalendarProvider.action_type: CalendarProvider(),
+    RescheduleMeetingProvider.action_type: RescheduleMeetingProvider(),
+    CancelMeetingProvider.action_type: CancelMeetingProvider(),
     TasksProvider.action_type: TasksProvider(),
     SlackProvider.action_type: SlackProvider(),
 }
@@ -43,11 +51,25 @@ def production_providers() -> dict[str, Provider]:
     by tests) stays free of the DB / signals dependencies that live inside the
     sender module. Slack + Tasks stay dry-run until their real senders exist.
     """
-    from navis.execution.providers._senders import calendar_sender, gmail_sender
+    from navis.execution.providers._senders import (
+        calendar_cancel_sender,
+        calendar_reschedule_sender,
+        calendar_sender,
+        gmail_sender,
+    )
 
     return {
         GmailProvider.action_type: GmailProvider(sender=gmail_sender),
+        # Replies go out through the SAME Gmail sender — it already accepts
+        # `reply_thread_id` / `in_reply_to_message_id` for threading.
+        ReplyToEmailProvider.action_type: ReplyToEmailProvider(sender=gmail_sender),
         CalendarProvider.action_type: CalendarProvider(sender=calendar_sender),
+        RescheduleMeetingProvider.action_type: RescheduleMeetingProvider(
+            sender=calendar_reschedule_sender
+        ),
+        CancelMeetingProvider.action_type: CancelMeetingProvider(
+            sender=calendar_cancel_sender
+        ),
         TasksProvider.action_type: TasksProvider(),
         SlackProvider.action_type: SlackProvider(),
     }
@@ -58,7 +80,10 @@ __all__ = [
     "ProviderError",
     "ProviderValidationError",
     "GmailProvider",
+    "ReplyToEmailProvider",
     "CalendarProvider",
+    "RescheduleMeetingProvider",
+    "CancelMeetingProvider",
     "TasksProvider",
     "SlackProvider",
     "get_provider",

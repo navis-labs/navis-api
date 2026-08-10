@@ -26,6 +26,10 @@ def make_view(
     external_id: str = "ext-1",
     external_version: str = "1",
     org_id: uuid.UUID = ORG,
+    # Overridable so tests can pin WHEN a message was sent. Due-date
+    # extraction resolves relative deadlines ("by Friday") against this,
+    # not against the wall clock.
+    event_timestamp: datetime = EVENT_TS,
 ) -> SignalView:
     return SignalView(
         event_id=event_id,
@@ -36,7 +40,7 @@ def make_view(
         event_type=event_type,
         external_id=external_id,
         external_version=external_version,
-        event_timestamp=EVENT_TS,
+        event_timestamp=event_timestamp,
         payload=payload,
     )
 

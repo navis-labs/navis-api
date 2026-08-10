@@ -20,6 +20,9 @@ from navis.decisions.service import DecisionService
 from navis.identity.authz import Principal, require_permission
 from navis.identity.dependencies import CurrentContext, get_current_context
 from navis.identity.permissions import Permission
+from navis.execution.proposer import decision_obligation_key
+from navis.execution.repository import ExecutionRepository
+from navis.execution.summary import execution_summary
 from navis.orchestration.brief import build_brief, propose_actions
 from navis.organization.contract import Capability
 from navis.organization.guards import require_capability
@@ -33,15 +36,52 @@ _DISMISSAL_NAMESPACE = uuid.UUID("7e2b1c4a-9d5f-5e11-b8c2-4a9f6c3d2b18")
 router = APIRouter(prefix="/brief", tags=["decisions"])
 
 
-def _serialize(brief: Any) -> dict[str, Any]:
+def _serialize(brief: Any, decisions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     return {
         "id": str(brief.id),
         "org_id": str(brief.organization_id),
         "as_of": brief.as_of.isoformat() if brief.as_of else None,
         "reasoning_version": brief.reasoning_version,
         "state_watermark": brief.state_watermark,
-        "decisions": brief.decisions,
+        "decisions": brief.decisions if decisions is None else decisions,
     }
+
+
+async def _with_executions(db: AsyncSession, brief: Any) -> dict[str, Any]:
+    """The brief, with each decision told what has already been done about it.
+
+    Without this the dashboard cannot tell "nobody has replied yet" from "the
+    reply was sent an hour ago": `GET /actions` returns REQUESTED rows only, so
+    a completed execution is invisible and the drawer keeps offering to send a
+    reply that has already gone out.
+
+    Resolution is by the P0 STABLE OBLIGATION KEY, never by decision_id. The
+    same unanswered email carries a different decision_id in every brief, so
+    matching on lineage would lose the execution the moment the brief was
+    rebuilt — the exact defect that let one email become three executions.
+
+    Strictly additive: every existing field is passed through untouched, the
+    decision list keeps its order, and nothing about brief generation or
+    `latest_brief` changes. Decisions gain `execution`, which is null whenever
+    no execution exists — the common case, since most decisions are findings to
+    read rather than replies to send.
+    """
+    decisions = list(brief.decisions or [])
+    if not decisions:
+        return _serialize(brief)
+
+    # Same `_map` the proposer uses, so the read path and the write path cannot
+    # disagree about which obligation a decision represents.
+    keys = [decision_obligation_key(d) for d in decisions]
+    found = await ExecutionRepository(db).get_by_obligation_keys(
+        brief.organization_id, [k for k in keys if k]
+    )
+
+    enriched = [
+        {**d, "execution": execution_summary(found.get(k)) if k else None}
+        for d, k in zip(decisions, keys)
+    ]
+    return _serialize(brief, enriched)
 
 
 @router.post("/generate")
@@ -51,7 +91,7 @@ async def generate(
 ) -> dict[str, Any]:
     """Assemble a fresh brief: State V2 -> Reasoning V2 -> Decision (orchestrated)."""
     brief = await build_brief(db, p.org_id)
-    return _serialize(brief)
+    return await _with_executions(db, brief)
 
 
 @router.get("/today")
@@ -63,7 +103,7 @@ async def today(
     brief = await DecisionService(db).latest_brief(p.org_id)
     if brief is None:
         brief = await build_brief(db, p.org_id)
-    return _serialize(brief)
+    return await _with_executions(db, brief)
 
 
 @router.post("/propose-actions")

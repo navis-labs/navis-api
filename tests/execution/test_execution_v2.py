@@ -12,6 +12,7 @@ from navis.execution.providers.base import ProviderError, ProviderValidationErro
 from navis.execution.proposer import propose_from_decisions
 from navis.execution.retry import ExecutionRetryPolicy, execute_with_retry
 from navis.execution.service import ExecutionNotFound, ExecutionService
+from navis.execution.contract import ProviderResult
 from navis.execution.status import (
     ExecutionStatus,
     InvalidTransition,
@@ -67,8 +68,14 @@ async def test_request_is_idempotent_no_duplicate():
 
 async def _requested(repo):
     svc = ExecutionService(repo=repo)
-    req, _ = await svc.request(ORG_A, DECISION, "send_email", {"to": "a@x.com", "subject": "Hi"},
-                               reasoning_signal_ids=["s1"], reasoning_version=1, state_watermark="wm-9")
+    # A body is REQUIRED — an email with none is refused before it reaches
+    # Gmail (see providers/gmail.py). The fixture describes a real message so
+    # these tests exercise the lifecycle, not the blank-email guard.
+    req, _ = await svc.request(
+        ORG_A, DECISION, "send_email",
+        {"to": "a@x.com", "subject": "Hi", "body": "Following up on the deck."},
+        reasoning_signal_ids=["s1"], reasoning_version=1, state_watermark="wm-9",
+    )
     return svc, req
 
 
@@ -83,12 +90,66 @@ async def test_approve_emits_event_and_no_provider_call():
     assert EventType.ACTION_EXECUTED.value not in event_types(repo)
 
 
-async def test_double_approval_is_rejected():
+async def test_double_approval_is_a_no_op_not_an_error():
+    """Re-approving is idempotent: the outcome asked for already happened.
+
+    This used to raise InvalidTransition, which surfaced to the user as
+    "invalid execution transition executed -> approved (409)" AFTER their
+    meeting had actually been scheduled — a double-click, a stale action list
+    or a retry all produced an error for an operation that succeeded.
+    """
+    repo = FakeExecutionRepo()
+    svc, req = await _requested(repo)
+    first = await svc.approve(req.id, USER)
+    approved_at = first.approved_at
+
+    second = await svc.approve(req.id, uuid.uuid4())
+
+    assert second.status == ExecutionStatus.APPROVED.value
+    assert second.approved_by == USER, "the original approver must not be overwritten"
+    assert second.approved_at == approved_at
+    # Crucially: no second event, so no second side effect downstream.
+    assert event_types(repo).count(EventType.ACTION_APPROVED.value) == 1
+
+
+async def test_approving_an_already_executed_request_is_a_no_op():
+    """The exact reported failure: approve arrives after execution finished."""
     repo = FakeExecutionRepo()
     svc, req = await _requested(repo)
     await svc.approve(req.id, USER)
+    await svc.begin_execution(req)
+    await svc.complete_execution(req, ProviderResult(ok=True))
+    assert req.status == ExecutionStatus.EXECUTED.value
+
+    again = await svc.approve(req.id, USER)
+
+    assert again.status == ExecutionStatus.EXECUTED.value, "must not be dragged back"
+    assert event_types(repo).count(EventType.ACTION_APPROVED.value) == 1
+
+
+async def test_approving_while_executing_is_a_no_op():
+    repo = FakeExecutionRepo()
+    svc, req = await _requested(repo)
+    await svc.approve(req.id, USER)
+    await svc.begin_execution(req)
+
+    again = await svc.approve(req.id, USER)
+
+    assert again.status == ExecutionStatus.EXECUTING.value
+
+
+@pytest.mark.parametrize("decline", ["reject", "cancel"])
+async def test_approving_something_a_human_declined_still_conflicts(decline):
+    """Idempotency must not silently resurrect a request someone refused."""
+    repo = FakeExecutionRepo()
+    svc, req = await _requested(repo)
+    if decline == "reject":
+        await svc.reject(req.id, USER, reason="not now")
+    else:
+        await svc.cancel(req.id)
+
     with pytest.raises(InvalidTransition):
-        await svc.approve(req.id, USER)  # APPROVED -> APPROVED is not allowed
+        await svc.approve(req.id, USER)
 
 
 async def test_reject_and_cancel_paths():
@@ -168,8 +229,19 @@ async def test_provider_validation_raises():
 # ---- Retry ----
 
 class _FlakyProvider(TasksProvider):
+    """Exercises RETRY MECHANICS, not task semantics.
+
+    It borrows create_task's action_type for convenience, so it must override
+    `validate` — TasksProvider's now refuses every payload (there is no task
+    system, see providers/tasks.py) and would fail this test before a single
+    retry was attempted.
+    """
+
     def __init__(self, fail_times: int):
         self._left = fail_times
+
+    async def validate(self, payload):
+        return None
 
     async def execute(self, payload):
         if self._left > 0:
@@ -187,32 +259,65 @@ async def test_retry_recovers_then_gives_up():
 
 
 # ---- Proposer (Decision -> Execution) ----
+def test_proposer_only_emits_actions_it_can_author_honestly():
+    """Phase 1 contract: propose nothing rather than propose something unsafe.
 
-def test_proposer_maps_categories_and_carries_lineage():
+    This test previously asserted the OPPOSITE — that `risk` produced a
+    send_email and `delegation` produced a create_task. Both shipped: the email
+    had `body: ""` and went to a real person, and the task was filed in a system
+    that does not exist. Until drafting lands, those categories yield nothing,
+    and the founder reads them on the brief instead.
+    """
     decisions = [
-        {"decision_id": str(uuid.uuid4()), "category": "risk", "title": "Commitment slipping",
-         "evidence": {"speaker_email": "a@acme.com"}, "reasoning_signal_ids": ["s1"],
+        {"decision_id": str(uuid.uuid4()), "category": "risk", "title": "Contact at risk",
+         "evidence": {"person_email": "p@x.com"}, "reasoning_signal_ids": ["s1"],
          "reasoning_version": 1, "state_watermark": "wm"},
         {"decision_id": str(uuid.uuid4()), "category": "delegation", "title": "Hub company",
-         "evidence": {}, "reasoning_signal_ids": ["s2"], "reasoning_version": 1, "state_watermark": "wm"},
+         "evidence": {}, "reasoning_signal_ids": ["s2"], "reasoning_version": 1,
+         "state_watermark": "wm"},
         {"decision_id": str(uuid.uuid4()), "category": "priority", "title": "Load",
-         "evidence": {}, "reasoning_signal_ids": ["s3"], "reasoning_version": 1, "state_watermark": "wm"},
+         "evidence": {}, "reasoning_signal_ids": ["s3"], "reasoning_version": 1,
+         "state_watermark": "wm"},
+    ]
+    assert propose_from_decisions(decisions, ORG_A) == []
+
+
+def test_proposer_emits_a_reply_candidate_and_carries_lineage():
+    """The one category that CAN be authored honestly today: someone waiting on
+    a reply. Lineage rides along so the resulting row is fully traceable."""
+    decisions = [
+        {"decision_id": str(uuid.uuid4()), "category": "waiting_reply",
+         "title": "John is waiting for your reply",
+         # rfc_message_id is what WaitingReplyReasoningEngine actually emits
+         # (engines/waiting.py) and is now REQUIRED: it is the stable identity
+         # of the reply obligation, so a candidate without one is withheld
+         # rather than given an identity that cannot be de-duplicated.
+         "evidence": {"person_email": "john@x.com", "thread_id": "t-1",
+                      "rfc_message_id": "<contract-1@mail.example>",
+                      "subject": "Contract", "waiting_days": 4.0},
+         "reasoning_signal_ids": ["s9"], "reasoning_version": 1, "state_watermark": "wm"},
     ]
     proposed = propose_from_decisions(decisions, ORG_A)
-    # risk-with-contact -> email; delegation -> task; priority -> skipped (informational)
-    kinds = [p.action_type for p in proposed]
-    assert ActionType.SEND_EMAIL.value in kinds
-    assert ActionType.CREATE_TASK.value in kinds
-    assert len(proposed) == 2
-    assert all(p.org_id == ORG_A and p.reasoning_signal_ids for p in proposed)
+    assert [p.action_type for p in proposed] == [ActionType.REPLY_TO_EMAIL.value]
+    p = proposed[0]
+    assert p.org_id == ORG_A
+    assert p.reasoning_signal_ids == ["s9"]
+    assert p.reasoning_version == 1
+    assert p.state_watermark == "wm"
+    # Proposed, but deliberately not sendable.
+    assert p.payload["requires_draft"] is True
 
 
 def test_proposer_is_deterministic():
-    decisions = [{"decision_id": str(DECISION), "category": "risk", "title": "X",
-                  "evidence": {"person_email": "p@x.com"}, "reasoning_signal_ids": ["s"],
+    decisions = [{"decision_id": str(DECISION), "category": "waiting_reply", "title": "X",
+                  "evidence": {"person_email": "p@x.com", "thread_id": "t-1",
+                               "rfc_message_id": "<x-1@mail.example>",
+                               "subject": "X", "waiting_days": 3.0},
+                  "reasoning_signal_ids": ["s"],
                   "reasoning_version": 1, "state_watermark": "w"}]
     a = propose_from_decisions(decisions, ORG_A)
     b = propose_from_decisions(decisions, ORG_A)
+    assert a, "determinism over an empty list would be vacuous"
     assert [(p.action_type, p.payload) for p in a] == [(p.action_type, p.payload) for p in b]
 
 
