@@ -24,18 +24,110 @@ GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 
-# Read-only Workspace scopes. Signals never write to Google.
+# Workspace scopes.
+#
+# Read-only across Gmail + Drive. Calendar takes BOTH `calendar.readonly`
+# (required by Google to query FreeBusy — the scheduling agent MUST check
+# availability before proposing) AND `calendar.events` (required to write
+# a new event with attendees, so Google sends the real invite email).
+#
+# History: v1 requested only `calendar.readonly` — write was blocked.
+#          v2 dropped readonly for `calendar.events` — this broke
+#          FreeBusy (403 ACCESS_TOKEN_SCOPE_INSUFFICIENT). Confirmed
+#          against Google's docs: FreeBusy requires `calendar` OR
+#          `calendar.readonly` and does NOT accept `calendar.events`.
+#          v3 keeps both scopes side-by-side — the narrowest working
+#          combination for our end-to-end scheduling flow.
+# v4 adds `gmail.send`. Without it the Phase 2B proactive-reply path cannot
+# work at all: every org was connected read-only, so `messages.send` 403s and a
+# reviewed, approved draft dead-letters at the last step. `gmail.send` is the
+# NARROWEST scope that permits sending — it grants no read access of its own and
+# cannot modify or delete existing mail, unlike `gmail.modify`.
 GOOGLE_SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/drive.metadata.readonly",
 ]
+
+# Scope substrings the callback/sender treats as "calendar write allowed".
+# Both `calendar.events` and the broader `calendar` grants qualify;
+# `calendar.readonly` does NOT (read-only cannot insert events).
+CALENDAR_WRITE_SCOPES = (
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar",
+)
+
+# Scope substrings that grant FreeBusy (availability) query access.
+# `calendar.readonly` is the standard grant per Google's docs; the
+# broader `calendar` scope also works. NOTE: `calendar.events` does
+# NOT include FreeBusy — that's the bug the v3 grant fixes.
+CALENDAR_READ_SCOPES = (
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar",
+)
+
+# Scope substrings that permit SENDING mail. `gmail.send` is the dedicated
+# send-only scope; `gmail.modify` and full `mail.google.com` also cover it and
+# are accepted so an org granted a broader scope elsewhere is not forced to
+# reconnect. `gmail.readonly` deliberately does NOT qualify.
+GMAIL_SEND_SCOPES = (
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://mail.google.com/",
+)
+
 # Bumped whenever GOOGLE_SCOPES changes. Persisted with the integration at consent so a
 # later feature that needs a NEW scope can detect "connected under an older scope set" and
 # trigger re-consent, instead of assuming access it doesn't actually have.
-GOOGLE_SCOPE_VERSION = "v1"
+GOOGLE_SCOPE_VERSION = "v4"
+
+
+def calendar_write_granted(scopes: str | None) -> bool:
+    """True iff the stored scope string contains a Calendar write scope.
+
+    Written to `Integration.scopes` at consent as a space-separated string.
+    Legacy orgs granted only `calendar.readonly` return False here so the
+    scheduling flow surfaces reconsent instead of silently 403ing at Google.
+    """
+    if not scopes:
+        return False
+    granted = set(scopes.split())
+    return any(w in granted for w in CALENDAR_WRITE_SCOPES)
+
+
+def gmail_send_granted(scopes: str | None) -> bool:
+    """True iff the stored scope string permits sending mail.
+
+    Mirrors `calendar_write_granted`, and exists for the same reason: an org
+    connected under an older scope set keeps every read feature working, and the
+    sender fails LOUD with a reconnect instruction BEFORE calling Google rather
+    than surfacing a bare 403 from deep inside a worker retry.
+    """
+    if not scopes:
+        return False
+    granted = set(scopes.split())
+    return any(s in granted for s in GMAIL_SEND_SCOPES)
+
+
+def calendar_read_granted(scopes: str | None) -> bool:
+    """True iff the stored scope string contains a scope that permits
+    FreeBusy queries.
+
+    The scheduling agent MUST check availability before proposing a
+    slot. `calendar.events` alone does NOT grant this — that was the
+    v2→v3 bug. A v3 grant carries both `calendar.readonly` (for
+    FreeBusy) and `calendar.events` (for insert). Legacy v2 grants
+    return False here so the agent can emit a reconsent clarification
+    with a clear message instead of a bare 403.
+    """
+    if not scopes:
+        return False
+    granted = set(scopes.split())
+    return any(r in granted for r in CALENDAR_READ_SCOPES)
 
 # Refresh this many seconds before the token actually expires.
 _REFRESH_SKEW_SECONDS = 120

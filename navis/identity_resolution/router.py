@@ -23,6 +23,7 @@ from navis.identity_resolution.resolver import (
     canonical_alias_ids,
     normalize_alias_value,
 )
+from navis.identity_resolution.search import search_persons
 from navis.platform.database import get_session
 
 router = APIRouter(prefix="/identity", tags=["identity_resolution"])
@@ -99,6 +100,28 @@ async def lookup_person(
         "canonical_id": canonical,
         "aliases": [_serialize(r) for r in class_rows],
     }
+
+
+@router.get("/persons/search")
+async def search_person(
+    q: str,
+    ctx: CurrentContext = Depends(get_current_context),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Name-substring / email-substring lookup over the identity graph.
+
+    Complements /persons/lookup (exact value only) — used by the chat
+    scheduling agent to resolve rough handles like "Rahul" to a person.
+    Case-insensitive; results folded by canonical equivalence class so
+    two aliases of the same real person collapse to one match. When
+    multiple people match, `ambiguous=true` and the caller (agent) is
+    expected to ask a clarification instead of picking one arbitrarily.
+
+    Queries shorter than 2 characters return an empty set — the router
+    never pretends a 1-char probe is a specific person lookup.
+    """
+    result = await search_persons(db, ctx.org_id, q)
+    return result.to_dict()
 
 
 @router.get("/persons/{alias_id}")

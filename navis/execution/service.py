@@ -15,8 +15,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from navis.execution.contract import OutcomeReference, ProviderResult
-from navis.execution.idempotency import execution_id, idempotency_key
-from navis.execution.models import ExecutionRequest
+from navis.execution.idempotency import (
+    execution_id,
+    idempotency_key,
+    obligation_idempotency_key,
+)
+from navis.execution.obligation import reply_obligation_key
+from navis.execution.models import ExecutionOrigin, ExecutionRequest
 from navis.execution.status import ExecutionStatus, assert_transition
 from navis.platform.events import EventType
 from navis.platform.monitoring import get_logger
@@ -64,8 +69,26 @@ class ExecutionService:
         reasoning_signal_ids: list[str],
         reasoning_version: int | None,
         state_watermark: str | None,
+        origin: ExecutionOrigin = ExecutionOrigin.CHAT,
     ) -> tuple[ExecutionRequest, bool]:
-        key = idempotency_key(org_id, decision_id, action_type, payload)
+        """`origin` decides which surface REVIEWS this, not how it executes.
+
+        It deliberately does NOT feed the idempotency key: the same decision +
+        payload is the same action whoever noticed it, and letting origin split
+        the key would let one meeting be booked twice — once from chat, once
+        from the proactive queue.
+        """
+        # A reply names the message it answers, and THAT is its identity. Using
+        # the payload hash instead let one unanswered email become a new action
+        # every time the state watermark moved — see execution/obligation.py.
+        #
+        # `decision_id` still rides along on the row for lineage and audit; it
+        # simply no longer decides what counts as the same action.
+        obligation = reply_obligation_key(action_type, payload)
+        if obligation is not None:
+            key = obligation_idempotency_key(org_id, obligation)
+        else:
+            key = idempotency_key(org_id, decision_id, action_type, payload)
         eid = execution_id(org_id, key)
         values = dict(
             id=eid,
@@ -77,9 +100,11 @@ class ExecutionService:
             action_type=action_type,
             status=ExecutionStatus.REQUESTED.value,
             idempotency_key=key,
+            obligation_key=obligation,
             payload=payload,
             provider_reference={},
             attempts=0,
+            origin=origin.value,
         )
         req, created = await self.repo.upsert_request(values)
         if created:
@@ -89,8 +114,40 @@ class ExecutionService:
 
     # ---- human approval lifecycle ----
 
+    # Approving something already approved/running/done asked for an outcome that
+    # has already been achieved — so it is a no-op, not a conflict. This is what
+    # `status.py` means by "double-approval ... no-ops instead of double side
+    # effects": the guard prevents the second SIDE EFFECT, it should not surface
+    # an error for a request that succeeded.
+    #
+    # Without this a user double-clicking Approve sees "invalid execution
+    # transition executed -> approved (409)" even though their meeting WAS
+    # scheduled — and the same 409 appears on a stale action list, a retried
+    # request, or a race with the execution worker.
+    #
+    # REJECTED / CANCELLED are deliberately excluded: approving something a human
+    # explicitly declined is a real conflict and must still fail loudly.
+    _APPROVE_IDEMPOTENT_FROM = {
+        ExecutionStatus.APPROVED,
+        ExecutionStatus.EXECUTING,
+        ExecutionStatus.EXECUTED,
+    }
+
+    # The same reasoning applies to the other two human verbs: re-issuing an
+    # intent that already holds is a no-op, re-issuing a CONFLICTING intent is
+    # a real 409. So `reject` on a REJECTED row and `cancel` on a CANCELLED row
+    # return the row unchanged, while `reject` on an EXECUTED row still raises
+    # (the side effect happened; pretending otherwise would be a lie).
+    _REJECT_IDEMPOTENT_FROM = {ExecutionStatus.REJECTED}
+    _CANCEL_IDEMPOTENT_FROM = {ExecutionStatus.CANCELLED}
+
     async def approve(self, eid: uuid.UUID, approver_id: uuid.UUID) -> ExecutionRequest:
         req = await self._require(eid)
+        if ExecutionStatus(req.status) in self._APPROVE_IDEMPOTENT_FROM:
+            # Already approved (and possibly already run). Return the current
+            # state unchanged: no re-approval, no second audit entry, and above
+            # all no second side effect.
+            return req
         self._transition(req, ExecutionStatus.APPROVED)
         req.approved_by = approver_id
         req.approved_at = self._now()
@@ -100,6 +157,8 @@ class ExecutionService:
 
     async def reject(self, eid: uuid.UUID, approver_id: uuid.UUID, reason: str | None = None) -> ExecutionRequest:
         req = await self._require(eid)
+        if ExecutionStatus(req.status) in self._REJECT_IDEMPOTENT_FROM:
+            return req
         self._transition(req, ExecutionStatus.REJECTED)
         req.approved_by = approver_id
         await self._emit(req, ExecutionStatus.REJECTED, extra={"reason": reason})
@@ -108,6 +167,8 @@ class ExecutionService:
 
     async def cancel(self, eid: uuid.UUID) -> ExecutionRequest:
         req = await self._require(eid)
+        if ExecutionStatus(req.status) in self._CANCEL_IDEMPOTENT_FROM:
+            return req
         self._transition(req, ExecutionStatus.CANCELLED)
         await self._emit(req, ExecutionStatus.CANCELLED)
         await self.repo.flush()

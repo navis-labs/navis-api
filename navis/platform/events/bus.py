@@ -22,6 +22,7 @@ import asyncio
 import json
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from navis.platform.config import settings
@@ -32,6 +33,35 @@ from navis.platform.monitoring.metrics import metrics as _metrics
 logger = get_logger("events")
 
 Handler = Callable[[DomainEvent], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class Delivery:
+    """Outcome of one `publish()` — what the transactional outbox relays need to
+    decide whether a row may be marked published.
+
+    Before this existed, `publish()` returned None whether every handler
+    succeeded, every handler raised, or no handler was even registered. The
+    outbox relays marked rows published unconditionally, so a handler failure
+    (or a process whose composition root never loaded) silently and permanently
+    dropped the event. `ok` is the honest answer to "was this event handled?".
+    """
+
+    event_type: str
+    handlers: int
+    handled: int
+    failed: int
+
+    @property
+    def ok(self) -> bool:
+        """True when nothing that was supposed to run failed.
+
+        Zero handlers is `ok`: a genuinely unsubscribed event type is delivered
+        by definition. Callers that must not tolerate an unwired process are
+        responsible for loading the composition root FIRST — see
+        `navis.platform.composition.ensure_subscribers`.
+        """
+        return self.failed == 0
 # An external transport (durable outbox / Kafka / NATS) can be registered here to
 # fan events OUT of this process. Abstraction point only — not wired today, because
 # in-process delivery is correct and sufficient at current scale.
@@ -65,9 +95,15 @@ class EventBus:
         """
         self._external = publisher
 
-    async def publish(self, event: DomainEvent) -> None:
+    async def publish(self, event: DomainEvent) -> Delivery:
         """Fan out to all in-process handlers concurrently. One failure never
-        blocks others. Also mirrors to Redis and any external transport."""
+        blocks others. Also mirrors to Redis and any external transport.
+
+        Returns a `Delivery` describing the outcome. Failures are still logged
+        and dead-lettered exactly as before — the return value is additive, so
+        fire-and-forget callers are unaffected, while the outbox relays can now
+        keep a failed row unpublished and retry it on the next pass.
+        """
         start = time.perf_counter()
         self.metrics["published"] += 1
         _metrics.incr("events.published", labels={"type": event.type.value})
@@ -86,19 +122,27 @@ class EventBus:
         handlers = list(self._handlers.get(event.type, []))
         if not handlers:
             _metrics.observe_ms("events.publish_latency", (time.perf_counter() - start) * 1000)
-            return
+            return Delivery(event.type.value, handlers=0, handled=0, failed=0)
 
         results = await asyncio.gather(
             *(self._run_handler(h, event) for h in handlers),
             return_exceptions=True,
         )
+        failed = 0
         for handler, result in zip(handlers, results):
             if isinstance(result, BaseException):
+                failed += 1
                 await self._dead_letter(handler, event, result)
             else:
                 self.metrics["handled"] += 1
                 _metrics.incr("events.handled", labels={"type": event.type.value})
         _metrics.observe_ms("events.publish_latency", (time.perf_counter() - start) * 1000)
+        return Delivery(
+            event.type.value,
+            handlers=len(handlers),
+            handled=len(handlers) - failed,
+            failed=failed,
+        )
 
     async def _run_handler(self, handler: Handler, event: DomainEvent) -> None:
         """Run one handler under a timeout so a hung handler can't stall publish."""

@@ -27,6 +27,17 @@ class SignalType(str, enum.Enum):
     PROJECT_STALLED = "project_stalled"
     CUSTOMER_ENGAGEMENT_DROP = "customer_engagement_drop"
     DECISION_UNRESOLVED = "decision_unresolved"
+    # Someone emailed the founder and no reply from them exists in the
+    # thread. Observed, never inferred — see engines/waiting.py.
+    WAITING_ON_USER_REPLY = "waiting_on_user_reply"
+    # A dated promise made TO the org whose deadline has passed with no
+    # delivery. Distinct from COMMITMENT_SLIPPING, which covers UNDATED
+    # promises by age alone; the two are mutually exclusive by design.
+    COMMITMENT_FOLLOW_UP = "commitment_follow_up"
+    # Somebody asked the founder to decide and no decision has landed.
+    # Distinct from DECISION_UNRESOLVED, which covers decisions the org
+    # RECORDED and never closed out.
+    DECISION_OWED = "decision_owed"
     MEETING_OVERLOAD = "meeting_overload"
     PRIORITY_LOAD = "priority_load"
     OPPORTUNITY = "opportunity"

@@ -26,15 +26,19 @@ from email.message import EmailMessage
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
 
-from navis.identity.models import Integration, IntegrationProvider
+from navis.identity.models import Integration
 from navis.platform.database import session_scope
 from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import metrics
 from navis.signals.calendar import CalendarClient
 from navis.signals.crypto import token_cipher
 from navis.signals.gmail import GmailClient
 from navis.signals.google.oauth import TokenManager
+from navis.signals.google.resolve import (
+    resolve_calendar_integration,
+    resolve_gmail_send_integration,
+)
 from navis.signals.google.transport import GoogleAPIError, GoogleTransport
 
 logger = get_logger("execution.providers.senders")
@@ -65,27 +69,41 @@ def _org_id_from_payload(payload: dict[str, Any]) -> UUID:
         raise SenderContextError(f"invalid org_id in __ctx__: {raw}") from exc
 
 
-async def _resolve_integration(
-    db, org_id: UUID, provider: IntegrationProvider
-) -> Integration:
-    integration = await db.scalar(
-        select(Integration)
-        .where(
-            Integration.organization_id == org_id,
-            Integration.provider == provider,
-            Integration.is_active.is_(True),
-        )
-        .order_by(Integration.created_at.desc())
-    )
-    if integration is None:
-        raise RuntimeError(
-            f"no active {provider.value} integration for org {org_id}"
-        )
-    if not integration.access_token or not integration.refresh_token:
-        raise RuntimeError(
-            f"{provider.value} integration missing tokens; reconnect required"
-        )
-    return integration
+def _execution_id_from_payload(payload: dict[str, Any]) -> UUID:
+    ctx = payload.get("__ctx__")
+    raw = ctx.get("execution_id") if isinstance(ctx, dict) else None
+    if not raw:
+        raise SenderContextError("execution context missing execution_id")
+    try:
+        return UUID(raw)
+    except (TypeError, ValueError) as exc:
+        raise SenderContextError(f"invalid execution_id in __ctx__: {raw}") from exc
+
+
+def _google_event_id(execution_id: UUID) -> str:
+    """Deterministic Google Calendar event id for an ExecutionRequest.
+
+    THIS is what makes "no duplicate Google Calendar events can ever occur"
+    true rather than aspirational. Google enforces id uniqueness per calendar,
+    so a client-supplied id turns events.insert into an idempotent operation:
+    every replay of the same ExecutionRequest — worker retry after a timeout
+    where Google actually succeeded, a stale-EXECUTING recovery that re-drives
+    the row, two workers racing, a manual dead-letter replay — targets the SAME
+    id and the second insert comes back 409 instead of booking a second meeting.
+
+    Google's id alphabet is base32hex: `a-v` and `0-9`, length 5-1024. A UUID's
+    hex digits (0-9a-f) are a strict subset, and the "navis" prefix is too
+    (n, a, v, i, s all fall in a-v), so the result is always valid.
+    """
+    return f"navis{execution_id.hex}"
+
+
+# `_resolve_integration` (newest active row for a provider, wins regardless of
+# what it can do) lived here and was deleted with its last caller. Both Google
+# senders now go through navis.signals.google.resolve, which selects on
+# CAPABILITY first. A generic newest-wins helper is exactly the shape that
+# reintroduces this bug the next time a sender needs an integration, so it is
+# gone rather than merely unused.
 
 
 def _decrypt_tokens_inplace(integration: Integration) -> None:
@@ -147,12 +165,25 @@ async def calendar_sender(payload: dict[str, Any]) -> str:
       * time_zone                   — IANA (default UTC)
       * conference                  — bool (attach Google Meet link)
       * send_google_invite          — bool (send native Google email to attendees)
+
+    EXACTLY-ONCE on the Google side: the event id is derived from the
+    ExecutionRequest id (see `_google_event_id`), so a replay returns 409 and we
+    report the pre-existing event rather than creating a duplicate.
     """
     org_id = _org_id_from_payload(payload)
+    event_id = _google_event_id(_execution_id_from_payload(payload))
     async with session_scope() as db:
-        integration = await _resolve_integration(
-            db, org_id, IntegrationProvider.GOOGLE_CALENDAR
+        # Shared resolver: finds the org's Calendar grant, materialises the
+        # per-provider row when a sibling Google grant already carries the
+        # scope, and fails loud BEFORE any Google call when the grant is
+        # read-only. That last case is the v1→v2 scope migration path: legacy
+        # grants keep read features working (freebusy, listing) but writing
+        # requires reconsent. The Celery worker maps the raise to FAILED +
+        # dead-letter; the audit message says exactly what the user must do.
+        integration = await resolve_calendar_integration(
+            db, org_id, require_write=True
         )
+        await db.commit()  # persist any self-heal before decrypting in place
         _decrypt_tokens_inplace(integration)
         token_manager = TokenManager(integration)
         transport = GoogleTransport(
@@ -161,19 +192,35 @@ async def calendar_sender(payload: dict[str, Any]) -> str:
         )
         try:
             client = CalendarClient(transport)
-            event = await client.create_event(
-                summary=payload["title"],
-                start_iso=payload["start"],
-                end_iso=_iso_end(payload),
-                attendees=payload.get("attendees") or None,
-                description=payload.get("description"),
-                location=payload.get("location"),
-                time_zone=payload.get("time_zone") or "UTC",
-                send_updates=(
-                    "all" if payload.get("send_google_invite", True) else "none"
-                ),
-                conference=bool(payload.get("conference", False)),
-            )
+            try:
+                event = await client.create_event(
+                    summary=payload["title"],
+                    start_iso=payload["start"],
+                    end_iso=_iso_end(payload),
+                    attendees=payload.get("attendees") or None,
+                    description=payload.get("description"),
+                    location=payload.get("location"),
+                    time_zone=payload.get("time_zone") or "UTC",
+                    send_updates=(
+                        "all" if payload.get("send_google_invite", True) else "none"
+                    ),
+                    conference=bool(payload.get("conference", False)),
+                    event_id=event_id,
+                )
+            except GoogleAPIError as exc:
+                if not exc.is_conflict:
+                    raise
+                # 409 — this exact ExecutionRequest already produced an event on
+                # this calendar. The desired end state HOLDS, so this is a
+                # success, not a failure. Confirm the event is really there
+                # (rather than trusting the status code) and return its id, so
+                # the audit row still carries a real provider reference.
+                logger.info(
+                    "calendar create replayed (409) execution_event_id=%s org=%s",
+                    event_id,
+                    org_id,
+                )
+                event = await client.get_event(event_id)
         except GoogleAPIError as exc:
             # Auth errors are non-retryable at the sender level — surface
             # a clear message so the DLQ + audit both explain "needs
@@ -187,13 +234,125 @@ async def calendar_sender(payload: dict[str, Any]) -> str:
             await _persist_refreshed_token(db, integration, token_manager)
             await transport.aclose()
 
-    event_id = str(event.get("id") or "")
-    if not event_id:
+    created_id = str(event.get("id") or "")
+    if not created_id:
         raise RuntimeError("calendar create_event returned no event id")
+    return created_id
+
+
+# ── Calendar reschedule / cancel senders ───────────────────────────────────
+
+
+async def _open_calendar(db, org_id: UUID) -> tuple[CalendarClient, Any, Integration]:
+    """Resolve + decrypt the org's Calendar integration and build a client.
+
+    Shared by the reschedule / cancel senders so the token lifecycle (decrypt,
+    refresh, persist) lives in exactly one place per verb.
+    """
+    integration = await resolve_calendar_integration(db, org_id, require_write=True)
+    await db.commit()  # persist any self-heal before decrypting in place
+    _decrypt_tokens_inplace(integration)
+    token_manager = TokenManager(integration)
+    transport = GoogleTransport(
+        token_manager.token_provider(), on_auth_failure=token_manager.invalidate
+    )
+    return CalendarClient(transport), (transport, token_manager), integration
+
+
+async def calendar_reschedule_sender(payload: dict[str, Any]) -> str:
+    """Move an EXISTING event to a new time.
+
+    Payload contract (see `RescheduleMeetingProvider.validate`):
+      * event_id (required)  — the Google event id being moved
+      * start (required)     — new ISO 8601 start
+      * end / duration_minutes
+      * time_zone            — IANA (default UTC)
+
+    PATCH is naturally idempotent: replaying the same new start/end converges on
+    the same event, so a worker retry can never produce a second meeting.
+    """
+    org_id = _org_id_from_payload(payload)
+    event_id = str(payload.get("event_id") or "").strip()
+    if not event_id:
+        raise RuntimeError("reschedule_meeting payload missing 'event_id'")
+    async with session_scope() as db:
+        client, (transport, token_manager), integration = await _open_calendar(db, org_id)
+        try:
+            event = await client.patch_event(
+                event_id,
+                start_iso=payload["start"],
+                end_iso=_iso_end(payload),
+                time_zone=payload.get("time_zone") or "UTC",
+                send_updates=(
+                    "all" if payload.get("send_google_invite", True) else "none"
+                ),
+            )
+        except GoogleAPIError as exc:
+            if exc.is_auth_error:
+                raise RuntimeError(
+                    "Google Calendar rejected the request; reconnect required"
+                ) from exc
+            if exc.is_not_found or exc.is_gone:
+                raise RuntimeError(
+                    f"calendar event {event_id} no longer exists; nothing to reschedule"
+                ) from exc
+            raise
+        finally:
+            await _persist_refreshed_token(db, integration, token_manager)
+            await transport.aclose()
+    return str(event.get("id") or event_id)
+
+
+async def calendar_cancel_sender(payload: dict[str, Any]) -> str:
+    """Cancel an EXISTING event.
+
+    Payload contract (see `CancelMeetingProvider.validate`):
+      * event_id (required) — the Google event id being cancelled
+
+    Idempotent by construction: `CalendarClient.delete_event` swallows 404/410
+    because "already gone" IS the requested end state.
+    """
+    org_id = _org_id_from_payload(payload)
+    event_id = str(payload.get("event_id") or "").strip()
+    if not event_id:
+        raise RuntimeError("cancel_meeting payload missing 'event_id'")
+    async with session_scope() as db:
+        client, (transport, token_manager), integration = await _open_calendar(db, org_id)
+        try:
+            await client.delete_event(
+                event_id,
+                send_updates=(
+                    "all" if payload.get("send_google_invite", True) else "none"
+                ),
+            )
+        except GoogleAPIError as exc:
+            if exc.is_auth_error:
+                raise RuntimeError(
+                    "Google Calendar rejected the request; reconnect required"
+                ) from exc
+            raise
+        finally:
+            await _persist_refreshed_token(db, integration, token_manager)
+            await transport.aclose()
     return event_id
 
 
 # ── Gmail sender ───────────────────────────────────────────────────────────
+
+
+def navis_message_id(execution_id: UUID) -> str:
+    """Deterministic RFC 2822 Message-ID for one ExecutionRequest.
+
+    THE DUPLICATE-SEND GUARD. Gmail's `messages.send` has no client-side
+    idempotency key — unlike Calendar's `events.insert`, which accepts a
+    client-generated event id and 409s on replay. So the strongest available
+    guard is to stamp our OWN Message-ID and, before every send, ask Gmail whether a
+    message with that id already exists (`rfc822msgid:` search).
+
+    Same execution => same Message-ID => a replay finds the earlier send instead
+    of making a second one. See `_already_sent` for the honest limits.
+    """
+    return f"<navis-{execution_id.hex}@navis.local>"
 
 
 def _encode_reply_message(
@@ -203,17 +362,55 @@ def _encode_reply_message(
     subject: str,
     body: str,
     in_reply_to_message_id: str | None = None,
+    message_id: str | None = None,
+    references: str | None = None,
 ) -> str:
     """Build an RFC 2822 message, base64url-encoded for Gmail messages.send."""
     msg = EmailMessage()
     msg["From"] = from_email
     msg["To"] = ", ".join(to_emails)
     msg["Subject"] = subject
+    if message_id:
+        msg["Message-ID"] = message_id
     if in_reply_to_message_id:
         msg["In-Reply-To"] = in_reply_to_message_id
-        msg["References"] = in_reply_to_message_id
+        # References carries the whole ancestry when we have it, so mail clients
+        # thread the reply under the original rather than starting a sibling.
+        msg["References"] = references or in_reply_to_message_id
     msg.set_content(body)
     return base64.urlsafe_b64encode(msg.as_bytes()).rstrip(b"=").decode("ascii")
+
+
+async def _already_sent(client: GmailClient, message_id: str) -> str | None:
+    """The Gmail id of a previous send of this exact execution, if any.
+
+    HONEST LIMITS — this narrows the duplicate window, it does not close it:
+
+      * Gmail indexes a sent message for search within moments, but that is not
+        a documented synchronous guarantee. A retry inside that window can still
+        double-send.
+      * A search failure returns None (we proceed to send) rather than blocking
+        a legitimate send on a transient error. Failing open is the right trade
+        for a founder's outbound mail; failing closed would strand real replies.
+
+    So Gmail remains AT-LEAST-ONCE. Calendar is exactly-once because Google
+    supports it there; claiming parity for Gmail would be a lie.
+    """
+    try:
+        found = await client.list_messages(query=f"rfc822msgid:{message_id.strip('<>')}")
+    except Exception:  # noqa: BLE001 — see docstring: fail open, do not strand mail
+        logger.warning("gmail duplicate pre-check failed for %s; sending anyway", message_id)
+        return None
+    items = found.get("messages") or []
+    if not items:
+        return None
+    existing = str(items[0].get("id") or "") or None
+    if existing:
+        logger.warning(
+            "gmail send SKIPPED: %s was already sent as message %s", message_id, existing
+        )
+        metrics.incr("gmail.send.duplicate_prevented")
+    return existing
 
 
 def _normalise_recipients(raw: Any) -> list[str]:
@@ -235,14 +432,27 @@ async def gmail_sender(payload: dict[str, Any]) -> str:
       * in_reply_to_message_id — RFC 2822 Message-ID of the source message
     """
     org_id = _org_id_from_payload(payload)
+    execution_id = _execution_id_from_payload(payload)
     recipients = _normalise_recipients(payload.get("to"))
     if not recipients:
         raise RuntimeError("gmail send: no recipients after normalisation")
+    # Final gate before a real send. The provider validates too; this is the
+    # last line, and it runs against the payload that will actually be encoded.
+    if not str(payload.get("body") or "").strip():
+        raise RuntimeError("gmail send: refusing to send an empty body")
+    our_message_id = navis_message_id(execution_id)
 
     async with session_scope() as db:
-        integration = await _resolve_integration(
-            db, org_id, IntegrationProvider.GMAIL
-        )
+        # Capability-aware resolution, mirroring calendar_sender's use of
+        # resolve_calendar_integration. This must NOT be the generic
+        # newest-row-wins `_resolve_integration`: on a workspace with two
+        # connected Google accounts that picks the most recent grant and then
+        # discovers it cannot send, while a send-capable grant sits one row
+        # down. The resolver filters on capability FIRST and raises the same
+        # actionable message when nothing can send — so an org still connected
+        # under the pre-v4 read-only grant gets one clear failure instead of an
+        # opaque 403 from inside a worker retry.
+        integration = await resolve_gmail_send_integration(db, org_id)
         _decrypt_tokens_inplace(integration)
         token_manager = TokenManager(integration)
         transport = GoogleTransport(
@@ -255,14 +465,21 @@ async def gmail_sender(payload: dict[str, Any]) -> str:
                 raise RuntimeError(
                     "gmail integration missing external_account; reconnect required"
                 )
+            client = GmailClient(transport)
+            # Has this exact execution already been sent? A retry after a
+            # timeout that actually delivered would otherwise send twice.
+            already = await _already_sent(client, our_message_id)
+            if already:
+                return already
             raw = _encode_reply_message(
                 from_email=from_email,
                 to_emails=recipients,
                 subject=str(payload.get("subject") or ""),
                 body=str(payload.get("body") or ""),
                 in_reply_to_message_id=payload.get("in_reply_to_message_id"),
+                message_id=our_message_id,
+                references=payload.get("references"),
             )
-            client = GmailClient(transport)
             sent = await client.send_message(
                 raw_rfc822_base64url=raw,
                 thread_id=payload.get("reply_thread_id"),

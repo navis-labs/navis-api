@@ -1,0 +1,41 @@
+# Local development database.
+#
+# Deliberately SEPARATE from docker-compose.yml (the production manifest, which
+# expects a managed Postgres such as Neon) and deliberately NOT named
+# `docker-compose.override.yml`, because that name is auto-merged — a plain
+# `docker compose up` in production would silently pick up a throwaway database.
+# This one only applies when you ask for it:
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#
+# Then point DATABASE_URL at it and run `alembic upgrade head`.
+#
+# The data here is disposable. It starts EMPTY — signals, memory, embeddings and
+# importance scores all live in whichever database produced them, and do not
+# travel with a connection-string change.
+
+services:
+  postgres:
+    # Matches the Neon major version (18.x) so migrations and SQL behave the same.
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: navis
+      POSTGRES_PASSWORD: navis
+      POSTGRES_DB: navis
+    ports:
+      - "5432:5432"
+    volumes:
+      # PG 18+ expects the mount at /var/lib/postgresql (NOT /data): the image
+      # places the cluster in a major-version subdirectory so `pg_upgrade --link`
+      # can work across a single mount point. Mounting /data makes 18 refuse to
+      # start. See docker-library/postgres#1259.
+      - navis-pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U navis -d navis"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  navis-pgdata:

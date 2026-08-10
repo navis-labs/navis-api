@@ -24,6 +24,7 @@ class FakeExecutionRepo:
     def __init__(self) -> None:
         self.rows: dict[uuid.UUID, SimpleNamespace] = {}
         self.by_idem: dict[tuple, uuid.UUID] = {}
+        self.by_obligation: dict[tuple, uuid.UUID] = {}
         self.events: list[SimpleNamespace] = []
         self.dead_letters: list[SimpleNamespace] = []
         self.inbox: set[tuple] = set()
@@ -32,13 +33,29 @@ class FakeExecutionRepo:
         idem = (values["organization_id"], values["idempotency_key"])
         if idem in self.by_idem:
             return self.rows[self.by_idem[idem]], False
+        # Mirrors the partial unique index uq_execution_obligation: one row per
+        # (org, obligation_key) wherever an obligation identity exists. Without
+        # this the fake would happily create the duplicate reply the real
+        # database refuses, and unit tests would disagree with production.
+        obl = values.get("obligation_key")
+        if obl:
+            key = (values["organization_id"], obl)
+            if key in self.by_obligation:
+                return self.rows[self.by_obligation[key]], False
         defaults = dict(
             created_at=_now(), updated_at=_now(), approved_at=None, approved_by=None,
             executed_at=None, last_error=None,
+            # Mirrors the column default: an unlabelled row is chat-origin, so
+            # it stays out of the proactive Action Center queue.
+            origin="chat",
         )
         row = SimpleNamespace(**{**defaults, **values})
         self.rows[values["id"]] = row
         self.by_idem[idem] = values["id"]
+        if values.get("obligation_key"):
+            self.by_obligation[(values["organization_id"], values["obligation_key"])] = (
+                values["id"]
+            )
         return row, True
 
     async def get(self, execution_id):

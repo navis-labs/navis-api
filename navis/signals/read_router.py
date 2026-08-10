@@ -295,7 +295,22 @@ def _latest_per_external_id_stmt(*, org_id: uuid.UUID, source: SignalSource):
     are version-aware (etag / Drive `version`), so every edit creates a new
     signal_events row for the same external_id. The frontend list wants one
     entry per meeting / file — the latest one — so we collapse versions here
-    rather than pushing that logic onto every consumer."""
+    rather than pushing that logic onto every consumer.
+
+    "Latest" is INGESTION order (`created_at`), not `occurred_at`. That
+    distinction is load-bearing: for a calendar signal `occurred_at` is the
+    MEETING'S START TIME (see CalendarConnector._to_event), not when we learned
+    about it. Cancelling a meeting three weeks out writes a cancellation row
+    stamped `now`, which is EARLIER than the original row's start — so ordering
+    by occurred_at picked the stale CREATED row, and the caller's
+    `event_type != CALENDAR_EVENT_CANCELLED` filter then had nothing to catch.
+    The cancelled meeting stayed on the dashboard permanently, even after a
+    full sync. Rescheduling a meeting to an earlier slot had the same failure.
+
+    `id` breaks ties: signal ids are deterministic UUIDv5, so two rows written
+    in the same transaction still collapse to a stable, replay-identical pick
+    instead of whichever the planner happened to emit first.
+    """
     return (
         select(SignalEventRecord)
         .where(
@@ -305,7 +320,8 @@ def _latest_per_external_id_stmt(*, org_id: uuid.UUID, source: SignalSource):
         .distinct(SignalEventRecord.external_id)
         .order_by(
             SignalEventRecord.external_id,
-            SignalEventRecord.occurred_at.desc(),
+            SignalEventRecord.created_at.desc(),
+            SignalEventRecord.id.desc(),
         )
     ).subquery()
 

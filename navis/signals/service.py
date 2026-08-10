@@ -20,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from navis.platform.events import EventType
 from navis.platform.monitoring import get_logger
 from navis.signals.base import SignalEvent, SignalEventType
+from navis.signals.importance import score_payload
+from navis.signals.models import compute_importance_id
 from navis.signals.repository import SignalRepository
 
 logger = get_logger("signals")
@@ -67,7 +69,8 @@ class SignalIngestionService:
             logger.debug("duplicate signal %s skipped", event.dedupe_key)
             return False
         await self.repo.append_outbox([self._outbox_row(event)])
-        await self.db.commit()  # signal row + outbox pointer commit atomically
+        await self.repo.append_importance([self._importance_row(event)])
+        await self.db.commit()  # signal row + outbox pointer + score commit atomically
         logger.info(
             "ingested %s/%s ext=%s v=%s org=%s",
             event.source.value, event.event_type.value, event.external_id,
@@ -92,11 +95,34 @@ class SignalIngestionService:
             for e in events:
                 by_id.setdefault(e.event_id, e)
             await self.repo.append_outbox([self._outbox_row(by_id[eid]) for eid in inserted_ids])
+            await self.repo.append_importance(
+                [self._importance_row(by_id[eid]) for eid in inserted_ids]
+            )
         except Exception:
             await self.db.rollback()  # clear the aborted txn so the caller can fall back
             raise
         await self.db.commit()  # signals + outbox pointers commit atomically
         return len(inserted_ids), len(events) - len(inserted_ids)
+
+    def _importance_row(self, event: SignalEvent) -> dict[str, Any]:
+        """Score the signal once, at ingestion, in the same transaction as the log.
+
+        The connector seals body fields before handing the event over, so the
+        payload is decrypted here first — otherwise every content-derived class
+        would silently miss and everything would collapse to a header-only score.
+        Scoring never raises (see `score_signal`), so a scoring change can never
+        block ingestion.
+        """
+        importance = score_payload(event.source, event.payload)
+        return {
+            "id": compute_importance_id(event.event_id, importance.version),
+            "organization_id": event.org_id,
+            "signal_event_id": event.event_id,
+            "version": importance.version,
+            "score": importance.score,
+            "classification": importance.classification,
+            "features": importance.features,
+        }
 
     def _outbox_row(self, event: SignalEvent) -> dict[str, Any]:
         return {

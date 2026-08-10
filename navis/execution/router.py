@@ -9,11 +9,19 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from navis.execution.models import ActionType, ExecutionRequest
+from navis.execution.config import MAX_EXECUTION_ATTEMPTS
+from navis.execution.drafts import (
+    DraftNotApprovable,
+    DraftNotFound,
+    DraftService,
+    InsufficientContext,
+)
+from navis.execution.models import ActionType, ExecutionOrigin, ExecutionRequest
+from navis.execution.providers.reply import NEEDS_DRAFT_MESSAGE, requires_draft
 from navis.execution.service import ExecutionNotFound, ExecutionService
 from navis.execution.status import ExecutionStatus, InvalidTransition
 from navis.identity.authz import Principal, require_permission
@@ -49,6 +57,16 @@ def _serialize(r: ExecutionRequest) -> dict[str, Any]:
         "state_watermark": r.state_watermark,
         "provider_reference": r.provider_reference,
         "attempts": r.attempts,
+        # The card renders a real failure reason instead of guessing at one.
+        # Truncated because `last_error` can carry a full provider traceback.
+        "last_error": (r.last_error or None) and r.last_error[:500],
+        "origin": r.origin,
+        # True while the action is a placeholder Navis proposed but has not
+        # written yet. The card renders "needs a draft" instead of Approve,
+        # and `approve` refuses it — see providers/reply.py.
+        "requires_draft": requires_draft(r.payload)
+        if r.action_type == ActionType.REPLY_TO_EMAIL.value
+        else False,
     }
 
 
@@ -57,6 +75,35 @@ def _enqueue_execution() -> None:
         celery_app.send_task("navis.execution.worker.execute_approved_actions")
     except Exception:  # broker may be down in dev; the beat schedule still picks it up
         pass
+
+
+async def _run_inline_execution_pass() -> None:
+    """Run one execution pass in the FastAPI process (no Celery needed).
+
+    Guarded by `settings.execution_inline_fallback` — always True in dev,
+    should be False in production when a real Celery worker is running.
+    Fires as `asyncio.create_task` from the approve handler so it does
+    NOT block the HTTP response; the frontend picks up state via the
+    poll loop.
+
+    Claims are FOR UPDATE SKIP LOCKED so this races safely with a real
+    Celery worker if both are running — whoever gets the row wins,
+    the other pass is a no-op.
+    """
+    # Lazy import to avoid touching the worker module at HTTP-router
+    # import time (worker.py has module-level Celery @task decorators
+    # that register with celery_app; safe but keeps the router lean).
+    from navis.execution.worker import _execute
+
+    try:
+        await _execute()
+    except Exception:  # noqa: BLE001 — inline path must never crash the process
+        from navis.platform.monitoring import get_logger
+
+        get_logger("execution.inline").exception(
+            "inline execution pass failed (row stays APPROVED; "
+            "Celery beat will retry)"
+        )
 
 
 async def _require_org(db: AsyncSession, eid: uuid.UUID, org_id: uuid.UUID) -> ExecutionRequest:
@@ -86,17 +133,47 @@ async def list_pending(
     ctx: CurrentContext = Depends(get_current_context),
     db: AsyncSession = Depends(get_session),
 ) -> list[dict[str, Any]]:
+    """The Action Center's queue: PROACTIVE actions awaiting review.
+
+    Origin-filtered on purpose. Chat-originated proposals are reviewed in the
+    conversation that produced them — the founder is already looking at the
+    card. Returning them here too put one row on two surfaces, each able to
+    approve it, and filled the "things Navis noticed" queue with things the
+    founder had just typed.
+
+    Chat does not need this endpoint: it holds the execution_id it created and
+    polls `GET /actions/{id}` directly.
+    """
     rows = (
         await db.scalars(
             select(ExecutionRequest)
             .where(
                 ExecutionRequest.organization_id == ctx.org_id,
                 ExecutionRequest.status == ExecutionStatus.REQUESTED.value,
+                ExecutionRequest.origin == ExecutionOrigin.PROACTIVE.value,
             )
             .order_by(ExecutionRequest.created_at.desc())
         )
     ).all()
     return [_serialize(r) for r in rows]
+
+
+@router.get("/{execution_id}")
+async def get_execution(
+    execution_id: uuid.UUID,
+    p: Principal = Depends(require_permission(Permission.EXECUTE_ACTIONS)),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Fetch a single execution row by id — used by the AskConsole
+    MeetingProposalCard to poll status transitions after approval
+    (REQUESTED → APPROVED → EXECUTING → EXECUTED | FAILED).
+
+    Org-scoped: the row is returned only if it belongs to the
+    authenticated principal's org (404 otherwise). Never exposes
+    another tenant's audit record.
+    """
+    req = await _require_org(db, execution_id, p.org_id)
+    return _serialize(req)
 
 
 @router.post("/{execution_id}/approve", dependencies=[Depends(require_capability(Capability.EXECUTION))])
@@ -105,14 +182,108 @@ async def approve(
     p: Principal = Depends(require_permission(Permission.EXECUTE_ACTIONS)),
     db: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    await _require_org(db, execution_id, p.org_id)
+    row = await _require_org(db, execution_id, p.org_id)
+    # A proactive reply Navis has proposed but not yet WRITTEN cannot be
+    # approved — there is nothing to send. The provider also refuses it
+    # (providers/reply.py), which is the hard guarantee; this check exists so
+    # the user gets an honest 409 instead of an approval that silently
+    # dead-letters seconds later.
+    if row.action_type == ActionType.REPLY_TO_EMAIL.value and requires_draft(row.payload):
+        # A proactive reply is approved through the DRAFT, which is the only
+        # thing a human can actually have reviewed. `DraftService.approve`
+        # re-checks staleness at this instant and merges the reviewed text into
+        # the payload — which is what clears `requires_draft` and lets the
+        # execution proceed.
+        # Scope pre-flight BEFORE freezing the draft. Without it the founder
+        # reviews, edits, approves — and the send dead-letters minutes later on
+        # a 403 they had no way to anticipate. Refusing here costs one click and
+        # tells them exactly what to do.
+        if not await _gmail_send_ready(db, p.org_id):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Navis can read your Gmail but is not yet allowed to send from "
+                "it. Reconnect Google Workspace to grant send access, then "
+                "approve this draft again.",
+            )
+        try:
+            await DraftService(db).approve(row, approver_id=p.subject_id)
+        except DraftNotFound:
+            raise HTTPException(status.HTTP_409_CONFLICT, NEEDS_DRAFT_MESSAGE)
+        except DraftNotApprovable as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+        if requires_draft(row.payload):  # belt and braces
+            raise HTTPException(status.HTTP_409_CONFLICT, NEEDS_DRAFT_MESSAGE)
+    # Snapshot BEFORE the service mutates the identity-mapped row. Only a real
+    # REQUESTED -> APPROVED transition creates new work; a repeat approve on an
+    # already APPROVED/EXECUTING/EXECUTED row is a no-op read (see
+    # ExecutionService._APPROVE_IDEMPOTENT_FROM) and must not enqueue a worker
+    # pass. Without this guard every stray double-click queued a Celery task
+    # plus an inline pass that could only ever find nothing to claim.
+    was_pending = row.status == ExecutionStatus.REQUESTED.value
     try:
         req = await ExecutionService(db).approve(execution_id, p.subject_id)
     except InvalidTransition as exc:
+        # Reachable only from REJECTED / CANCELLED — approving something a human
+        # explicitly declined is a genuine conflict and stays a 409.
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     except ExecutionNotFound:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
-    _enqueue_execution()  # side effect runs out-of-band in the worker
+    if was_pending:
+        _enqueue_execution()  # side effect runs out-of-band in the worker
+        # Dev-mode inline fallback: fire an in-process execution pass so
+        # meetings actually get created on Google even without a running
+        # Celery worker. The task runs AFTER we return (asyncio.create_task
+        # does not block the response), so the poll loop on the frontend
+        # will catch REQUESTED → APPROVED → EXECUTING → EXECUTED as the
+        # pass advances the row. Safe to run alongside a real worker —
+        # both use FOR UPDATE SKIP LOCKED to race for the row.
+        from navis.platform.config import settings as _settings
+
+        if _settings.execution_inline_fallback:
+            import asyncio
+
+            asyncio.create_task(_run_inline_execution_pass())
+    return _serialize(req)
+
+
+@router.post("/{execution_id}/retry", dependencies=[Depends(require_capability(Capability.EXECUTION))])
+async def retry(
+    execution_id: uuid.UUID,
+    p: Principal = Depends(require_permission(Permission.EXECUTE_ACTIONS)),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Re-drive a FAILED execution.
+
+    A FAILED row with attempts remaining is ALREADY re-claimable by the worker
+    (`repository.claim_executable`) — but only on the next scheduled pass. The
+    card's Retry button needs something to happen now, and `approve` cannot
+    serve: FAILED -> APPROVED is not an edge in the status machine, so calling
+    it 409s. Rather than widen the state machine (which would let a rejected
+    row be resurrected), this endpoint changes NO state and just asks the
+    worker to look again.
+
+    Idempotent and safe to spam: the claim is FOR UPDATE SKIP LOCKED, and a row
+    that has exhausted its attempts is left alone with a clear 409.
+    """
+    req = await _require_org(db, execution_id, p.org_id)
+    if req.status != ExecutionStatus.FAILED.value:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"only failed executions can be retried (this one is {req.status})",
+        )
+    if (req.attempts or 0) >= MAX_EXECUTION_ATTEMPTS:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"execution exhausted its {MAX_EXECUTION_ATTEMPTS} attempts; "
+            "it is in the dead-letter queue and needs an operator replay",
+        )
+    _enqueue_execution()
+    from navis.platform.config import settings as _settings
+
+    if _settings.execution_inline_fallback:
+        import asyncio
+
+        asyncio.create_task(_run_inline_execution_pass())
     return _serialize(req)
 
 
@@ -142,3 +313,178 @@ async def cancel(
     except InvalidTransition as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     return _serialize(req)
+
+
+# ── Draft surface (Phase 2B) ───────────────────────────────────────────
+#
+# The document a human reviews before a proactive email is sent. Deliberately
+# separate endpoints from the execution lifecycle: editing a draft is not an
+# execution state transition, and the ExecutionRequest identity must survive any
+# number of edits (see execution/drafts/models.py).
+
+
+class DraftEditBody(BaseModel):
+    """Partial edit — only the fields present are changed."""
+
+    subject: str | None = Field(None, max_length=500)
+    body: str | None = Field(None, max_length=20_000)
+    recipients: list[str] | None = Field(None, max_length=20)
+
+
+async def _sender_name(db: AsyncSession, org_id: uuid.UUID) -> str | None:
+    """The founder's display name for the sign-off, or None.
+
+    None is a real answer, not a failure: the draft then ends with a bare
+    "Best," rather than an invented name. Never guessed from an email address.
+
+    Resolved through the SAME capability-aware resolver the sender uses, so the
+    sign-off names the account the mail will actually go out from. Picking the
+    newest Gmail row instead (as this did) signs a multi-account workspace's
+    draft with one person's name and sends it from another's address.
+
+    The read-only fallback is deliberate: an org that has not granted
+    gmail.send must still be able to GENERATE and review drafts — the approve
+    gate is what stops it, and stopping it here would mean losing the sign-off
+    name for every org that has not reconsented yet.
+    """
+    from navis.identity.models import Integration, IntegrationProvider, User
+    from navis.signals.google.resolve import (
+        GmailNotConnected,
+        GmailSendScopeInsufficient,
+        resolve_gmail_send_integration,
+    )
+
+    try:
+        row = await resolve_gmail_send_integration(db, org_id)
+    except (GmailNotConnected, GmailSendScopeInsufficient):
+        row = await db.scalar(
+            select(Integration)
+            .where(
+                Integration.organization_id == org_id,
+                Integration.provider == IntegrationProvider.GMAIL,
+                Integration.is_active.is_(True),
+            )
+            .order_by(Integration.created_at.desc())
+        )
+    if row is None or row.user_id is None:
+        return None
+    user = await db.get(User, row.user_id)
+    name = (getattr(user, "full_name", None) or "").strip() if user else ""
+    return name or None
+
+
+async def _gmail_send_ready(db: AsyncSession, org_id: uuid.UUID) -> bool:
+    """Does this org's Gmail grant actually permit sending?
+
+    Orgs connected before the v4 scope set hold `gmail.readonly` only. Every
+    read feature keeps working; only the proactive send needs reconsent.
+
+    Asks the SAME resolver the sender will use. This previously ran its own
+    newest-row-wins query, which meant the gate and the sender could disagree on
+    a multi-account workspace — and worse, agree wrongly: both looked at a newly
+    connected read-only grant and ignored an older one that could send. Sharing
+    the resolver makes "will approve let this through?" and "can the worker
+    actually send it?" the same question by construction.
+    """
+    from navis.signals.google.resolve import (
+        GmailNotConnected,
+        GmailSendScopeInsufficient,
+        resolve_gmail_send_integration,
+    )
+
+    try:
+        await resolve_gmail_send_integration(db, org_id)
+    except (GmailNotConnected, GmailSendScopeInsufficient):
+        return False
+    return True
+
+
+def _draft_response(req: ExecutionRequest, draft) -> dict[str, Any]:
+    return {"action": _serialize(req), "draft": draft.to_dict()}
+
+
+@router.get("/{execution_id}/draft", dependencies=[Depends(require_capability(Capability.EXECUTION))])
+async def get_draft(
+    execution_id: uuid.UUID,
+    p: Principal = Depends(require_permission(Permission.EXECUTE_ACTIONS)),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """The draft for a proactive action, generating one on first open.
+
+    Lazy generation means a candidate the founder never looks at costs nothing,
+    and a draft is always written against the freshest thread Navis has. The
+    read also re-checks staleness, so opening a card that the world has moved
+    past shows the warning immediately rather than at approve time.
+    """
+    req = await _require_org(db, execution_id, p.org_id)
+    try:
+        draft = await DraftService(db).get_or_generate(
+            req, sender_name=await _sender_name(db, p.org_id)
+        )
+    except InsufficientContext as exc:
+        # Item 11: when there is not enough grounded material, Navis asks
+        # rather than producing a confident email.
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+    await db.commit()
+    return _draft_response(req, draft)
+
+
+@router.put("/{execution_id}/draft", dependencies=[Depends(require_capability(Capability.EXECUTION))])
+async def edit_draft(
+    execution_id: uuid.UUID,
+    body: DraftEditBody,
+    p: Principal = Depends(require_permission(Permission.EXECUTE_ACTIONS)),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Save the founder's edits.
+
+    Updates a document. It does NOT create a second ExecutionRequest, does not
+    recompute the idempotency key, and does not touch the execution row — the
+    action keeps its identity, lineage and board position across any number of
+    edits.
+    """
+    req = await _require_org(db, execution_id, p.org_id)
+    try:
+        draft = await DraftService(db).edit(
+            req,
+            subject=body.subject,
+            body=body.body,
+            recipients=body.recipients,
+            editor_id=p.subject_id,
+        )
+    except DraftNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no draft for this action yet")
+    except DraftNotApprovable as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    await db.commit()
+    return _draft_response(req, draft)
+
+
+@router.post(
+    "/{execution_id}/draft/regenerate",
+    dependencies=[Depends(require_capability(Capability.EXECUTION))],
+)
+async def regenerate_draft(
+    execution_id: uuid.UUID,
+    force: bool = False,
+    p: Principal = Depends(require_permission(Permission.EXECUTE_ACTIONS)),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Rewrite the draft against the CURRENT thread.
+
+    The recovery path for a stale draft. `force` is required to overwrite a
+    draft the founder has edited — silently discarding their own words would be
+    the most infuriating thing this feature could do, so it takes an explicit
+    second ask.
+    """
+    req = await _require_org(db, execution_id, p.org_id)
+    try:
+        draft = await DraftService(db).generate(
+            req, sender_name=await _sender_name(db, p.org_id), force=force
+        )
+    except DraftNotApprovable as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    except InsufficientContext as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+    await db.commit()
+    return _draft_response(req, draft)

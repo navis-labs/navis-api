@@ -19,10 +19,19 @@ from tests.execution.fakes import DECISION, ORG_A, USER, FakeExecutionRepo
 FAST = ExecutionRetryPolicy(max_attempts=2, initial_backoff=0.0, max_backoff=0.0, jitter=0.0)
 
 
-async def _approved(repo, action="create_task", payload=None, decision=DECISION):
+async def _approved(repo, action="send_email", payload=None, decision=DECISION):
+    """Default action is send_email with a COMPLETE payload.
+
+    It used to be create_task, which was a convenient always-succeeds provider —
+    conveniently, because it succeeded at nothing: there is no task system, and
+    it now refuses every payload rather than reporting a task it never made.
+    These tests are about worker mechanics (rate limiting, telemetry, retries),
+    so they need an action that genuinely executes.
+    """
     svc = ExecutionService(repo=repo)
     req, _ = await svc.request(
-        ORG_A, decision, action, payload or {"title": "x"},
+        ORG_A, decision, action,
+        payload or {"to": "a@x.com", "subject": "x", "body": "a real body"},
         reasoning_signal_ids=["s1"], reasoning_version=1, state_watermark="w",
     )
     await svc.approve(req.id, USER)
@@ -72,7 +81,10 @@ async def test_recovery_ignores_fresh_executing():
 
 async def test_exhausted_attempts_dead_letters_then_replays():
     repo = FakeExecutionRepo()
-    _, req = await _approved(repo)
+    # AlwaysFailProvider declares action_type="create_task", so the row must
+    # match it. It supplies its own permissive `validate`, so the real (now
+    # unsupported) TasksProvider is not involved.
+    _, req = await _approved(repo, action="create_task", payload={"title": "x"})
     providers = {"create_task": AlwaysFailProvider()}
 
     res = await execute_pass(repo, providers=providers, policy=FAST, max_attempts=1)
@@ -101,11 +113,14 @@ async def test_rate_limiter_throttles_without_dropping():
     repo = FakeExecutionRepo()
     svc = ExecutionService(repo=repo)
     for i in range(2):
-        r, _ = await svc.request(ORG_A, uuid.uuid4(), "create_task", {"title": f"t{i}"},
-                                 reasoning_signal_ids=[], reasoning_version=1, state_watermark="w")
+        r, _ = await svc.request(
+            ORG_A, uuid.uuid4(), "send_email",
+            {"to": f"t{i}@x.com", "subject": f"t{i}", "body": "a real body"},
+            reasoning_signal_ids=[], reasoning_version=1, state_watermark="w",
+        )
         await svc.approve(r.id, USER)
 
-    limiter = InMemoryRateLimiter({"tasks": 1}, clock=lambda: 0)  # 1 per (fixed) window
+    limiter = InMemoryRateLimiter({"gmail": 1}, clock=lambda: 0)  # 1 per (fixed) window
     res = await execute_pass(repo, policy=FAST, rate_limiter=limiter, max_attempts=3)
     assert res["executed"] == 1 and res["skipped"] == 1  # one ran, one throttled (still APPROVED)
     approved_left = [r for r in repo.rows.values() if r.status == ExecutionStatus.APPROVED.value]
@@ -147,5 +162,30 @@ async def test_telemetry_records_provider_success():
     await _approved(repo)
     tel = ProviderTelemetry()
     await execute_pass(repo, policy=FAST, telemetry=tel, max_attempts=3)
-    assert tel.counters.get("tasks.calls") == 1
-    assert tel.success_rate("tasks") == 1.0
+    assert tel.counters.get("gmail.calls") == 1
+    assert tel.success_rate("gmail") == 1.0
+
+
+async def test_an_unroutable_row_fails_itself_without_killing_the_pass():
+    """A row whose action_type has no registered provider must fail alone.
+
+    APPROVED -> FAILED is not a legal transition, so failing straight from the
+    claimed state raised InvalidTransition out of `execute_pass` and took every
+    other claimed row down with it — one bad row stalling the whole queue.
+    """
+    repo = FakeExecutionRepo()
+    svc = ExecutionService(repo=repo)
+    orphan, _ = await svc.request(
+        ORG_A, uuid.uuid4(), "unknown_action_type", {"x": 1},
+        reasoning_signal_ids=[], reasoning_version=1, state_watermark="w",
+    )
+    await svc.approve(orphan.id, USER)
+    _, healthy = await _approved(repo, decision=uuid.uuid4())
+
+    res = await execute_pass(repo, policy=FAST, max_attempts=3)
+
+    assert res["failed"] == 1
+    assert res["executed"] == 1, "the healthy row must still run"
+    assert (await repo.get(orphan.id)).status == ExecutionStatus.FAILED.value
+    assert (await repo.get(healthy.id)).status == ExecutionStatus.EXECUTED.value
+    assert any(d.execution_id == orphan.id for d in repo.dead_letters)

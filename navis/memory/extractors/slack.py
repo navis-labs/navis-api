@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from navis.memory.envelope import EntityType
 from navis.memory.extractors.base import Extractor, MemoryDraft, SignalView
-from navis.memory.extractors.email import _COMMITMENT_RE, _DECISION_RE, _fact_key, _sentences
+from navis.memory.extractors.email import (
+    _fact_key,
+    _sentences,
+    is_commitment_sentence,
+    is_decision_sentence,
+)
 from navis.memory.schemas import current_version
 from navis.memory.confidence import HEURISTIC, HIGH, LOW, STRUCTURAL
 from navis.signals.base import SignalEventType, SignalSource
@@ -128,7 +133,7 @@ class SlackRelationshipExtractor(Extractor):
 
 class SlackCommitmentExtractor(Extractor):
     name = "slack_commitment"
-    version = "1.0.0"
+    version = "1.1.0"
     sources = _SLACK
 
     def extract(self, signal: SignalView) -> list[MemoryDraft]:
@@ -140,7 +145,7 @@ class SlackCommitmentExtractor(Extractor):
         ver = current_version(EntityType.COMMITMENT)
         drafts = []
         for idx, sentence in enumerate(_sentences(body)):
-            if 8 <= len(sentence) <= 400 and _COMMITMENT_RE.search(sentence):
+            if is_commitment_sentence(sentence):
                 drafts.append(MemoryDraft(
                     entity_type=EntityType.COMMITMENT,
                     entity_natural_key=f"{signal.external_id}:{_fact_key(sentence)}",
@@ -157,7 +162,7 @@ class SlackCommitmentExtractor(Extractor):
 
 class SlackDecisionExtractor(Extractor):
     name = "slack_decision"
-    version = "1.0.0"
+    version = "1.1.0"
     sources = _SLACK
 
     def extract(self, signal: SignalView) -> list[MemoryDraft]:
@@ -169,7 +174,7 @@ class SlackDecisionExtractor(Extractor):
         ver = current_version(EntityType.DECISION)
         drafts = []
         for idx, sentence in enumerate(_sentences(body)):
-            if 8 <= len(sentence) <= 400 and _DECISION_RE.search(sentence):
+            if is_decision_sentence(sentence):
                 drafts.append(MemoryDraft(
                     entity_type=EntityType.DECISION,
                     entity_natural_key=f"{signal.external_id}:{_fact_key(sentence)}",

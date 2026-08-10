@@ -13,6 +13,7 @@ from __future__ import annotations
 from time import monotonic
 
 from navis.execution.config import MAX_EXECUTION_ATTEMPTS
+from navis.execution.contract import ProviderReference, ProviderResult
 from navis.execution.dead_letter import ExecutionDeadLetterService
 from navis.execution.providers import get_provider
 from navis.execution.providers.base import ProviderValidationError
@@ -34,7 +35,12 @@ async def execute_pass(
     rate_limiter=None,
     max_attempts: int = MAX_EXECUTION_ATTEMPTS,
     telemetry=None,
+    reconciler=None,
 ) -> dict:
+    """`reconciler` is injected so tests can assert the read-model write-back
+    happened WITHOUT reaching Google. `None` means "resolve the production one
+    lazily" — importing it at module scope would drag the Signals stack into
+    every test that touches the worker."""
     svc = ExecutionService(repo=repo)
     dlq = ExecutionDeadLetterService(repo)
     tel = telemetry or provider_telemetry
@@ -45,9 +51,41 @@ async def execute_pass(
     for req in claimed:
         provider = get_provider(req.action_type, providers)
         if provider is None:
+            # APPROVED -> FAILED is NOT a legal edge (status.py), so failing
+            # straight from the claimed state raised InvalidTransition out of
+            # the pass — taking every OTHER claimed row down with it. Step
+            # through EXECUTING, which is the same path every other terminal
+            # outcome takes, so one unroutable row can only fail itself.
+            await svc.begin_execution(req)
             await svc.fail_execution(req, f"no provider for {req.action_type}")
             await dlq.record(req, provider=None, error="no provider")  # unrecoverable
             failed += 1
+            continue
+
+        # Already-executed guard. A claimed row can carry a provider reference
+        # when a PREVIOUS attempt reached the provider successfully but did not
+        # get to record EXECUTED — the stale-EXECUTING recovery path pushes such
+        # rows to FAILED, which makes them re-claimable here. Re-running the
+        # provider would create a SECOND calendar event / send a SECOND email.
+        # The reference is proof the side effect already happened, so close the
+        # row out instead of repeating it.
+        existing = _provider_reference_id(req)
+        if existing:
+            logger.warning(
+                "execution %s already has provider reference %s; completing "
+                "without re-calling %s", req.id, existing, provider.name,
+            )
+            await svc.begin_execution(req)
+            await svc.complete_execution(
+                req,
+                ProviderResult(
+                    ok=True,
+                    reference=ProviderReference(
+                        provider.name, existing, {"replayed": True}
+                    ),
+                ),
+            )
+            executed += 1
             continue
 
         # Rate-limit gate: leave APPROVED/FAILED for the next pass (no storm).
@@ -76,6 +114,19 @@ async def execute_pass(
             result = await execute_with_retry(provider, augmented, policy)
             tel.record(provider.name, ok=result.ok, retried=False, latency_s=monotonic() - t0)
             if result.ok:
+                # READ-AFTER-WRITE. Pull the mutated calendar event's CURRENT
+                # state into signal_events BEFORE the row reaches EXECUTED, so
+                # the transition carries a real guarantee:
+                #
+                #     status == EXECUTED => Navis's read model reflects the change.
+                #
+                # Without this, Execution wrote to Google and nothing told
+                # Navis — the dashboard card, the chat fallback and Memory all
+                # kept serving the cancelled meeting until an unrelated Celery
+                # sync happened to run. Non-fatal by design (see reconcile's
+                # docstring): a bookkeeping failure must never flip a
+                # genuinely-successful cancellation to FAILED.
+                await _reconcile_read_model(req, result, reconciler)
                 await svc.complete_execution(req, result)
                 logger.info("executed %s %s", req.id, request_durations(req))
                 executed += 1
@@ -97,6 +148,60 @@ async def execute_pass(
     if claimed:
         logger.info("execute_pass executed=%d failed=%d skipped=%d", executed, failed, skipped)
     return {"executed": executed, "failed": failed, "skipped": skipped}
+
+
+async def _reconcile_read_model(req, result, reconciler) -> None:
+    """Write the just-mutated calendar event back into Navis's read model.
+
+    Swallows everything: the side effect on Google already happened, and
+    failing the request here would both lie about that and re-drive the
+    provider on the next pass. The scheduled sync remains the backstop.
+    """
+    from navis.signals.calendar.reconcile import (
+        CALENDAR_MUTATION_ACTION_TYPES,
+        event_id_for,
+    )
+
+    if req.action_type not in CALENDAR_MUTATION_ACTION_TYPES:
+        return
+    if result.reference is not None and result.reference.extra.get("dry_run"):
+        # A dry-run provider changed nothing on Google, so there is nothing to
+        # read back. Reconciling would spend a session and a Google call to
+        # re-confirm a state we never altered.
+        return
+    external_id = event_id_for(
+        req.action_type,
+        req.payload or {},
+        result.reference.external_id if result.reference else None,
+    )
+    if not external_id:
+        logger.warning(
+            "execution %s (%s) produced no calendar event id; read model not "
+            "reconciled", req.id, req.action_type,
+        )
+        return
+    if reconciler is None:
+        from navis.signals.calendar.reconcile import reconcile_calendar_event
+
+        reconciler = reconcile_calendar_event
+    try:
+        await reconciler(req.organization_id, external_id)
+    except Exception:  # noqa: BLE001 — see docstring
+        logger.exception(
+            "read-model reconcile failed for execution %s event=%s "
+            "(side effect DID happen; sync will converge)", req.id, external_id,
+        )
+
+
+def _provider_reference_id(req) -> str | None:
+    """The external id a prior attempt recorded, if any. Dry-run references are
+    ignored: they represent no real side effect, so re-running is safe (and is
+    what local dev expects when a real sender is later wired in)."""
+    ref = getattr(req, "provider_reference", None)
+    if not isinstance(ref, dict) or ref.get("dry_run"):
+        return None
+    external_id = ref.get("external_id")
+    return str(external_id) if external_id else None
 
 
 async def _maybe_dlq(dlq, req, provider, error, max_attempts) -> None:

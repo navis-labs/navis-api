@@ -1,6 +1,6 @@
 """identity_aliases + identity_link_events + decision_dismissals
 
-Revision ID: 0029_identity_resolution_and_dismissals
+Revision ID: 0029_identity_res_dismissals
 Revises: 0028_mem_org_time_index
 Create Date: 2026-07-07
 
@@ -20,13 +20,13 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0029_identity_resolution_and_dismissals"
+revision: str = "0029_identity_res_dismissals"
 # Merges the two prior heads (0028_mem_org_time_index and
-# 0027_org_profile_onboarding_fields) so alembic advances to a single head
+# 0027_org_profile_onboarding) so alembic advances to a single head
 # after this revision. Additive only — no cross-branch schema conflicts.
 down_revision: Union[str, Sequence[str], None] = (
     "0028_mem_org_time_index",
-    "0027_org_profile_onboarding_fields",
+    "0027_org_profile_onboarding",
 )
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

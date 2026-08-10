@@ -87,9 +87,24 @@ class DecisionService:
         return await self.db.get(DailyBrief, brief_id)
 
     async def latest_brief(self, org_id: uuid.UUID) -> DailyBrief | None:
+        """The newest brief this org has, by the point in time it describes.
+
+        NULLS LAST is load-bearing, not a style choice. Postgres orders NULLs
+        FIRST under `DESC`, and a brief written before the org's first sync has
+        `as_of = NULL` with zero decisions — so a plain `desc(as_of)` returned
+        that empty row ahead of every real brief, permanently. The visible
+        symptom: `POST /brief/generate` produced the correct decisions, the
+        dashboard rendered them, and the next SWR revalidation of
+        `GET /brief/today` replaced them with an empty brief about a second
+        later. Every generated brief was unreadable through this method.
+
+        A NULL `as_of` means "we do not know what moment this describes", which
+        is strictly less useful than any dated brief — so it sorts last and is
+        returned only when nothing dated exists.
+        """
         return await self.db.scalar(
             select(DailyBrief)
             .where(DailyBrief.organization_id == org_id)
-            .order_by(desc(DailyBrief.as_of))
+            .order_by(desc(DailyBrief.as_of).nulls_last())
             .limit(1)
         )

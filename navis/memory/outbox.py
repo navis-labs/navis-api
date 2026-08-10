@@ -10,44 +10,85 @@ Wired as a Celery task (registered via navis.registry) + a beat schedule entry.
 """
 from __future__ import annotations
 
-import asyncio
+import time
 from typing import Any
 
+from navis.platform.composition import ensure_subscribers
 from navis.platform.events import DomainEvent, EventType, event_bus
 from navis.platform.monitoring import get_logger
 from navis.platform.monitoring.metrics import metrics
 
 logger = get_logger("memory.outbox")
 
+# See navis.signals.outbox for the rationale — same synchronous delivery, same
+# celery task time limits, same "a pass must never be hard-killed mid-flight".
+RELAY_TIME_BUDGET_SECONDS = 120.0
 
-async def relay_memory_pass(repo: Any, *, limit: int = 500) -> int:
-    """Publish persisted memory pointer events, then mark them published. Returns the count
-    published. The whole pass runs in one transaction (the caller's session_scope), so the
-    FOR-UPDATE-SKIP-LOCKED claim and the mark commit together."""
+
+async def relay_memory_pass(
+    repo: Any, *, limit: int = 500, time_budget: float = RELAY_TIME_BUDGET_SECONDS
+) -> int:
+    """Publish persisted memory pointer events, then mark the SUCCESSFULLY HANDLED
+    ones published. Returns the count published. The whole pass runs in one
+    transaction (the caller's session_scope), so the FOR-UPDATE-SKIP-LOCKED claim
+    and the mark commit together.
+
+    Same delivery contract as the signal relay: `published_at` means every
+    subscriber ran without raising. A failed downstream consumer (e.g. the
+    embedding subscriber) leaves the row unpublished for the next pass instead of
+    losing the pointer. Re-delivery is safe — consumers dedupe on memory_id.
+    """
+    ensure_subscribers()
     rows = await repo.pending_outbox(limit=limit)
     published_ids = []
-    for row in rows:
+    failed = 0
+    deadline = time.monotonic() + time_budget
+    stopped_early = 0
+    for index, row in enumerate(rows):
+        if time.monotonic() >= deadline:
+            stopped_early = len(rows) - index
+            break
         try:
-            await event_bus.publish(
-                DomainEvent(
-                    type=EventType(row.event_type),
-                    org_id=row.organization_id,
-                    source="memory",
-                    payload=row.payload,  # pointer + lineage; memory_id inside for dedupe
-                )
-            )
+            event_type = EventType(row.event_type)
         except ValueError:
             # Unknown event_type value — leave the row unpublished + loud; a code deploy
             # that removed an EventType shouldn't silently swallow the pointer.
+            failed += 1
             logger.exception(
                 "memory outbox skipped row=%s: unknown event_type=%s", row.id, row.event_type,
             )
             continue
-        published_ids.append(row.id)
+        delivery = await event_bus.publish(
+            DomainEvent(
+                type=event_type,
+                org_id=row.organization_id,
+                source="memory",
+                payload=row.payload,  # pointer + lineage; memory_id inside for dedupe
+            )
+        )
+        if delivery.ok:
+            published_ids.append(row.id)
+        else:
+            failed += 1
+            logger.warning(
+                "memory outbox row=%s retained for retry: %d/%d handler(s) failed on %s",
+                row.id, delivery.failed, delivery.handlers, row.event_type,
+            )
     await repo.mark_outbox_published(published_ids)
     if published_ids:
         metrics.incr("memory.outbox.published", value=len(published_ids))
-        logger.info("memory outbox relay published=%d", len(published_ids))
+    if failed:
+        metrics.incr("memory.outbox.retained", value=failed)
+    if stopped_early:
+        metrics.incr("memory.outbox.deferred", value=stopped_early)
+        logger.info(
+            "memory outbox relay hit its %.0fs budget; deferred=%d to next pass",
+            time_budget, stopped_early,
+        )
+    if published_ids or failed:
+        logger.info(
+            "memory outbox relay published=%d retained=%d", len(published_ids), failed
+        )
     return len(published_ids)
 
 

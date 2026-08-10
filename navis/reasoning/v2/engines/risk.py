@@ -20,15 +20,34 @@ DECISION_UNRESOLVED_DAYS = 7.0
 CUSTOMER_DROP_DAYS = 14.0
 MEETING_OVERLOAD_COUNT = 5
 
-# Upper age cap — anything older than this is beyond the founder's
-# actionable window (roughly one month). Past that horizon the entity
-# is history, not "slipping / cooling / stalled" — surfacing it on the
-# daily brief just clutters the surface with items the founder can
-# neither salvage nor act on quickly. Frontend applies a tighter 15-day
-# display filter on top of this; the engine still emits up to 30 days
-# so callers that want a broader operational view (audit, reporting)
-# can read the raw signal stream.
-MAX_SURFACE_AGE_DAYS = 30.0
+# ── Upper age caps ─────────────────────────────────────────────────────
+#
+# There is no single correct ceiling, because the signals measure two
+# different things and only one of them decays.
+#
+# DECAY signals measure SILENCE — relationship cooling, project stalled,
+# customer engagement dropping. Silence genuinely stops being "cooling" at some
+# point and becomes a lapsed relationship: a different, lower-urgency fact that
+# a daily brief should not keep re-raising. One month is the founder's
+# actionable window here, and past it the item is history they can neither
+# salvage nor act on quickly.
+#
+# OBLIGATION signals measure an UNMET DUTY — a promise someone made, a decision
+# you owe, a reply you never sent. These do NOT decay. "You promised me the deck
+# 45 days ago" is more urgent than at 5 days, not less, and a Chief of Staff
+# that silently forgets promises past an arbitrary horizon has the single worst
+# failure mode this product can have. The 30-day cap applied to commitments was
+# therefore a real (if quiet) regression — it made Navis forget.
+#
+# The obligation ceiling is still BOUNDED rather than absent: the scan stays
+# sane, and a board carrying a year of debt is its own kind of useless. A
+# quarter is long enough that nothing a founder would still act on is dropped.
+MAX_DECAY_AGE_DAYS = 30.0
+MAX_OBLIGATION_AGE_DAYS = 90.0
+
+# Back-compat alias for the decay window. Kept so existing imports keep meaning
+# what they always meant; new code should name the window it wants.
+MAX_SURFACE_AGE_DAYS = MAX_DECAY_AGE_DAYS
 
 # Defensive scrub for legacy Memory rows written before the extractor learned
 # to strip HTML from Gmail bodies (extractors/email.py). New rows are already
@@ -58,8 +77,13 @@ class CommitmentReasoningEngine(ReasoningEngine):
         for c in state.commitments():
             if c.status != "open":
                 continue
+            # A dated promise belongs to CommitmentFollowUpEngine, which can say
+            # WHEN it was due. Skipping it here keeps the two mutually exclusive
+            # so one promise never produces two cards.
+            if c.due_at:
+                continue
             age = days_between(ctx.as_of, c.last_seen)
-            if age is None or age < COMMITMENT_SLIPPING_DAYS or age > MAX_SURFACE_AGE_DAYS:
+            if age is None or age < COMMITMENT_SLIPPING_DAYS or age > MAX_OBLIGATION_AGE_DAYS:
                 continue
             clean = _plain(c.text)
             if not clean:
@@ -170,8 +194,13 @@ class DecisionReasoningEngine(ReasoningEngine):
         for d in state.decisions():
             if d.status != "open":
                 continue
+            # Decision REQUESTS ("can you approve X?") are DecisionOwedEngine's
+            # job — it knows who is waiting and can address the follow-up. This
+            # engine covers decisions the org RECORDED and never closed out.
+            if d.kind == "request":
+                continue
             age = days_between(ctx.as_of, d.last_seen)
-            if age is None or age < DECISION_UNRESOLVED_DAYS or age > MAX_SURFACE_AGE_DAYS:
+            if age is None or age < DECISION_UNRESOLVED_DAYS or age > MAX_OBLIGATION_AGE_DAYS:
                 continue
             out.append(
                 SignalDraft(

@@ -28,6 +28,23 @@ class GmailProvider(Provider):
             raise ProviderValidationError("send_email requires 'to'")
         if not payload.get("subject"):
             raise ProviderValidationError("send_email requires 'subject'")
+        # An email with no body is never a thing a human meant to send. The
+        # proactive proposer used to emit exactly that — `{"to": <them>,
+        # "subject": <the decision title>, "body": ""}` — so one click on a
+        # "Commitment slipping: I'll get you the deck by Friday" card sent that
+        # sentence, as a subject line, with an empty body, to the person who
+        # said it. Validation lives HERE (not only at the proposer) because
+        # this is the last gate before Google: any future producer of a
+        # send_email payload inherits the guarantee for free.
+        #
+        # ProviderValidationError is non-retryable by contract, so a malformed
+        # row fails once, dead-letters with this message, and never reaches
+        # Gmail — not on this attempt and not on any retry.
+        if not str(payload.get("body") or "").strip():
+            raise ProviderValidationError(
+                "send_email requires a non-empty 'body' — refusing to send a "
+                "blank email"
+            )
 
     async def execute(self, payload: dict[str, Any]) -> ProviderResult:
         if self._sender is None:

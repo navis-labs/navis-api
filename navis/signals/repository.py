@@ -15,7 +15,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.signals.base import SignalEvent, SignalSource
-from navis.signals.models import SignalDeadLetter, SignalEventRecord, SignalOutbox
+from navis.signals.models import (
+    SignalDeadLetter,
+    SignalEventRecord,
+    SignalImportance,
+    SignalOutbox,
+)
 
 
 class SignalRepository:
@@ -96,6 +101,22 @@ class SignalRepository:
             return
         self.db.add_all([SignalOutbox(**r) for r in rows])
         await self.db.flush()
+
+    # ---- derived: importance ----
+    async def append_importance(self, rows: Sequence[dict[str, Any]]) -> None:
+        """Append importance scores IN THE CALLER'S TRANSACTION (no commit).
+
+        `ON CONFLICT DO NOTHING` on the deterministic id makes re-scoring free:
+        an ingest retry, a replay, or a backfill that overlaps live traffic all
+        converge on the same single row per (signal, policy version).
+        """
+        if not rows:
+            return
+        await self.db.execute(
+            pg_insert(SignalImportance).values(list(rows)).on_conflict_do_nothing(
+                index_elements=["id"]
+            )
+        )
 
     async def pending_outbox(self, *, limit: int = 500) -> Sequence[SignalOutbox]:
         """Claim unpublished pointers FOR UPDATE SKIP LOCKED so multiple relay workers
