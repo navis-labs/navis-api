@@ -32,6 +32,7 @@ from navis.platform.database import session_scope
 from navis.platform.monitoring import get_logger
 from navis.platform.monitoring.metrics import metrics
 from navis.signals.calendar import CalendarClient
+from navis.signals.calendar.client import conference_info
 from navis.signals.crypto import token_cipher
 from navis.signals.gmail import GmailClient
 from navis.signals.google.oauth import TokenManager
@@ -151,8 +152,13 @@ def _iso_end(payload: dict[str, Any]) -> str:
     return (dt + timedelta(minutes=duration_min)).isoformat()
 
 
-async def calendar_sender(payload: dict[str, Any]) -> str:
+async def calendar_sender(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """Create a real Google Calendar event for the org.
+
+    Returns `(event_id, conference_extra)`. The second element feeds
+    `ProviderReference.extra`, carrying `meet_url` / `conference_status` when a
+    conference was requested and `{}` otherwise — the reschedule and cancel
+    senders still return a bare id, since neither creates a conference.
 
     Payload contract (matches CalendarProvider.validate + the frontend's
     MeetingScheduleDrawer):
@@ -237,7 +243,10 @@ async def calendar_sender(payload: dict[str, Any]) -> str:
     created_id = str(event.get("id") or "")
     if not created_id:
         raise RuntimeError("calendar create_event returned no event id")
-    return created_id
+    # The event object carries the Meet link; returning only the id threw it
+    # away. `conference_info` yields {} for a non-conference event, so the
+    # reference shape is unchanged when no Meet was requested.
+    return created_id, conference_info(event)
 
 
 # ── Calendar reschedule / cancel senders ───────────────────────────────────

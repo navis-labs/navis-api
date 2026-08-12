@@ -73,7 +73,11 @@ PAYLOAD_FIELDS_V1: dict[EntityType, tuple[str, ...]] = {
                           "kind", "asked_by", "asked_by_name", "asked_at",
                           "thread_id", "rfc_message_id"),
     EntityType.CHANNEL: ("channel_id", "name", "visibility", "workspace_id"),
-    EntityType.DOCUMENT: ("document_id", "title", "owners", "parents", "drive_id", "source"),
+    # `status` is ADDITIVE (no version bump, per the note above): "active" | "trashed".
+    # Always written, never null — State's fold skips nulls, so an omitted status
+    # would leave a stale "trashed" as the surviving value.
+    EntityType.DOCUMENT: ("document_id", "title", "owners", "parents", "drive_id",
+                          "source", "status"),
 }
 
 

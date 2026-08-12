@@ -253,6 +253,12 @@ class ScheduledProposal(BaseModel):
     # proposal card so the founder can spot bad assumptions before
     # approving.
     assumptions: list[str] = Field(default_factory=list)
+    # A meeting Navis books is a meeting people can join: every scheduled
+    # proposal requests a Google Meet conference. Typed and defaulted HERE, on
+    # the producer, rather than left to the sender's `payload.get("conference",
+    # False)` fallback — that fallback silently produced Meet-less events
+    # precisely because no producer ever set the key. Not a user-facing toggle.
+    conference: bool = True
 
     def to_execution_payload(self) -> dict:
         """The dict that becomes `ExecutionRequest.payload`.
@@ -273,6 +279,7 @@ class ScheduledProposal(BaseModel):
             "attendee_name": self.attendee.name,
             "description": self.description,
             "send_google_invite": True,
+            "conference": self.conference,
             # Lineage — carried through so the executed event links back
             # to the signal it was born from.
             "source_signal_event_id": self.source_signal_event_id,

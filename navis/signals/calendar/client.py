@@ -6,11 +6,82 @@ that; this client just surfaces the error from the transport.
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from navis.signals.google.transport import GoogleTransport
 
 _BASE = "https://www.googleapis.com/calendar/v3"
+
+# `entryPoints` also carries phone numbers, PINs and access codes. Only the
+# video entry is ever read out of a conference — see `conference_info`.
+_VIDEO_ENTRY_POINT = "video"
+
+
+def _conference_request_id(
+    event_id: str | None, summary: str, start_iso: str, end_iso: str
+) -> str:
+    """Stable idempotency key for ONE conference-creation request.
+
+    Google treats `requestId` as the idempotency key for conference creation:
+    replaying an insert with the same id returns the SAME conference instead of
+    minting a second one. That guarantee is only worth something if the id
+    survives a process restart, so this must never use Python's builtin
+    `hash()` — string hashing is randomized per process via PYTHONHASHSEED, so
+    two workers (or the same worker after a restart) would compute different
+    ids for the same meeting and Google would create a second conference.
+
+    When the caller supplies a client-generated `event_id` — the execution
+    worker always does, as `navis{execution_id.hex}` — the conference id is
+    derived from it, so an event and its conference share ONE deterministic
+    identity rooted in the ExecutionRequest. The SHA-256 fallback covers
+    callers that let Google assign the event id; it is content-addressed and
+    therefore just as stable across processes.
+    """
+    if event_id:
+        return f"{event_id}-conf"
+    digest = hashlib.sha256(f"{summary}|{start_iso}|{end_iso}".encode()).hexdigest()
+    return f"navisconf-{digest[:32]}"
+
+
+def conference_info(event: dict[str, Any]) -> dict[str, Any]:
+    """Meet join URL + conference status read off an events.insert response.
+
+    Conference creation is ASYNCHRONOUS. Google may return the created event
+    with `conferenceData.createRequest.status.statusCode == 'pending'` and no
+    join URL yet, and it may later resolve to `failure`. Both are reported
+    verbatim rather than smoothed over: an absent Meet link is recoverable, a
+    fabricated one sends people to a room that does not exist.
+
+    Only the video entry point is surfaced. Phone numbers, PINs and access
+    codes stay out of the execution result, matching the minimization the
+    ingest connector already applies to conferences it observes.
+
+    Returns `{}` for an ordinary event with no conference attached.
+    """
+    conference = event.get("conferenceData") or {}
+    status = ((conference.get("createRequest") or {}).get("status") or {}).get(
+        "statusCode"
+    )
+
+    url = event.get("hangoutLink")
+    if not url:
+        for entry in conference.get("entryPoints") or []:
+            if entry.get("entryPointType") == _VIDEO_ENTRY_POINT and entry.get("uri"):
+                url = entry["uri"]
+                break
+
+    info: dict[str, Any] = {}
+    if url:
+        info["meet_url"] = url
+    if status:
+        # Google's own word for it, even when that word is 'pending'/'failure'.
+        info["conference_status"] = status
+    elif url:
+        # A link with no createRequest block: the conference already exists
+        # (e.g. a replayed 409 re-fetch). Having the URL IS the success signal.
+        info["conference_status"] = "success"
+    return info
 
 
 class CalendarClient:
@@ -153,7 +224,9 @@ class CalendarClient:
         if conference:
             body["conferenceData"] = {
                 "createRequest": {
-                    "requestId": f"navis-{hash(start_iso) & 0xFFFFFFFF:x}",
+                    "requestId": _conference_request_id(
+                        event_id, summary, start_iso, end_iso
+                    ),
                     "conferenceSolutionKey": {"type": "hangoutsMeet"},
                 }
             }

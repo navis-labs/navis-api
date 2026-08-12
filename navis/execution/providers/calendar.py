@@ -8,13 +8,16 @@ from navis.execution.contract import ProviderReference, ProviderResult
 from navis.execution.providers.base import Provider, ProviderValidationError
 
 Sender = Callable[[dict[str, Any]], Awaitable[str]]
+# The create path returns `(event_id, conference_extra)` — the mutation verbs
+# (reschedule / cancel) create no conference and keep the bare-id `Sender`.
+CreateSender = Callable[[dict[str, Any]], Awaitable[tuple[str, dict[str, Any]]]]
 
 
 class CalendarProvider(Provider):
     name = "calendar"
     action_type = "schedule_meeting"
 
-    def __init__(self, sender: Sender | None = None) -> None:
+    def __init__(self, sender: CreateSender | None = None) -> None:
         self._sender = sender
 
     async def validate(self, payload: dict[str, Any]) -> None:
@@ -31,8 +34,13 @@ class CalendarProvider(Provider):
             return ProviderResult(
                 ok=True, reference=ProviderReference("calendar", synthetic, {"dry_run": True})
             )
-        event_id = await self._sender(payload)
-        return ProviderResult(ok=True, reference=ProviderReference("calendar", event_id))
+        # `extra` carries meet_url / conference_status when a conference was
+        # requested, and is empty otherwise — so a plain event's reference
+        # shape is byte-identical to what it was before Meet support.
+        event_id, extra = await self._sender(payload)
+        return ProviderResult(
+            ok=True, reference=ProviderReference("calendar", event_id, extra)
+        )
 
     async def status(self, reference: dict[str, Any]) -> str:
         return "scheduled"

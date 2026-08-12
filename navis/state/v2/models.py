@@ -36,8 +36,17 @@ class Watermark:
     last_memory_id: uuid.UUID | None = None
 
     def passed(self, event_timestamp: datetime, memory_id: uuid.UUID) -> bool:
-        """True if (ts, memory_id) is strictly AFTER this watermark."""
-        if self.last_timestamp is None:
+        """True if (ts, memory_id) is strictly AFTER this watermark.
+
+        The two fields are a PAIR — both set, or both None; the snapshot table
+        enforces exactly that with `ck_state_snapshots_watermark_paired`.
+        Testing both is what makes the pairing legible to a type checker, and
+        it fails SAFE: a half-set cursor cannot say what has already been
+        folded, so every record counts as unseen and the fold replays rather
+        than silently skipping history. Testing only `last_timestamp` here
+        would reach `None.int` inside `order_key` and raise AttributeError.
+        """
+        if self.last_timestamp is None or self.last_memory_id is None:
             return True
         return order_key(event_timestamp, memory_id) > order_key(
             self.last_timestamp, self.last_memory_id
@@ -55,9 +64,17 @@ class Watermark:
             return cls()
         ts = d.get("last_timestamp")
         mid = d.get("last_memory_id")
+        if not ts or not mid:
+            # Half-set. `ck_state_snapshots_watermark_paired` guards the two
+            # dedicated COLUMNS, but this parses the snapshot's `full_projection`
+            # JSONB, which no constraint validates — so a legacy or hand-edited
+            # blob can carry one half without the other. An incomplete cursor
+            # cannot be trusted to say what has been folded: drop it and let the
+            # projection rebuild from scratch.
+            return cls()
         return cls(
-            last_timestamp=datetime.fromisoformat(ts) if ts else None,
-            last_memory_id=uuid.UUID(mid) if mid else None,
+            last_timestamp=datetime.fromisoformat(ts),
+            last_memory_id=uuid.UUID(mid),
         )
 
 
@@ -241,6 +258,13 @@ class ChannelState(_BaseView):
 class DocumentState(_BaseView):
     @property
     def title(self): return self.fields.get("title")
+    @property
+    def status(self):
+        """"active" | "trashed" — latest-wins, so a restore flips it back.
+        Defaults to "active" for records written before the field existed."""
+        return self.fields.get("status", "active")
+    @property
+    def is_trashed(self): return self.status == "trashed"
     @property
     def owner_emails(self): return self.fields.get("owners", [])     # raw emails from the payload
     @property

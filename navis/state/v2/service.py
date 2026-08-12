@@ -45,7 +45,7 @@ from navis.state.v2.models import (
 )
 from navis.state.v2.repository import MemoryReader, SnapshotRepository
 
-logger = get_logger("state.v2")
+logger  = get_logger("state.v2")
 
 # Advisory-lock space for State — disjoint from signals/memory/execution (blake2b
 # personalization), so a State per-org lock never collides with another domain's lock.
