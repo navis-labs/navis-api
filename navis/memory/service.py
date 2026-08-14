@@ -192,9 +192,25 @@ async def _on_signal_pointer(event: DomainEvent) -> None:
         await MemoryIngestionService(db).ingest_signal(uuid.UUID(event_id))
 
 
+# Every bus event `signals.service._BUS_EVENT_FOR_TYPE` can route a signal to must
+# appear here, or that signal is captured and relayed but never becomes memory.
+#
+# CALENDAR_EVENT_UPDATED / _CANCELLED were missing. Signals route by their ACTUAL
+# event_type, and Google stamps an event UPDATED whenever `createdTime !=
+# modifiedTime` — which is the common case — so the canonical Calendar record for a
+# real meeting was published to a bus with zero handlers and silently dropped. What
+# survived was only the Meet-derived copy (which routes via the SIGNAL_INGESTED
+# fallback), carrying no status, no organizer and no join link. Cancellations were
+# lost the same way, which is why a cancelled meeting could never reach the
+# `status="cancelled"` state the MEETING payload schema already defines.
+#
+# Re-delivery is safe: memory_id is a deterministic UUIDv5 and inserts are
+# ON CONFLICT DO NOTHING, so a replayed pointer converges instead of duplicating.
 for _evt in (
     EventType.GMAIL_RECEIVED,
     EventType.CALENDAR_EVENT_CREATED,
+    EventType.CALENDAR_EVENT_UPDATED,
+    EventType.CALENDAR_EVENT_CANCELLED,
     EventType.MEETING_COMPLETED,
     EventType.SIGNAL_INGESTED,
 ):

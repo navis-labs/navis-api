@@ -40,27 +40,96 @@ class DecisionCategory(str, enum.Enum):
     OPPORTUNITY = "opportunity"
 
 
-# Deterministic map from a reasoning signal type to a decision category.
+# A SIGNAL IS NOT A DECISION.
+#
+# Reasoning emits two kinds of signal, and only one of them is a decision:
+#
+#   * DECISION POINTS — something is owed, slipping, unanswered or at risk.
+#     A person has to exercise judgment: reply, approve, prioritize,
+#     delegate, or commit. These become Decisions.
+#
+#   * INTERPRETATION — true, useful observations about the organization
+#     that ask nothing of anyone. Engines/meta.py says so in its own
+#     docstring: "These produce interpretation, NOT decisions ... it does
+#     NOT rank actions or recommend (that is Decision's job)."
+#     These stay ReasoningSignals: available as context and evidence,
+#     never promoted to the brief.
+#
+# This map is the boundary, and membership in it is the ONLY test. A
+# signal type absent here is not a decision — see `category_for`.
+#
+# ── Why this map used to be wrong ─────────────────────────────────────
+#
+# It previously listed all 14 signal types, and `category_for` fell back
+# to PRIORITY for anything unmapped. Two consequences, both visible in
+# production briefs:
+#
+#   * CONTEXT_SUMMARY ("Organizational context") is emitted with
+#     confidence=1.0 and, as a PRIORITY, drew the largest category bias
+#     in the ranker — so a bare recitation of entity counts outranked
+#     genuine obligations in essentially every brief.
+#   * OPPORTUNITY ("Active inbound engagement") fires for any
+#     relationship with an inbound direction in the last two days, with
+#     no automation filter. Promotional mail, invoices, newsletters and
+#     calendar notifications each produced an identically-titled
+#     "decision" that asked nothing of the founder.
+#
+# The fallback also meant any NEW signal type silently became a PRIORITY
+# decision the moment it was added. Absence now excludes.
 _CATEGORY_FOR_SIGNAL = {
+    # Something was promised and is drifting.
     SignalType.COMMITMENT_SLIPPING: DecisionCategory.RISK,
+    SignalType.COMMITMENT_FOLLOW_UP: DecisionCategory.FOLLOW_UP,
+    # A relationship or project is decaying and someone must intervene.
     SignalType.RELATIONSHIP_COOLING: DecisionCategory.RISK,
     SignalType.PROJECT_STALLED: DecisionCategory.RISK,
-    SignalType.DECISION_UNRESOLVED: DecisionCategory.RISK,
-    SignalType.WAITING_ON_USER_REPLY: DecisionCategory.WAITING_REPLY,
-    SignalType.COMMITMENT_FOLLOW_UP: DecisionCategory.FOLLOW_UP,
-    SignalType.DECISION_OWED: DecisionCategory.DECISION_OWED,
     SignalType.CUSTOMER_ENGAGEMENT_DROP: DecisionCategory.RISK,
+    # A judgment is explicitly owed.
+    SignalType.DECISION_UNRESOLVED: DecisionCategory.RISK,
+    SignalType.DECISION_OWED: DecisionCategory.DECISION_OWED,
+    # A person is waiting on a human reply. engines/waiting.py already
+    # excludes automated, promotional and no-reply senders before this
+    # ever fires — that filter is the org's single notion of "is this a
+    # real person", and nothing here second-guesses it.
+    SignalType.WAITING_ON_USER_REPLY: DecisionCategory.WAITING_REPLY,
+    # Calendar load the founder has to actively prune.
     SignalType.MEETING_OVERLOAD: DecisionCategory.RISK,
-    SignalType.OPPORTUNITY: DecisionCategory.OPPORTUNITY,
-    SignalType.LEVERAGE_POINT: DecisionCategory.DELEGATION,
-    SignalType.PRIORITY_LOAD: DecisionCategory.PRIORITY,
-    SignalType.ORG_DRIFT: DecisionCategory.PRIORITY,
-    SignalType.CONTEXT_SUMMARY: DecisionCategory.PRIORITY,
 }
 
+# Interpretation-only. Listed explicitly so the exclusion is a decision
+# someone made, not an oversight, and so a reader can see the whole
+# vocabulary in one place. Keeping these OUT of the brief is what makes
+# a quiet Today trustworthy.
+_INTERPRETATION_ONLY = frozenset(
+    {
+        SignalType.CONTEXT_SUMMARY,   # "Organizational context" — a state recitation
+        SignalType.PRIORITY_LOAD,     # aggregate of the risk signals already listed above
+        SignalType.ORG_DRIFT,         # "Rising commitment volume" — a trend, not an ask
+        SignalType.OPPORTUNITY,       # "Active inbound engagement" — an observation
+        SignalType.LEVERAGE_POINT,    # "Hub company: X" — a structural fact
+    }
+)
 
-def category_for(signal_type: SignalType) -> DecisionCategory:
-    return _CATEGORY_FOR_SIGNAL.get(signal_type, DecisionCategory.PRIORITY)
+# Every signal type must be deliberately classified as one or the other.
+# A new type added to SignalType without a home here fails fast in tests
+# rather than silently appearing in founders' briefs.
+assert set(_CATEGORY_FOR_SIGNAL) | _INTERPRETATION_ONLY == set(SignalType), (
+    "every SignalType must be classified as decision-worthy or interpretation-only"
+)
+
+
+def category_for(signal_type: SignalType) -> DecisionCategory | None:
+    """The decision category for a signal, or None if it is not a decision.
+
+    None is a real answer, not a failure: interpretation signals are
+    valid reasoning output that simply do not belong in a brief.
+    """
+    return _CATEGORY_FOR_SIGNAL.get(signal_type)
+
+
+def is_decision_worthy(signal_type: SignalType) -> bool:
+    """Does this signal represent a point where a person must decide?"""
+    return signal_type in _CATEGORY_FOR_SIGNAL
 
 
 def compute_decision_id(

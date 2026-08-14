@@ -207,11 +207,20 @@ def test_score_email_hard_skips_bulk_precedence():
     assert R._score_email({"precedence": "bulk"}) is None
 
 
+def _score(payload: dict[str, Any]) -> int:
+    """`_score_email` returns None for hard-skipped junk. Every comparison test
+    below feeds scoreable mail, so narrow once here rather than repeating an
+    `is not None` guard before each `>`."""
+    score = R._score_email(payload)
+    assert score is not None, "expected a scoreable payload, got a hard-skip"
+    return score
+
+
 def test_score_email_important_label_dominates():
     """Gmail's IMPORTANT label encodes Google's own inbox ML — it must
     outweigh a bare inbox email with nothing else going for it."""
-    plain = R._score_email({"label_ids": ["INBOX"], "sender_email": "x@acme.com"})
-    important = R._score_email({"label_ids": ["INBOX", "IMPORTANT"], "sender_email": "x@acme.com"})
+    plain = _score({"label_ids": ["INBOX"], "sender_email": "x@acme.com"})
+    important = _score({"label_ids": ["INBOX", "IMPORTANT"], "sender_email": "x@acme.com"})
     assert important > plain
     assert important >= 10  # IMPORTANT alone is worth 10
 
@@ -226,8 +235,8 @@ def test_score_email_starred_is_strong():
 def test_score_email_commitment_language_boosts():
     """A promise from the sender ('I'll send it by EOD') means the thread
     is actionable — outrank a plain inbox mail from the same domain."""
-    plain = R._score_email({"label_ids": ["INBOX"], "body_text": "hello"})
-    commit = R._score_email({
+    plain = _score({"label_ids": ["INBOX"], "body_text": "hello"})
+    commit = _score({
         "label_ids": ["INBOX"],
         "body_text": "I'll send the deck by EOD tomorrow.",
     })
@@ -237,24 +246,24 @@ def test_score_email_commitment_language_boosts():
 def test_score_email_decision_language_boosts_more_than_commitment():
     """A 'we decided' / 'approved' beats a mere commitment — it's a fact
     the org needs to record, not a pending action."""
-    commit = R._score_email({"body_text": "I'll follow up next week."})
-    decision = R._score_email({"body_text": "We've decided to go with option B."})
+    commit = _score({"body_text": "I'll follow up next week."})
+    decision = _score({"body_text": "We've decided to go with option B."})
     assert decision > commit
 
 
 def test_score_email_free_domain_gets_no_business_boost():
     """A @gmail.com sender is more often personal noise than a real
     counterparty — the domain bonus applies only to business domains."""
-    biz = R._score_email({"sender_email": "ceo@acme.com", "label_ids": ["INBOX"]})
-    free = R._score_email({"sender_email": "someone@gmail.com", "label_ids": ["INBOX"]})
+    biz = _score({"sender_email": "ceo@acme.com", "label_ids": ["INBOX"]})
+    free = _score({"sender_email": "someone@gmail.com", "label_ids": ["INBOX"]})
     assert biz > free
 
 
 def test_score_email_direct_addressed_beats_mass_cc():
     """One recipient, no CC → for-you-specifically. 20 people on CC →
     broadcast FYI. The scorer has to distinguish the two."""
-    direct = R._score_email({"to_emails": ["me@acme.com"], "cc_emails": []})
-    mass = R._score_email({
+    direct = _score({"to_emails": ["me@acme.com"], "cc_emails": []})
+    mass = _score({
         "to_emails": ["a@x.com"] * 8,
         "cc_emails": ["b@x.com"] * 8,
     })
@@ -285,7 +294,7 @@ def test_important_sort_orders_newest_first_regardless_of_score():
         payload={},
     )
     entries = [(21, old_hi_score, {}), (8, fresh_lo_score, {})]
-    entries.sort(key=R._important_sort_key, reverse=True)
+    entries.sort(key=R._important_sort_key, reverse=True)  # type: ignore[arg-type]  # _Row is a deliberate SignalEventRecord stand-in
     assert entries[0][1].external_id == "fresh"
     assert entries[1][1].external_id == "old"
 
@@ -298,7 +307,7 @@ def test_important_sort_score_breaks_ties_on_same_timestamp():
     lo = _Row(id=uuid.uuid4(), external_id="lo", occurred_at=ts, payload={})
     hi = _Row(id=uuid.uuid4(), external_id="hi", occurred_at=ts, payload={})
     entries = [(5, lo, {}), (12, hi, {})]
-    entries.sort(key=R._important_sort_key, reverse=True)
+    entries.sort(key=R._important_sort_key, reverse=True)  # type: ignore[arg-type]  # _Row is a deliberate SignalEventRecord stand-in
     assert entries[0][1].external_id == "hi"
 
 
@@ -314,7 +323,7 @@ def test_important_sort_tolerates_missing_occurred_at():
     missing = _Row(id=uuid.uuid4(), external_id="missing", occurred_at=None, payload={})
     entries = [(20, missing, {}), (5, real, {})]
     # Should not raise even though scores would suggest missing comes first.
-    entries.sort(key=R._important_sort_key, reverse=True)
+    entries.sort(key=R._important_sort_key, reverse=True)  # type: ignore[arg-type]  # _Row is a deliberate SignalEventRecord stand-in
     assert entries[0][1].external_id == "real"
     assert entries[1][1].external_id == "missing"
 
@@ -359,7 +368,7 @@ def test_version_collapse_orders_by_ingestion_not_meeting_start():
     stmt = _latest_per_external_id_stmt(
         org_id=_uuid.uuid4(), source=SignalSource.CALENDAR
     )
-    order_sql = " ".join(str(c) for c in stmt.element._order_by_clauses).lower()
+    order_sql = " ".join(str(c) for c in getattr(stmt.element, "_order_by_clauses")).lower()
 
     assert "created_at desc" in order_sql, (
         "collapse must pick the newest INGESTED version; ordering by "
@@ -372,3 +381,88 @@ def test_version_collapse_orders_by_ingestion_not_meeting_start():
     # Deterministic tie-break: signal ids are UUIDv5, so two rows written in the
     # same transaction still collapse to a replay-identical pick.
     assert "id desc" in order_sql
+
+
+# ---- Upcoming window includes an IN-PROGRESS meeting ----------------------
+#
+# `occurred_at` is the meeting's START (see `_latest_per_external_id_stmt`), so
+# the old `occurred_at >= now` predicate deleted a meeting from Today the very
+# instant it began — precisely when the founder opens the page to join it. The
+# window must close on the END time instead.
+
+
+def _upcoming_window_sql() -> str:
+    """Compile the window predicate the endpoint builds, without a database."""
+    from sqlalchemy import DateTime, cast, func, select
+    from navis.signals.base import SignalSource
+
+    latest = R._latest_per_external_id_stmt(org_id=uuid.uuid4(), source=SignalSource.CALENDAR)
+    ends_at = func.coalesce(
+        cast(latest.c.payload["end"]["dateTime"].astext, DateTime(timezone=True)),
+        latest.c.occurred_at,
+    )
+    from sqlalchemy.dialects import postgresql
+
+    now = datetime.now(timezone.utc)
+    stmt = select(latest).where(
+        latest.c.event_type != SignalEventType.CALENDAR_EVENT_CANCELLED.value,
+        ends_at >= now,
+        latest.c.occurred_at <= now + timedelta(days=7),
+    )
+    return str(
+        stmt.compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+
+
+def test_upcoming_window_closes_on_end_time_not_start():
+    sql = _upcoming_window_sql()
+    assert "coalesce" in sql.lower(), "window must fall back to start when end is absent"
+    assert "'end'" in sql and "dateTime" in sql, "window must read the event's end time"
+
+
+def test_in_progress_meeting_is_inside_the_window():
+    """A meeting running 10:30–11:15 must still be returned at 10:57."""
+    start = datetime(2026, 8, 13, 5, 0, tzinfo=timezone.utc)    # 10:30 IST
+    end = datetime(2026, 8, 13, 5, 45, tzinfo=timezone.utc)     # 11:15 IST
+    now = datetime(2026, 8, 13, 5, 27, tzinfo=timezone.utc)     # 10:57 IST — mid-meeting
+
+    assert not (start >= now), "the OLD start-based predicate excluded it (the bug)"
+    assert end >= now, "the NEW end-based predicate includes it"
+
+
+def test_finished_meeting_is_outside_the_window():
+    """The fix must not turn 'upcoming' into 'everything ever'."""
+    end = datetime(2026, 8, 13, 5, 45, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 13, 6, 30, tzinfo=timezone.utc)     # 45 min after it ended
+
+    assert not (end >= now)
+
+
+def test_shape_calendar_exposes_the_canonical_meet_url():
+    """Today's 'Join Meet' must come from the Calendar event itself, never from
+    a Meet-derived copy (the deriver deliberately drops join URLs)."""
+    row = _Row(
+        id=uuid.uuid4(),
+        external_id="oji40sl3uf61senmcc1a99k17k",
+        occurred_at=datetime(2026, 8, 13, 5, 0, tzinfo=timezone.utc),
+        payload={
+            "summary": "Nick and Abhi",
+            "status": "confirmed",
+            "start": {"dateTime": "2026-08-13T10:30:00+05:30", "timeZone": "Asia/Kolkata"},
+            "end": {"dateTime": "2026-08-13T11:15:00+05:30", "timeZone": "Asia/Kolkata"},
+            "attendee_count": 2,
+            "organizer": {"email": "astravision.global@gmail.com"},
+            "hangout_link": "https://meet.google.com/tap-kbov-nfz",
+            "conference_data": {"conference_id": "tap-kbov-nfz", "has_video": True},
+        },
+        event_type=SignalEventType.CALENDAR_EVENT_UPDATED.value,
+    )
+    shaped = R._shape_calendar(row)
+
+    assert shaped["summary"] == "Nick and Abhi"
+    assert shaped["status"] == "confirmed"
+    assert shaped["hangout_link"] == "https://meet.google.com/tap-kbov-nfz"
+    assert shaped["organizer_email"] == "astravision.global@gmail.com"
+    assert shaped["external_id"] == "oji40sl3uf61senmcc1a99k17k"

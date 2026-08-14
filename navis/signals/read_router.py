@@ -26,11 +26,12 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, TypeAlias
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from sqlalchemy import DateTime, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.dependencies import CurrentContext, get_current_context
@@ -143,7 +144,7 @@ _EPOCH_UTC = datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _important_sort_key(
-    entry: tuple[int, "SignalEventRecord", dict[str, Any]],
+    entry: tuple[int, _SignalRow, dict[str, Any]],
 ) -> tuple[datetime, int]:
     """Ordering for /gmail/important results.
 
@@ -233,7 +234,26 @@ def _score_email(payload: dict[str, Any]) -> int | None:
     return score
 
 
-def _shape_gmail_from_decrypted(rec: SignalEventRecord, p: dict[str, Any]) -> dict[str, Any]:
+# What the `_shape_*` helpers accept. Two things get shaped: real ORM rows
+# (Gmail's straight select) and `_RowShim`s over a DISTINCT ON subquery mapping
+# (Calendar/Drive). Annotating them with the concrete `SignalEventRecord` alone
+# made every DISTINCT ON call site a type error even though it is the intended
+# design — see `_RowShim` at the bottom of this module.
+#
+# A structural Protocol looks like the tidier answer here and does NOT work:
+#   * the ORM declares `id: Mapped[uuid.UUID]`, and protocol matching compares
+#     that declared type against `uuid.UUID` rather than the descriptor's value
+#     type, so SignalEventRecord fails to match; and
+#   * `_RowShim` serves its attributes through `__getattr__`, which type
+#     checkers do not use to satisfy protocol members, so it fails too.
+# A plain union matches both nominally, which is all this needs.
+#
+# `from __future__ import annotations` makes annotations lazy strings, so the
+# alias may name `_RowShim` before its definition without a runtime NameError.
+_SignalRow: TypeAlias = "SignalEventRecord | _RowShim"
+
+
+def _shape_gmail_from_decrypted(rec: _SignalRow, p: dict[str, Any]) -> dict[str, Any]:
     """Shape a Gmail record whose payload is ALREADY decrypted. Used by
     /gmail/important, which decrypts once for scoring and reuses the same
     dict for shaping — decrypt cost is real on large windows."""
@@ -252,11 +272,11 @@ def _shape_gmail_from_decrypted(rec: SignalEventRecord, p: dict[str, Any]) -> di
     }
 
 
-def _shape_gmail(rec: SignalEventRecord) -> dict[str, Any]:
+def _shape_gmail(rec: _SignalRow) -> dict[str, Any]:
     return _shape_gmail_from_decrypted(rec, _decrypt_content(rec.payload or {}))
 
 
-def _shape_calendar(rec: SignalEventRecord) -> dict[str, Any]:
+def _shape_calendar(rec: _SignalRow) -> dict[str, Any]:
     p = rec.payload or {}
     organizer = p.get("organizer") or {}
     conference = p.get("conference_data") or {}
@@ -268,6 +288,11 @@ def _shape_calendar(rec: SignalEventRecord) -> dict[str, Any]:
         "start":          p.get("start"),
         "end":            p.get("end"),
         "attendees_count": p.get("attendee_count") or 0,
+        # ADDITIVE: the emails behind the count. A meeting card that can only say
+        # "2 attendees" cannot name who is in the room, which is the one thing the
+        # founder needs before joining. Emails only — the connector already drops
+        # attendee displayName as bulk PII, and nothing here re-adds it.
+        "attendees":      [a.get("email") for a in (p.get("attendees") or []) if a.get("email")],
         "organizer_email": organizer.get("email"),
         "has_conference": bool(conference) or bool(p.get("hangout_link")),
         "hangout_link":   p.get("hangout_link"),
@@ -275,7 +300,7 @@ def _shape_calendar(rec: SignalEventRecord) -> dict[str, Any]:
     }
 
 
-def _shape_drive(rec: SignalEventRecord) -> dict[str, Any]:
+def _shape_drive(rec: _SignalRow) -> dict[str, Any]:
     p = rec.payload or {}
     return {
         "event_id":    str(rec.id),
@@ -440,6 +465,14 @@ async def calendar_upcoming(
     so we DISTINCT ON external_id to collapse a series of edits to the
     latest snapshot. Cancelled events are excluded — the UI card is for
     "what's on the calendar", not an audit trail.
+
+    A meeting that has already STARTED but not yet ENDED is still returned.
+    `occurred_at` is the meeting's start (see `_latest_per_external_id_stmt`),
+    so gating on `occurred_at >= now` deleted a meeting from the dashboard the
+    instant it began — exactly when the founder opens Today to join it. The
+    window is therefore closed on the END time, falling back to the start when
+    an event carries no parseable end (all-day events use `date`, not
+    `dateTime`).
     """
     connected = await _is_connected(
         db, org_id=ctx.org_id, provider=IntegrationProvider.GOOGLE_CALENDAR
@@ -448,11 +481,18 @@ async def calendar_upcoming(
     horizon = now + timedelta(days=days_ahead)
 
     latest = _latest_per_external_id_stmt(org_id=ctx.org_id, source=SignalSource.CALENDAR)
+    # payload->'end'->>'dateTime' is an ISO-8601 string with offset; Postgres
+    # casts it to timestamptz directly. COALESCE keeps all-day / malformed
+    # events behaving exactly as before rather than dropping them.
+    ends_at = func.coalesce(
+        cast(latest.c.payload["end"]["dateTime"].astext, DateTime(timezone=True)),
+        latest.c.occurred_at,
+    )
     stmt = (
         select(latest)
         .where(
             latest.c.event_type != SignalEventType.CALENDAR_EVENT_CANCELLED.value,
-            latest.c.occurred_at >= now,
+            ends_at >= now,
             latest.c.occurred_at <= horizon,
         )
         .order_by(latest.c.occurred_at.asc())
@@ -501,7 +541,7 @@ class _RowShim:
 
     __slots__ = ("_row",)
 
-    def __init__(self, row: dict[str, Any]) -> None:
+    def __init__(self, row: Mapping[Any, Any]) -> None:
         self._row = row
 
     def __getattr__(self, name: str) -> Any:
