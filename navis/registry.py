@@ -14,6 +14,7 @@ from navis.signals import models as _signal_models  # noqa: F401
 from navis.memory import models as _memory_models  # noqa: F401
 from navis.identity_resolution import models as _identity_resolution_models  # noqa: F401
 from navis.state.v2 import snapshots as _state_v2_snapshots  # noqa: F401
+from navis.reasoning import store as _reasoning_store  # noqa: F401  (reasoning_signals table)
 from navis.decisions import models as _decision_models  # noqa: F401
 from navis.execution import models as _execution_models  # noqa: F401
 from navis.execution.drafts import models as _draft_models  # noqa: F401
@@ -27,6 +28,10 @@ from navis.ml.embeddings import models as _ml_embedding_models  # noqa: F401
 from navis.memory import service as _memory_service  # noqa: F401
 from navis.identity_resolution import service as _identity_resolution_service  # noqa: F401  (subscribes to signal pointers)
 from navis.learning import subscribers as _learning_subscribers  # noqa: F401  (OUTCOME_OBSERVED)
+# Without this import the LEARNING_UPDATED handler is never registered, so the
+# projection only ever ran from a manual POST /intelligence/project — which is why
+# intelligence_insights sat at 0 rows and Adaptive had nothing to propose from.
+from navis.intelligence import subscribers as _intelligence_subscribers  # noqa: F401  (LEARNING_UPDATED)
 from navis.execution import worker as _execution_worker  # noqa: F401  (registers tasks)
 from navis.signals import outbox as _signal_outbox  # noqa: F401  (registers the outbox relay task)
 from navis.signals import importance_backfill as _signal_importance_backfill  # noqa: F401  (scoring backfill task)

@@ -332,3 +332,330 @@ async def test_same_decision_different_org_distinct_requests():
     b, _ = await svc.request(ORG_B, DECISION, "send_email", payload,
                              reasoning_signal_ids=[], reasoning_version=1, state_watermark="w")
     assert a.id != b.id and a.organization_id != b.organization_id
+
+
+# ---- provenance ID namespaces stay separate ---------------------------------
+#
+# `reasoning_signal_ids` is what Learning aggregates on and Intelligence cites
+# as `supporting_reasoning_signal_ids`, so it must hold ONLY
+# `reasoning_signals.signal_id` values. The chat scheduling path was writing
+# `signal_events.id` into it (`active_signal_id` is looked up as a
+# SignalEventRecord; `source_signal_event_id` is derived from it), which would
+# have keyed a signal_intelligence insight to something that is not a reasoning
+# signal — a reference nothing can ever resolve.
+
+
+def test_chat_scheduling_writes_source_events_not_reasoning_ids():
+    """The exact bug, pinned at the source: chat must not put a signal_events.id
+    into reasoning_signal_ids."""
+    import ast
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parents[2]
+           / "navis" / "api" / "chat_router.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    # Find every `reasoning_signal_ids=<value>` keyword passed anywhere in chat.
+    passed: list[ast.AST] = [
+        kw.value
+        for node in ast.walk(tree) if isinstance(node, ast.Call)
+        for kw in node.keywords
+        if kw.arg == "reasoning_signal_ids"
+    ]
+    assert passed, "chat no longer passes reasoning_signal_ids at all"
+    for value in passed:
+        # Chat concludes nothing from a persisted ReasoningSignal, so the only
+        # honest value it can pass is an empty list.
+        assert isinstance(value, ast.List) and not value.elts, (
+            "chat_router passes a non-empty reasoning_signal_ids; a signal_events.id "
+            "there is unresolvable in the reasoning_signals namespace"
+        )
+    assert "source_signal_event_ids=source_signal_event_ids" in src, (
+        "source-event provenance must be preserved in its own field, not dropped"
+    )
+
+
+async def test_execution_keeps_the_two_namespaces_apart():
+    """Both survive the round-trip without being merged."""
+    svc = ExecutionService(repo=FakeExecutionRepo())
+    req, _ = await svc.request(
+        ORG_A, DECISION, ActionType.SCHEDULE_MEETING.value, {"x": 1},
+        reasoning_signal_ids=["11111111-1111-1111-1111-111111111111"],
+        source_signal_event_ids=["22222222-2222-2222-2222-222222222222"],
+        reasoning_version=3, state_watermark="wm-1",
+    )
+    assert req.reasoning_signal_ids == ["11111111-1111-1111-1111-111111111111"]
+    assert req.source_signal_event_ids == ["22222222-2222-2222-2222-222222222222"]
+
+
+async def test_source_events_default_empty_for_existing_callers():
+    """Backward compatible: every pre-existing call site omits the new field."""
+    svc = ExecutionService(repo=FakeExecutionRepo())
+    req, _ = await svc.request(
+        ORG_A, DECISION, ActionType.SCHEDULE_MEETING.value, {"y": 2},
+        reasoning_signal_ids=[], reasoning_version=None, state_watermark=None,
+    )
+    assert req.source_signal_event_ids == []
+
+
+# ---- PHASE 5.1 AUDIT: what the Decision -> Execution boundary actually carries ----
+#
+# These tests do not assert a desired design. They PIN the behaviour the audit
+# measured, so a later phase that changes it has to change a test that says why.
+
+
+def test_supporting_insight_ids_are_dropped_at_the_execution_boundary():
+    """Phase 4 provenance stops at the proposer. PINNED, not endorsed.
+
+    `Decision.to_dict()` emits `supporting_insight_ids` (decisions/base.py) —
+    WHICH ORGANIZATIONAL FACTS informed this decision. The proposer reads only
+    named keys, and that field is not one of them, so it never reaches
+    `ProposedAction`, `ExecutionService.request`, `execution_requests`, the
+    outbox payload, or `Outcome`.
+
+    Consequence: "why did Navis perform this action?" resolves through
+    reasoning_signal_ids only. The Intelligence half of the Phase 4 chain
+    (insight -> supporting_reasoning_signal_ids) cannot be reached from an
+    execution row. Closing this needs a column + a field, so it is a Phase 5.2
+    decision, not a drive-by fix.
+    """
+    decision = {
+        "decision_id": str(DECISION),
+        "category": "waiting_reply",
+        "title": "John is waiting for your reply",
+        "evidence": {
+            "person_email": "john@x.com", "thread_id": "t-1",
+            "rfc_message_id": "<audit-1@mail.example>", "subject": "Contract",
+        },
+        "reasoning_signal_ids": ["s-1"],
+        "reasoning_version": 1,
+        "state_watermark": "wm",
+        "supporting_insight_ids": ["insight-a", "insight-b"],
+    }
+    proposed = propose_from_decisions([decision], ORG_A)
+    assert len(proposed) == 1, "precondition: this decision IS proposable"
+    p = proposed[0]
+
+    # Reasoning lineage survives...
+    assert p.reasoning_signal_ids == ["s-1"]
+    # ...Intelligence lineage does not. No field exists to carry it.
+    assert not hasattr(p, "supporting_insight_ids")
+    assert "supporting_insight_ids" not in p.payload
+
+
+async def test_execution_request_has_nowhere_to_put_insight_provenance():
+    """The gap is structural, not a missed assignment: neither the intake
+    signature nor the persisted row has a slot for it."""
+    import inspect
+
+    from navis.execution.models import ExecutionRequest as _Row
+
+    params = inspect.signature(ExecutionService.request).parameters
+    assert "supporting_insight_ids" not in params
+    assert not hasattr(_Row, "supporting_insight_ids")
+
+    # And it does not sneak through on the outbox event either.
+    repo = FakeExecutionRepo()
+    svc = ExecutionService(repo=repo)
+    req, _ = await svc.request(
+        ORG_A, DECISION, ActionType.SCHEDULE_MEETING.value, {"title": "x", "start": "s"},
+        reasoning_signal_ids=["s-1"], reasoning_version=1, state_watermark="wm",
+    )
+    await svc.approve(req.id, USER)
+    for e in repo.events:
+        assert "supporting_insight_ids" not in e.payload
+
+
+# ---- PHASE 5.1 AUDIT: organization isolation on the HTTP surface ----
+
+
+async def test_require_org_refuses_a_foreign_orgs_execution():
+    """`_require_org` is the ONLY thing standing between an authenticated
+    principal and another tenant's execution row: ExecutionService.approve /
+    reject / cancel take a bare execution_id and never check the org.
+
+    A foreign row must be indistinguishable from a missing one (404, not 403 —
+    existence is itself tenant information)."""
+    from fastapi import HTTPException
+
+    from navis.execution.router import _require_org
+
+    eid = uuid.uuid4()
+    row = type("Row", (), {"id": eid, "organization_id": ORG_B})()
+
+    class _DB:
+        async def get(self, _model, _pk):
+            return row
+
+    assert await _require_org(_DB(), eid, ORG_B) is row  # own org: allowed
+
+    with pytest.raises(HTTPException) as exc:
+        await _require_org(_DB(), eid, ORG_A)  # foreign org
+    assert exc.value.status_code == 404
+
+
+def test_every_execution_id_route_is_org_scoped():
+    """Structural guarantee: a future handler that forgets `_require_org` fails
+    HERE rather than by leaking a tenant's row in production."""
+    import ast
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parents[2]
+           / "navis" / "execution" / "router.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    checked = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        is_route = any(
+            isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
+            and isinstance(d.func.value, ast.Name) and d.func.value.id == "router"
+            for d in node.decorator_list
+        )
+        args = {a.arg for a in node.args.args}
+        if not is_route or "execution_id" not in args:
+            continue
+        called = {
+            n.func.id for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+        assert "_require_org" in called, (
+            f"route {node.name!r} takes an execution_id but never org-scopes it"
+        )
+        checked.append(node.name)
+
+    # Guards the guard: if the routes are renamed away, this test must not pass vacuously.
+    assert len(checked) >= 6, f"expected the full /actions/{{id}} surface, saw {checked}"
+
+
+# ---- PHASE 5.2.1: a simulation must never be recorded as a real execution ----
+#
+# `Provider.execute()` dry-runs when no sender is injected, returning ok=True
+# with a synthetic `dry_run=True` reference. That is CORRECT for
+# `_DEFAULT_PROVIDERS` — the tests above depend on it and it keeps the suite off
+# Google. It was a silent misconfiguration in `production_providers()`, where
+# `send_slack` was registered with no sender: an approved Slack action ran the
+# dry-run branch, the worker recorded EXECUTED, and Observation captured a
+# success for a message that was never sent.
+
+
+def test_production_registry_never_serves_a_simulating_provider():
+    """THE invariant, and the reason this fix generalises.
+
+    Any provider in the production registry either reaches a real external
+    system (`is_live`) or refuses outright (`unsupported`). Nothing in between —
+    a provider that would return a synthetic dry-run reference cannot be served
+    to the worker, so no future connector can be wired without its sender and
+    quietly report fake successes.
+    """
+    from navis.execution.providers import production_providers
+
+    for action_type, provider in production_providers().items():
+        assert provider.is_live or provider.unsupported, (
+            f"{action_type} would SIMULATE in production: no sender is wired and "
+            f"{type(provider).__name__} does not refuse, so an approved action "
+            "would be recorded as EXECUTED without happening"
+        )
+
+
+def test_unsupported_providers_are_still_served_in_production():
+    """`create_task` has no sender and never will until a backend exists, but it
+    raises at validate() rather than simulating. Keeping it is deliberate: it
+    can explain itself, where a withheld type dead-ends on 'no provider'."""
+    from navis.execution.providers import production_providers
+
+    registry = production_providers()
+    assert ActionType.CREATE_TASK.value in registry
+    assert registry[ActionType.CREATE_TASK.value].unsupported is True
+
+
+async def test_a_simulating_provider_cannot_reach_executed_in_production():
+    """A provider with NO sender must never report success in production.
+
+    The original reproduction used `send_slack`, which was wired into the
+    production registry with no sender: it ran the dry-run branch, the worker
+    recorded EXECUTED, and Observation captured a success for a message that was
+    never sent. Slack now HAS a real sender (see providers/_senders.py), so it is
+    no longer an example of the defect — the mechanism is therefore pinned with a
+    constructed senderless provider, which keeps this invariant under test for
+    every connector that ships after this one rather than until the next one does.
+    """
+    from navis.execution.providers import _production_safe
+    from navis.execution.providers.base import Provider
+
+    class _Unwired(Provider):
+        name = "slack"
+        action_type = "send_slack"
+
+        def __init__(self):
+            self._sender = None  # is_live -> False: would simulate
+
+        async def validate(self, payload):
+            pass
+
+        async def execute(self, payload):  # pragma: no cover - must be unreachable
+            raise AssertionError("a withheld provider must never execute")
+
+        async def status(self, reference):
+            return "sent"
+
+    registry = _production_safe({"send_slack": _Unwired()})
+    assert registry == {}, "a provider that would simulate must be withheld"
+
+    repo = FakeExecutionRepo()
+    svc = ExecutionService(repo=repo)
+    req, _ = await svc.request(
+        ORG_A, DECISION, ActionType.SEND_SLACK.value,
+        {"channel": "#general", "text": "hello"},
+        reasoning_signal_ids=[], reasoning_version=1, state_watermark="wm",
+    )
+    await svc.approve(req.id, USER)
+
+    result = await execute_pass(repo, providers=registry, policy=FAST)
+
+    assert result == {"executed": 0, "failed": 1, "skipped": 0}
+    assert req.status == ExecutionStatus.FAILED.value
+    # The three things that made the old behaviour a lie.
+    assert req.executed_at is None
+    assert req.provider_reference == {}
+    assert EventType.ACTION_EXECUTED.value not in event_types(repo)
+    # Observation is told the truth instead.
+    assert EventType.ACTION_FAILED.value in event_types(repo)
+    # And it is preserved for an operator rather than silently dropped.
+    assert [d.action_type for d in repo.dead_letters] == [ActionType.SEND_SLACK.value]
+
+
+async def test_a_live_provider_still_executes_and_keeps_its_reference():
+    """Guards against over-correction: the fix must not touch the real path.
+
+    A wired provider still reaches EXECUTED and its genuine external id still
+    survives onto the row and into the outcome Observation consumes.
+    """
+    async def sender(payload):
+        return "real-gmail-id-123"
+
+    repo = FakeExecutionRepo()
+    svc = ExecutionService(repo=repo)
+    req, _ = await svc.request(
+        ORG_A, DECISION, ActionType.SEND_EMAIL.value,
+        {"to": "a@x.com", "subject": "Hi", "body": "Real body"},
+        reasoning_signal_ids=[], reasoning_version=1, state_watermark="wm",
+    )
+    await svc.approve(req.id, USER)
+
+    live = GmailProvider(sender=sender)
+    assert live.is_live is True
+    result = await execute_pass(
+        repo, providers={ActionType.SEND_EMAIL.value: live}, policy=FAST
+    )
+
+    assert result["executed"] == 1
+    assert req.status == ExecutionStatus.EXECUTED.value
+    assert req.executed_at is not None
+    assert req.provider_reference["external_id"] == "real-gmail-id-123"
+    assert "dry_run" not in req.provider_reference
+    executed = [e for e in repo.events if e.event_type == EventType.ACTION_EXECUTED.value]
+    assert executed[0].payload["outcome"]["provider_reference"]["external_id"] == (
+        "real-gmail-id-123"
+    )

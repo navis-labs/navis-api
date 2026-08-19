@@ -119,6 +119,29 @@ celery_app.conf.beat_schedule = {
         "task": "navis.execution.worker.recover_stale_executions",
         "schedule": 60,
     },
+    # ML: embed every memory fact that has no vector at the current write pin.
+    #
+    # This is the ONLY path by which most of Memory becomes searchable. The
+    # real-time subscriber (ml/embeddings/subscribers.py) reacts to bus pointer
+    # events, and `memory.service._BUS_EVENT_FOR_ENTITY` publishes those for only
+    # five entity types — so THREAD, COMPANY, MEETING, DOCUMENT, CHANNEL and
+    # CUSTOMER facts are never embedded by it. The sweeper was written as that
+    # safety net but was never scheduled, so those types had zero vectors and
+    # /chat could not recall a single email thread, meeting or document.
+    #
+    # Safe to run on a timer: keyset-paginated with a persisted cursor, bounded
+    # per invocation, and it selects only records lacking a vector at this pin —
+    # so a pass with nothing pending is one empty query and zero provider calls.
+    # Writes are idempotent (ON CONFLICT DO NOTHING on a deterministic id), so an
+    # overlapping run costs a wasted embed at worst, never a duplicate.
+    #
+    # Five minutes matches `sync-signals`: a fact is retrievable within roughly
+    # one sync cycle of landing, and the five subscriber-covered types stay
+    # instant.
+    "embed-memory-backlog": {
+        "task": "navis.ml.embeddings.jobs.embed_all_orgs",
+        "schedule": 60 * 5,
+    },
     # Identity hygiene: reap expired sessions + expired revoked-token rows. Hourly is
     # ample — expiry is already enforced at auth time; this only reclaims storage. Both
     # are idempotent index-served bulk DELETEs, so overlap/re-run is harmless.

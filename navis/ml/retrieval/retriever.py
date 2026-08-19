@@ -15,8 +15,9 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from navis.memory.envelope import EntityType
 from navis.memory.lineage import lineage_by_memory_id
-from navis.memory.meetings import cancelled_meeting_memory_ids
+from navis.memory.meetings import cancelled_meeting_entity_ids
 from navis.ml.embeddings.pins import EmbeddingPin, read_pin
 from navis.ml.retrieval.dedupe import collapse_by_event
 from navis.ml.retrieval.reranker import rerank
@@ -111,18 +112,60 @@ class MemoryRetriever:
         #
         # Suppression is a READ concern only: nothing is deleted, and anything
         # that legitimately wants to know what used to be true still can.
-        cancelled = await cancelled_meeting_memory_ids(
-            self.db, org_id, [h.memory_id for h in ranked]
-        )
-        if cancelled:
-            ranked = [h for h in ranked if h.memory_id not in cancelled]
+        #
+        # RESOLVED FROM WHAT WE ALREADY HAVE, NOT RE-QUERIED. `cancelled_meeting_
+        # memory_ids` opens with a round trip that maps candidate memory_ids to
+        # their meeting entity_ids — data this method is already holding twice
+        # over: `Hit.entity_type` is denormalised onto memory_embeddings from the
+        # memory record itself (embeddings/service.py), and `lineage` carries
+        # every candidate's `entity_id`. Memory is append-only and immutable, so
+        # neither copy can drift from the record.
+        #
+        # That made the lookup a pure network cost. Measured against the
+        # production database: server-side execution of the whole retrieval query
+        # is 4.3ms while ONE round trip is ~930ms, so retrieval is round-trip
+        # bound, and this one cost 0.9-2.1s per turn — including turns with no
+        # meeting among the candidates at all, which now issue no query.
+        #
+        # Identical semantics: the same candidates, filtered on the same
+        # entity_type, resolved to the same entity_ids, answered by the same
+        # `cancelled_meeting_entity_ids`. Org isolation is unchanged — the
+        # candidates came from an org-scoped search and that function applies its
+        # own `organization_id` filter.
+        entity_by_memory: dict[uuid.UUID, uuid.UUID] = {}
+        for h in ranked:
+            if h.entity_type != EntityType.MEETING.value:
+                continue
+            fact = lineage.get(h.memory_id)
+            if fact is not None and fact.entity_id is not None:
+                entity_by_memory[h.memory_id] = fact.entity_id
+        if entity_by_memory:
+            cancelled_entities = await cancelled_meeting_entity_ids(
+                self.db, org_id, set(entity_by_memory.values())
+            )
+            cancelled = {
+                m for m, e in entity_by_memory.items() if e in cancelled_entities
+            }
+            if cancelled:
+                ranked = [h for h in ranked if h.memory_id not in cancelled]
 
-        # Collapse to one fact per event BEFORE taking the top k, so dedup frees
-        # slots for other events instead of shortening the answer. This is why
-        # the wider candidate pool from Phase 2B matters: there is enough material
-        # behind the duplicates to fill k with distinct events.
+        # Collapse BEFORE taking the top k, so dedup frees slots for other
+        # material instead of shortening the answer. This is why the wider
+        # candidate pool matters: there is enough behind the duplicates to fill
+        # k with distinct facts.
+        #
+        # Entity first, then event. They remove different repetitions and both
+        # are needed: one entity is re-observed across many events (5.7 records
+        # per person), and one event produces many entities. Entity-first also
+        # keeps the answer's entity types diverse, because it is the
+        # high-multiplicity types (person, relationship, company) that would
+        # otherwise take every slot from threads, meetings and documents.
+        def entity_of(hit: Hit) -> uuid.UUID | None:
+            fact = lineage.get(hit.memory_id)
+            return fact.entity_id if fact else None
+
         def event_of(hit: Hit) -> uuid.UUID | None:
             fact = lineage.get(hit.memory_id)
             return fact.source_signal_event_id if fact else None
 
-        return collapse_by_event(ranked, event_of)[:k]
+        return collapse_by_event(collapse_by_event(ranked, entity_of), event_of)[:k]

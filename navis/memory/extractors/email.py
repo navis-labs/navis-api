@@ -199,6 +199,36 @@ def classify_email(payload: dict) -> str:
     return "personal"
 
 
+def sender_classification(payload: dict) -> dict:
+    """The message's classification, as it applies to its SENDER.
+
+    WHY THIS IS SENDER-SCOPED. Every input the two classifiers above read —
+    List-Id, Precedence, Auto-Submitted, the Gmail tab label, the no-reply
+    local-part — describes how the SENDING address mails. None of them says
+    anything about who was on `to` or `cc`. A founder cc'd on a promotional
+    blast is not automated; the blast is. So these keys are attached ONLY to the
+    from-address's facts (see PersonExtractor / RelationshipExtractor) and never
+    to a recipient's, whose own entity would otherwise inherit — under State's
+    latest-non-null-wins fold — a flag that was never about them.
+
+    WHY IT IS NOT SUPPRESSION. The record is still written, in full, for every
+    address. This preserves the observation "this address sends automated mail"
+    as a fact ABOUT the counterparty; it never asserts that they do not exist.
+    A Calendly notification remains real evidence that Calendly contacted the
+    org — it is simply legible as a service notification rather than as a human
+    business relationship.
+
+    Same two keys, same values, as the THREAD fact already carries, so a
+    reasoning engine reading a person or a relationship can apply the exact
+    gates `reasoning/v2/engines/waiting.py` already applies to threads. One
+    classifier, not a second divergent notion of "is this a real person".
+    """
+    return {
+        "is_automated": is_automated_email(payload),
+        "category": classify_email(payload),
+    }
+
+
 # --- Body cleanup ------------------------------------------------------------
 
 # Quoted history + signature markers. Without this, every reply re-extracts the
@@ -263,20 +293,41 @@ def _fact_key(text: str) -> str:
 
 
 class PersonExtractor(Extractor):
-    name = "email_person"
-    version = "1.0.0"
+    # RENAMED from "email_person" (see memory.ids EVOLUTION LAW). 1.1.0 carries
+    # the sender classification, and the identity tuple excludes `version` — so
+    # under the old name a replay re-derives the SAME memory_ids, hits ON
+    # CONFLICT DO NOTHING, and the new keys never land on any org already
+    # ingested. That is exactly the trap ThreadExtractor (1.2.0) and
+    # CommitmentExtractor (1.3.0) fell into; the law prescribes moving the name
+    # for a change that SHOULD produce new facts.
+    #
+    # `entity_natural_key` is deliberately still the bare email, so v2 records
+    # fold onto the SAME person entity instead of forking a second one. v1 and
+    # v2 records of one message share an event_timestamp, so the fold falls back
+    # to memory_id order — safe in both directions: every key they share carries
+    # an identical value, every key v2 adds is ABSENT from v1, and
+    # latest-NON-NULL-wins cannot be clobbered by an absent key. Old rows stay
+    # exactly as written; nothing is deleted or mutated.
+    name = "email_person_v2"
+    version = "1.1.0"
     sources = _GMAIL
 
     def extract(self, signal: SignalView) -> list[MemoryDraft]:
         ver = current_version(EntityType.PERSON)
+        # Computed once per message; attached to the SENDER only — see
+        # `sender_classification` for why a recipient must not inherit it.
+        classification = sender_classification(signal.payload)
         drafts = []
         for role, name, email in _addresses(signal.payload):
+            payload = {"email": email, "name": name or None, "role": role}
+            if role == "from":
+                payload.update(classification)
             drafts.append(
                 MemoryDraft(
                     entity_type=EntityType.PERSON,
                     entity_natural_key=email,
                     dedup_key=email,  # one PERSON fact per address per signal
-                    payload={"email": email, "name": name or None, "role": role},
+                    payload=payload,
                     confidence=HIGH,
                     schema_version=ver,
                 )
@@ -285,6 +336,15 @@ class PersonExtractor(Extractor):
 
 
 class CompanyExtractor(Extractor):
+    # DELIBERATELY NOT CLASSIFIED. A COMPANY here is a DOMAIN, and a domain is
+    # not a mailer: acme.com legitimately carries both alice@acme.com (human)
+    # and no-reply@acme.com (receipts). Under State's latest-non-null-wins fold
+    # a single `is_automated` on the company entity would simply track whichever
+    # of them mailed most recently — an actively misleading fact, and one that
+    # would let a reasoning engine dismiss a real customer because their billing
+    # robot spoke last. The classification is address-scoped, so it lives on the
+    # address-scoped entities (PERSON, RELATIONSHIP) and nowhere else. Left at
+    # name "email_company"/1.0.0 precisely because nothing changed.
     name = "email_company"
     version = "1.0.0"
     sources = _GMAIL
@@ -435,22 +495,44 @@ class ThreadExtractor(Extractor):
 
 
 class RelationshipExtractor(Extractor):
-    name = "email_relationship"
-    version = "1.0.0"
+    """One observed interaction per address on the message.
+
+    1.1.0 carries the sender classification onto the from-address's fact. Before
+    it, RELATIONSHIP recorded only `direction`, which is why every newsletter and
+    vendor robot entered State indistinguishable from a human counterparty: a
+    reasoning engine reading relationships had no field on which it COULD tell
+    them apart, while one reading THREADs (which has carried `category` /
+    `is_automated` since 1.2.0) could. This closes that asymmetry at the source.
+
+    RENAMED from "email_relationship" (see memory.ids EVOLUTION LAW) for the
+    same reason spelled out on PersonExtractor: the identity tuple excludes
+    `version`, so keeping the name would mean the new keys never reach an
+    already-ingested org. `entity_natural_key` stays the bare email so v2 folds
+    onto the SAME relationship entity, and v1's absent keys cannot clobber v2's.
+    """
+
+    name = "email_relationship_v2"
+    version = "1.1.0"
     sources = _GMAIL
 
     def extract(self, signal: SignalView) -> list[MemoryDraft]:
         ver = current_version(EntityType.RELATIONSHIP)
+        # Computed once per message; attached to the SENDER only — see
+        # `sender_classification` for why a recipient must not inherit it.
+        classification = sender_classification(signal.payload)
         drafts = []
         for role, _name, email in _addresses(signal.payload):
             direction = "inbound" if role == "from" else "outbound"
+            # An OBSERVED interaction — no health, no score.
+            payload = {"person_email": email, "direction": direction, "via": "email"}
+            if role == "from":
+                payload.update(classification)
             drafts.append(
                 MemoryDraft(
                     entity_type=EntityType.RELATIONSHIP,
                     entity_natural_key=email,
                     dedup_key=f"{direction}:{email}",
-                    # An OBSERVED interaction — no health, no score.
-                    payload={"person_email": email, "direction": direction, "via": "email"},
+                    payload=payload,
                     confidence=HIGH,
                     schema_version=ver,
                 )

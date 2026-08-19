@@ -54,23 +54,25 @@ async def _org(engine) -> uuid.UUID:
         return org.id
 
 
-async def _add_brief(engine, org_id, *, as_of, decisions):
+async def _add_brief(
+    engine, org_id, *, as_of, decisions, reasoning_version=2, state_watermark=None
+):
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from navis.decisions.models import DailyBrief
 
     async with AsyncSession(engine, expire_on_commit=False) as s:
-        s.add(
-            DailyBrief(
-                id=uuid.uuid4(),
-                organization_id=org_id,
-                reasoning_version=2,
-                state_watermark=None,
-                as_of=as_of,
-                decisions=decisions,
-            )
+        brief = DailyBrief(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            reasoning_version=reasoning_version,
+            state_watermark=state_watermark,
+            as_of=as_of,
+            decisions=decisions,
         )
+        s.add(brief)
         await s.commit()
+        return brief.id
 
 
 async def _latest(engine, org_id):
@@ -167,3 +169,87 @@ async def test_an_undated_brief_is_still_returned_when_it_is_the_only_one(engine
     got = await _latest(engine, org)
     assert got is not None
     assert got.as_of is None
+
+
+# ── 5. two projections of ONE snapshot — the corrected one wins ────────
+#
+# `as_of` is State's logical time, so reprojecting a snapshot under corrected
+# reasoning writes a second brief with a byte-identical `as_of`. Live, org
+# 071ae55b holds two briefs at 2026-08-17 16:11:12 (reasoning v3 and v4) and org
+# df7d1c0a holds the same pair at 15:26:36. `as_of DESC LIMIT 1` alone picked
+# between them by whatever order Postgres happened to scan in.
+
+
+async def test_the_newer_reasoning_version_wins_when_as_of_ties(engine):
+    org = await _org(engine)
+    await _add_brief(engine, org, as_of=NOW, decisions=[{"n": "v3"}],
+                     reasoning_version=3, state_watermark="wm-1")
+    await _add_brief(engine, org, as_of=NOW, decisions=[{"n": "v4"}],
+                     reasoning_version=4, state_watermark="wm-1")
+
+    got = await _latest(engine, org)
+    assert got.reasoning_version == 4, "the superseded projection was served"
+    assert got.decisions == [{"n": "v4"}]
+
+
+async def test_the_tie_break_is_stable_whatever_the_insert_order(engine):
+    """The corrected brief was written SECOND live, so an accidental dependence
+    on physical row order would pass. Insert newest-first to rule that out."""
+    org = await _org(engine)
+    await _add_brief(engine, org, as_of=NOW, decisions=[{"n": "v4"}],
+                     reasoning_version=4, state_watermark="wm-1")
+    await _add_brief(engine, org, as_of=NOW, decisions=[{"n": "v3"}],
+                     reasoning_version=3, state_watermark="wm-1")
+
+    assert (await _latest(engine, org)).reasoning_version == 4
+    # Deterministic: repeated reads never disagree.
+    for _ in range(5):
+        assert (await _latest(engine, org)).decisions == [{"n": "v4"}]
+
+
+async def test_the_superseded_brief_is_preserved_not_deleted(engine):
+    """The read chooses; it never rewrites history. The old projection stays
+    stored and stays reachable by its own id."""
+    from sqlalchemy import func, select
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from navis.decisions.models import DailyBrief
+
+    org = await _org(engine)
+    old_id = await _add_brief(engine, org, as_of=NOW, decisions=[{"n": "v3"}],
+                              reasoning_version=3, state_watermark="wm-1")
+    await _add_brief(engine, org, as_of=NOW, decisions=[{"n": "v4"}],
+                     reasoning_version=4, state_watermark="wm-1")
+
+    await _latest(engine, org)
+    async with AsyncSession(engine, expire_on_commit=False) as s:
+        total = await s.scalar(
+            select(func.count(DailyBrief.id)).where(DailyBrief.organization_id == org)
+        )
+        old = await s.get(DailyBrief, old_id)
+    assert total == 2
+    assert old is not None and old.decisions == [{"n": "v3"}]
+
+
+async def test_a_newer_snapshot_still_beats_a_newer_reasoning_version(engine):
+    """`as_of` remains the primary key of the ordering. A v3 brief describing a
+    LATER snapshot is the current one; the tie-break only settles equal snapshots."""
+    org = await _org(engine)
+    await _add_brief(engine, org, as_of=NOW - timedelta(days=1),
+                     decisions=[{"n": "old-v4"}], reasoning_version=4)
+    await _add_brief(engine, org, as_of=NOW, decisions=[{"n": "new-v3"}],
+                     reasoning_version=3)
+
+    got = await _latest(engine, org)
+    assert got.as_of == NOW and got.decisions == [{"n": "new-v3"}]
+
+
+async def test_a_single_version_org_is_unaffected(engine):
+    """No regression for an org that has only ever run one reasoning version."""
+    org = await _org(engine)
+    await _add_brief(engine, org, as_of=NOW - timedelta(days=1), decisions=[{"n": 1}])
+    await _add_brief(engine, org, as_of=NOW, decisions=[{"n": 2}])
+
+    got = await _latest(engine, org)
+    assert got.reasoning_version == 2 and got.decisions == [{"n": 2}]
+

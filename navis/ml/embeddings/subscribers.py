@@ -17,8 +17,16 @@ Coverage gap (deliberate, matches existing pointer wiring):
 COMMITMENT / DECISION / RELATIONSHIP to the bus. Other entity types (COMPANY,
 CUSTOMER, MEETING, THREAD, CHANNEL, DOCUMENT) are memory-only today, so they
 will NOT be embedded by this subscriber. Backfill / sweeper via
-`navis.ml.embeddings.jobs.embed_org` remains the mechanism that catches them
-(and also any record whose subscriber invocation dead-letters).
+`navis.ml.embeddings.jobs.embed_org` is the mechanism that catches them (and
+also any record whose subscriber invocation dead-letters).
+
+That sweeper is the load-bearing half of this design and it now RUNS: it is on
+the Celery beat as `embed-memory-backlog` (every 5 min). It was not, which is
+why the six types above had zero vectors and retrieval could not reach a single
+email thread, meeting or document. Adding bus events for them purely to feed
+this subscriber would make Memory publish domain events for ML's benefit —
+the wrong direction — so coverage stays split: five types instant, the rest
+within one sweep.
 """
 from __future__ import annotations
 

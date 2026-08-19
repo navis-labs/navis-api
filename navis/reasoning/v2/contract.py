@@ -16,7 +16,17 @@ from typing import Any
 # Bump when ANY engine's logic/thresholds change → signals get new ids, replay-safe.
 # v2: added MAX_SURFACE_AGE_DAYS cap to risk.py engines so signals aren't
 #     emitted for entities silent > 30 days (see engines/risk.py header).
-REASONING_VERSION = 2
+# v3: OpportunityEngine decides organizational relevance from the SET of
+#     signal_importance classifications observed across a relationship, instead
+#     of emitting for every recent inbound address (see engines/meta.py).
+# v4: RelationshipReasoningEngine applies that same relevance vocabulary, now
+#     shared from base.py, and REQUIRES human-bearing evidence rather than
+#     merely suppressing on evidence of irrelevance. Live, RELATIONSHIP_COOLING
+#     was firing for newsletters, billing robots and no-reply senders, and
+#     Intelligence aggregated them into organizational risk. PriorityEngine's
+#     cooling count moved under the same gate so PRIORITY_LOAD cannot contradict
+#     the signals. Historical v3 signal ids stay immutable and are not re-minted.
+REASONING_VERSION = 4
 
 _REASONING_NAMESPACE = uuid.UUID("7a2b9c14-3d5e-5f60-8b1a-9c0d2e4f6a81")
 

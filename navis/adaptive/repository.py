@@ -1,9 +1,19 @@
 """AdaptiveRepository — reads ONLY Intelligence + Learning; writes adaptive_*.
 
 Upstream dependency is strictly {Intelligence, Learning}. This module imports
-navis.intelligence.models and navis.learning.models and nothing else from the
+navis.intelligence.repository and navis.learning.models and nothing else from the
 pipeline. It never touches Signals/Memory/State/Reasoning/Decision/Execution/
 Observation.
+
+Intelligence is read THROUGH ITS OWN REPOSITORY, not with a query of our own.
+`intelligence_insights` is append-only, so every projection an org has ever run is
+still in the table and a bare `select()` returns all of them at once — which is
+what this module used to do. `IntelligenceRepository.get_insights` owns the rule
+that decides which projection is current (newest per key for Learning-derived
+insights, the newest whole snapshot for reality-derived ones), and duplicating
+that rule here would mean Adaptive folding superseded conclusions into policy
+while `GET /intelligence/insights` served the corrected ones. One read boundary,
+one answer.
 """
 from __future__ import annotations
 
@@ -23,7 +33,7 @@ from navis.adaptive.contract import (
 )
 from navis.adaptive.models import PolicyApproval, PolicyProposal, PolicySnapshot
 from navis.adaptive.policy import merge_defaults
-from navis.intelligence.models import IntelligenceInsight
+from navis.intelligence.repository import IntelligenceRepository
 from navis.learning.models import AggregateDimension, LearningAggregate, LearningPattern
 
 
@@ -45,11 +55,11 @@ class AdaptiveRepository:
         return [AggRow(r.key, r.successes, r.failures, r.neutrals, r.total) for r in rows]
 
     async def build_view(self, org_id: uuid.UUID) -> AdaptiveView:
-        insight_rows = (
-            await self.db.scalars(
-                select(IntelligenceInsight).where(IntelligenceInsight.organization_id == org_id)
-            )
-        ).all()
+        # The org's CURRENT insights — the same rows GET /intelligence/insights
+        # serves. Org isolation, the current/superseded rule and the ordering all
+        # come from Intelligence's own boundary; nothing about them is restated
+        # here. See the module docstring.
+        insight_rows = await IntelligenceRepository(self.db).get_insights(org_id)
         insights = [
             InsightRow(
                 insight_id=str(r.insight_id),

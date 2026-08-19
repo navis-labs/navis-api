@@ -494,3 +494,285 @@ def test_informational_email_records_no_decision_request(body):
     from navis.memory.extractors.email import DecisionRequestExtractor
 
     assert DecisionRequestExtractor().extract(_email(body_text=body)) == []
+
+
+# ── P0-1: the sender classification reaches PERSON and RELATIONSHIP ────
+#
+# The classifier was already correct and already ran on every message, but its
+# output was attached ONLY to the THREAD fact. RELATIONSHIP carried `direction`
+# and nothing else, so a newsletter blast and a human counterparty entered State
+# indistinguishable — which is why an engine reading threads could filter noise
+# and one reading relationships structurally could not. These pin the fix:
+# the classification is PRESERVED onto the address-scoped entities, scoped to
+# the SENDER, and nothing is suppressed.
+
+import uuid  # noqa: E402
+
+from navis.memory.envelope import EntityType  # noqa: E402
+from navis.memory.extractors.email import (  # noqa: E402
+    CompanyExtractor,
+    PersonExtractor,
+    RelationshipExtractor,
+)
+from navis.memory.service import build_memory_records  # noqa: E402
+from navis.state.v2.builders import MemoryRecordView, build_projection  # noqa: E402
+from tests.memory.fakes import EVENT, INTEG, ORG  # noqa: E402
+
+ORG_B = uuid.UUID("99999999-9999-9999-9999-999999999999")
+
+_NEWSLETTER = {
+    "from": "Open Scout <openscout+on-the-side@substack.com>",
+    "to": "founder@navis.com",
+    "subject": "This week in AI",
+    "thread_id": "t-nl",
+    "sender_email": "openscout+on-the-side@substack.com",
+    "label_ids": ["CATEGORY_PROMOTIONS"],
+    "body_text": "Five links you should read this week.",
+}
+_HUMAN = {
+    "from": "Alice <alice@acme.com>",
+    "to": "founder@navis.com",
+    "subject": "Q3 pricing",
+    "thread_id": "t-h",
+    "sender_email": "alice@acme.com",
+    "label_ids": ["INBOX", "CATEGORY_PERSONAL"],
+    "body_text": "Can we talk Thursday about pricing?",
+}
+
+
+def _draft(drafts, dedup_key):
+    return next(d for d in drafts if d.dedup_key == dedup_key)
+
+
+# 1. Human sender
+
+
+def test_a_human_sender_is_recorded_as_not_automated():
+    view = gmail_view(payload=_HUMAN)
+
+    person = _draft(PersonExtractor().extract(view), "alice@acme.com")
+    assert person.payload["is_automated"] is False
+    assert person.payload["category"] == "personal"
+
+    rel = _draft(RelationshipExtractor().extract(view), "inbound:alice@acme.com")
+    assert rel.payload["is_automated"] is False
+    assert rel.payload["category"] == "personal"
+
+
+# 2. Automated / newsletter sender
+
+
+def test_a_newsletter_sender_is_flagged_but_still_fully_remembered():
+    """Preserve classification, do NOT delete evidence: the address remains a
+    fact, it is simply legible as a service blast rather than a human party."""
+    view = gmail_view(payload=_NEWSLETTER)
+    people = PersonExtractor().extract(view)
+    rels = RelationshipExtractor().extract(view)
+
+    # Nothing suppressed — every address on the message still becomes a fact.
+    assert {d.dedup_key for d in people} == {
+        "openscout+on-the-side@substack.com", "founder@navis.com"
+    }
+    assert len(rels) == 2
+
+    sender = _draft(people, "openscout+on-the-side@substack.com")
+    assert sender.payload["is_automated"] is True
+    assert sender.payload["category"] == "promotional"
+    assert sender.payload["email"] == "openscout+on-the-side@substack.com"  # still there
+
+    rel = _draft(rels, "inbound:openscout+on-the-side@substack.com")
+    assert rel.payload["is_automated"] is True
+    assert rel.payload["category"] == "promotional"
+
+
+def test_a_recipient_never_inherits_the_senders_classification():
+    """The founder cc'd on a promotional blast is not automated; the blast is.
+    Every input the classifier reads describes how the FROM address mails, so a
+    recipient's own entity must not pick the flag up under latest-wins folding."""
+    view = gmail_view(payload=_NEWSLETTER)
+
+    founder = _draft(PersonExtractor().extract(view), "founder@navis.com")
+    assert "is_automated" not in founder.payload
+    assert "category" not in founder.payload
+
+    rel = _draft(RelationshipExtractor().extract(view), "outbound:founder@navis.com")
+    assert "is_automated" not in rel.payload
+    assert "category" not in rel.payload
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"label_ids": ["CATEGORY_PROMOTIONS"]},          # Gmail's own tab
+        {"label_ids": ["CATEGORY_UPDATES"]},             # receipts / OTPs
+        {"list_id": "<openscout.substack.com>"},         # RFC List-Id
+        {"precedence": "bulk"},                          # RFC precedence
+        {"auto_submitted": "auto-generated"},            # RFC 3834
+    ],
+)
+def test_every_automation_marker_the_classifier_knows_reaches_the_relationship(extra):
+    """One classifier, not two: whatever makes a THREAD automated must make the
+    sender's RELATIONSHIP automated by exactly the same rule."""
+    payload = {**_HUMAN, "label_ids": [], **extra}
+    view = gmail_view(payload=payload)
+
+    thread = ThreadExtractor().extract(view)[0]
+    rel = _draft(RelationshipExtractor().extract(view), "inbound:alice@acme.com")
+
+    assert thread.payload["is_automated"] is True
+    assert rel.payload["is_automated"] is thread.payload["is_automated"]
+    assert rel.payload["category"] == thread.payload["category"]
+
+
+def test_company_deliberately_carries_no_classification():
+    """A COMPANY is a DOMAIN, and one domain hosts both alice@acme.com and
+    no-reply@acme.com. A latest-wins flag there would track whichever mailed
+    last — so the field is omitted rather than added to satisfy symmetry."""
+    companies = CompanyExtractor().extract(gmail_view(payload=_NEWSLETTER))
+    assert companies
+    for c in companies:
+        assert "is_automated" not in c.payload
+        assert "category" not in c.payload
+
+
+# 3. Existing records without the fields
+
+
+def _rel_record(payload: dict, *, tag: str, org_id=ORG) -> MemoryRecordView:
+    from datetime import datetime, timezone
+
+    ns = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    return MemoryRecordView(
+        memory_id=uuid.uuid5(ns, f"mem:{org_id}:{tag}"),
+        org_id=org_id,
+        entity_type=EntityType.RELATIONSHIP.value,
+        entity_id=uuid.uuid5(ns, f"ent:{org_id}:relationship:alice@acme.com"),
+        event_timestamp=datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+        payload=payload,
+        source_signal_event_id=uuid.uuid5(ns, f"sig:{org_id}:{tag}"),
+        schema_version=1,
+        confidence=0.9,
+    )
+
+
+def test_records_written_before_the_fields_existed_still_fold():
+    """Additive keys, no schema bump, no migration: a v1 payload loads and folds
+    exactly as before and reads back as UNKNOWN — never as "this is a human"."""
+    state = build_projection(
+        ORG,
+        [_rel_record({"person_email": "alice@acme.com", "direction": "inbound"}, tag="v1")],
+    )
+    (r,) = state.relationships()
+    assert r.person_email == "alice@acme.com"
+    assert r.directions == ["inbound"]
+    assert r.is_automated is None      # unknown, NOT False
+    assert r.category is None
+
+
+def test_an_old_record_cannot_clobber_the_new_classification():
+    """The v1/v2 coexistence argument, executed. Both facts of one message share
+    an event_timestamp, so the fold falls back to memory_id order — but v1 simply
+    LACKS the keys, and latest-NON-NULL-wins cannot be clobbered by an absent
+    key. Deterministic whichever way the records arrive."""
+    v1 = _rel_record({"person_email": "alice@acme.com", "direction": "inbound"}, tag="v1")
+    v2 = _rel_record(
+        {"person_email": "alice@acme.com", "direction": "inbound",
+         "is_automated": True, "category": "promotional"},
+        tag="v2",
+    )
+    for order in ([v1, v2], [v2, v1]):
+        (r,) = build_projection(ORG, order).relationships()
+        assert r.is_automated is True
+        assert r.category == "promotional"
+
+
+# 4. Provenance
+
+
+def test_classified_facts_keep_their_full_signal_lineage():
+    records = build_memory_records(gmail_view(payload=_NEWSLETTER))
+    classified = [r for r in records if (r.payload or {}).get("is_automated") is not None]
+
+    # person + relationship for the sender, and the thread fact.
+    assert {r.entity_type for r in classified} == {
+        EntityType.PERSON, EntityType.RELATIONSHIP, EntityType.THREAD
+    }
+    for r in classified:
+        assert r.org_id == ORG
+        assert r.source_signal_event_id == EVENT
+        assert r.source_integration_id == INTEG
+        assert r.extractor_name and r.extractor_version
+
+
+# 5. Organization isolation
+
+
+def test_classification_is_scoped_to_one_organization():
+    """The same message ingested for two orgs yields disjoint memory_ids AND
+    disjoint entity_ids, so one org's classification can never land on another
+    org's entity."""
+    a = build_memory_records(gmail_view(payload=_NEWSLETTER))
+    b = build_memory_records(gmail_view(payload=_NEWSLETTER, org_id=ORG_B))
+
+    def classified_entities(records):
+        return {r.entity_id for r in records if (r.payload or {}).get("is_automated") is not None}
+
+    assert classified_entities(a) and classified_entities(b)
+    assert classified_entities(a).isdisjoint(classified_entities(b))
+    assert {r.memory_id for r in a}.isdisjoint({r.memory_id for r in b})
+    assert all(r.org_id == ORG for r in a)
+    assert all(r.org_id == ORG_B for r in b)
+
+
+# 6. THREAD behaviour is untouched
+
+
+def test_thread_classification_and_identity_are_unchanged():
+    """THREAD was already correct. P0-1 must not move its extractor name, its
+    version, or a single payload key."""
+    assert ThreadExtractor.name == "email_thread_v2"
+    assert ThreadExtractor.version == "1.2.0"
+
+    payload = ThreadExtractor().extract(gmail_view(payload=_NEWSLETTER))[0].payload
+    assert payload["category"] == "promotional"
+    assert payload["is_automated"] is True
+    assert payload["thread_id"] == "t-nl"
+    assert payload["direction"] == "inbound"
+
+
+# 7. WaitingReplyEngine behaviour is untouched
+
+
+def test_waiting_on_reply_is_unaffected_by_relationship_classification():
+    """The engine reads THREADs. Adding fields to RELATIONSHIP must not couple
+    it: a human thread still fires even when the same address also carries an
+    automated relationship fact, and an automated thread still does not."""
+    from datetime import timedelta
+
+    from navis.reasoning.v2 import run_reasoning_v2
+    from navis.reasoning.v2.contract import SignalType
+    from tests.reasoning.test_waiting_on_reply import NOW, ORG as W_ORG, _msg
+
+    automated_rel = MemoryRecordView(
+        memory_id=uuid.uuid5(uuid.NAMESPACE_DNS, "rel-auto"),
+        org_id=W_ORG,
+        entity_type=EntityType.RELATIONSHIP.value,
+        entity_id=uuid.uuid5(uuid.NAMESPACE_DNS, "ent-rel-auto"),
+        event_timestamp=NOW - timedelta(days=4),
+        payload={"person_email": "john@partner.com", "direction": "inbound",
+                 "is_automated": True, "category": "promotional"},
+        source_signal_event_id=uuid.uuid5(uuid.NAMESPACE_DNS, "sig-rel-auto"),
+        schema_version=1,
+        confidence=0.9,
+    )
+    state = build_projection(
+        W_ORG,
+        [_msg("t-1", days_ago=4, direction="inbound"), automated_rel],
+        as_of=NOW,
+    )
+    waiting = [
+        s for s in run_reasoning_v2(state)
+        if s.signal_type is SignalType.WAITING_ON_USER_REPLY
+    ]
+    assert len(waiting) == 1
+    assert "John Carter" in waiting[0].title

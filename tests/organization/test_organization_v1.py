@@ -110,6 +110,62 @@ async def test_can_use_unknown_capability_denies_not_raises():
     assert await ent.can_use(ORG_A, "not_a_real_capability") is False
 
 
+async def test_entitlement_decision_does_not_depend_on_environment():
+    """The capability gate must answer the same in dev, staging and production.
+
+    `_decide` used to return True for everything whenever `settings.is_production`
+    was False — and ENVIRONMENT defaults to development when unset, so one missing
+    env var on a production box granted every capability to every org. This is the
+    regression test for that: the decision reads org state only.
+    """
+    from navis.platform.config import settings
+
+    repo = FakeOrgRepo()
+    ent = EntitlementService(repo)
+    await BillingService(repo, ent).set_plan(ORG_A, Plan.FREE)
+
+    original = settings.environment
+    try:
+        for env in ("development", "staging", "production"):
+            settings.environment = env
+            assert await ent.can_use(ORG_A, Capability.EXECUTION) is False
+            assert await ent.can_use(ORG_A, Capability.MEMORY) is True
+    finally:
+        settings.environment = original
+
+
+async def test_unknown_plan_and_status_deny_rather_than_raise():
+    """`plan` and `status` are free text in the database, so a legacy, renamed or
+    hand-edited value reaches the decision function. It must deny — raising here
+    would turn every gated request for that org into a 500, and falling through
+    would authorize an org whose tier nobody can name."""
+    repo = FakeOrgRepo()
+    ent = EntitlementService(repo)
+    await BillingService(repo, ent).set_plan(ORG_A, Plan.ENTERPRISE)
+
+    lifecycle = await repo.ensure_lifecycle(ORG_A)
+    # Drop the seeded explicit grant so resolution actually reaches the plan branch.
+    del repo.entitlements[(ORG_A, Capability.EXECUTION.value)]
+
+    lifecycle.plan = "legacy_gold"
+    assert await ent.can_use(ORG_A, Capability.EXECUTION) is False
+
+    lifecycle.plan = Plan.ENTERPRISE.value
+    lifecycle.status = "deleted"
+    assert await ent.can_use(ORG_A, Capability.EXECUTION) is False
+
+
+async def test_unprovisioned_org_gets_free_tier_only():
+    """No lifecycle row = the window between org creation and async provisioning.
+    It resolves to the minimum tier, never to a capability that can mutate the
+    outside world."""
+    repo = FakeOrgRepo()
+    ent = EntitlementService(repo)
+    assert await ent.can_use(ORG_A, Capability.MEMORY) is True        # FREE
+    assert await ent.can_use(ORG_A, Capability.EXECUTION) is False    # not FREE
+    assert await ent.can_use(ORG_A, Capability.DECISION) is False
+
+
 async def test_explicit_entitlement_overrides_plan():
     repo = FakeOrgRepo()
     ent = EntitlementService(repo)

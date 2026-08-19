@@ -239,6 +239,24 @@ def _integration():
     return SimpleNamespace(id=uuid.uuid4(), user_id=uuid.uuid4())
 
 
+def _grant():
+    """What reconcile now hands `_to_signal`: a DETACHED credential snapshot.
+
+    Not an ORM row, and that is the point — reconcile used to hold the live
+    `Integration` across the Google call with decrypted tokens assigned onto it,
+    which the session then committed as plaintext.
+    """
+    from navis.signals.calendar.reconcile import _CalendarGrant
+
+    return _CalendarGrant(
+        integration_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        access_token="enc:1:stored-ciphertext",
+        refresh_token="enc:1:stored-ciphertext",
+        token_expires_at=None,
+    )
+
+
 def test_a_live_event_maps_to_the_current_version():
     """Reconciled events must be BYTE-IDENTICAL to synced ones — same event-type
     rules, same payload minimisation, same version key — or the same meeting
@@ -256,7 +274,7 @@ def test_a_live_event_maps_to_the_current_version():
         "attendees": [{"email": "arjun@fund.com", "responseStatus": "accepted"}],
         "organizer": {"email": "founder@acme.com"},
     }
-    signal = _to_signal(ORG_A, _integration(), raw)
+    signal = _to_signal(ORG_A, _grant(), raw)
 
     assert signal is not None
     assert signal.source is SignalSource.CALENDAR
@@ -274,7 +292,7 @@ def test_a_deleted_event_maps_to_a_cancellation():
     from navis.signals.calendar.reconcile import _to_signal
 
     # Exactly the stub `_reconcile` synthesises on a 404/410 from Google.
-    signal = _to_signal(ORG_A, _integration(), {"id": "evt-gone", "status": "cancelled"})
+    signal = _to_signal(ORG_A, _grant(), {"id": "evt-gone", "status": "cancelled"})
 
     assert signal is not None
     assert signal.event_type is SignalEventType.CALENDAR_EVENT_CANCELLED
@@ -285,7 +303,7 @@ def test_a_malformed_payload_does_not_raise():
     """Bookkeeping must never take down a successful execution."""
     from navis.signals.calendar.reconcile import _to_signal
 
-    assert _to_signal(ORG_A, _integration(), {}) is None  # no id
+    assert _to_signal(ORG_A, _grant(), {}) is None  # no id
 
 
 def test_two_cancellations_of_one_event_do_not_dedupe_into_silence():

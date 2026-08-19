@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select, update
+from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +29,9 @@ from navis.ml.embeddings.models import (
     compute_progress_id,
 )
 from navis.ml.embeddings.pins import EMBEDDING_VERSION, EmbeddingPin, write_pin
+# Width of the typed vector column retrieval reads; defined where retrieval
+# owns it so writer and reader cannot disagree about the index shape.
+from navis.ml.retrieval.vector_search import ANN_DIM
 from navis.platform.config import settings
 from navis.platform.monitoring import get_logger
 from navis.platform.monitoring.metrics import metrics
@@ -91,12 +95,18 @@ def _domain_of(email: str) -> str:
 
 # Raw role tokens ("from"/"to") read as noise next to a name; the natural-language
 # form embeds closer to how a founder would ask ("who sent me…", "who was cc'd").
+#
+# The PHRASES stay vendor-neutral even where the token is not. `slack_member` is
+# the vocabulary Memory's Slack extractor writes, so ML has to decode it — but it
+# renders as "channel member", because a Teams or Discord membership is the same
+# organizational fact and embedding one vendor's name would make the vector claim
+# something the entity does not say. Any future `*_member` token maps here too.
 _ROLE_WORDS = {
     "from": "sender",
     "to": "recipient",
     "cc": "copied recipient",
     "attendee": "meeting attendee",
-    "slack_member": "Slack member",
+    "slack_member": "channel member",
 }
 
 
@@ -215,10 +225,15 @@ def _project_text(p: dict) -> str:
 
 
 def _channel_text(p: dict) -> str:
+    # NOT "Slack channel": CHANNEL is a normalized entity, and the payload
+    # (channel_id/name/visibility/workspace_id) carries no producer. A Teams or
+    # Discord channel folds into the same entity type, so naming one vendor here
+    # would embed a false claim about every other. Vendor identity belongs to the
+    # Signal, below State — ML only ever sees the normalized fact.
     name, visibility = _clean(p.get("name")), _clean(p.get("visibility"))
     if not name:
         return ""
-    return f"Slack channel #{name}" + (f" ({visibility})" if visibility else "")
+    return f"Channel #{name}" + (f" ({visibility})" if visibility else "")
 
 
 def _customer_text(p: dict) -> str:
@@ -336,7 +351,39 @@ class EmbeddingService:
         stmt = pg_insert(MemoryEmbedding).values(rows).on_conflict_do_nothing(
             index_elements=["id"]
         )
-        return (await self.db.execute(stmt)).rowcount or 0
+        written = (await self.db.execute(stmt)).rowcount or 0
+        await self._fill_typed_vectors([r["id"] for r in rows])
+        return written
+
+    async def _fill_typed_vectors(self, ids: list[uuid.UUID]) -> None:
+        """Mirror the JSONB vector into the typed `embedding_vec` column.
+
+        Retrieval's fast path filters on `embedding_vec IS NOT NULL` (see
+        `ml/retrieval/vector_search.py`), so a row written without it would be
+        silently invisible to search while looking perfectly healthy in the
+        table — the worst kind of miss.
+
+        Kept as a follow-up statement rather than an insert column so the ORM
+        model stays free of a pgvector type dependency and a database without
+        migration 0038 still works. Idempotent (`IS NULL` guard) and scoped to
+        the rows just written; failure degrades to the JSONB scan rather than
+        failing the embed.
+        """
+        if not ids:
+            return
+        try:
+            await self.db.execute(
+                sa_text(
+                    "UPDATE memory_embeddings "
+                    "   SET embedding_vec = (embedding::text)::vector "
+                    " WHERE id = ANY(:ids) AND embedding_vec IS NULL "
+                    f"  AND dim = {ANN_DIM}"
+                ),
+                {"ids": ids},
+            )
+        except Exception:  # noqa: BLE001 — typed column is an optimisation, not a requirement
+            logger.exception("could not populate embedding_vec; search falls back to JSONB")
+            metrics.incr("ml.embeddings.typed_vector_failed")
 
     # ---- resumable backfill ------------------------------------------------
 
@@ -374,12 +421,41 @@ class EmbeddingService:
         The previous implementation used `LIMIT n` with no ORDER BY and no offset:
         with 3,078 records and a limit of 1,000 it re-scanned the same 1,000 rows
         on every call, and the other 2,078 could never be embedded at all.
+
+        ONLY UNEMBEDDED RECORDS ARE SELECTED, and the cursor RESETS on completion.
+        Both are required for this to work as a recurring sweeper rather than a
+        one-shot backfill, because `memory_id` is a CONTENT-derived UUIDv5 (see
+        `memory.ids`) and is therefore NOT time-ordered: a record ingested today
+        is equally likely to sort below the cursor as above it. With a
+        monotonically advancing cursor and no reset, a completed backfill parked
+        the cursor at the maximum id and every subsequently created record whose
+        id sorted below it could never be visited again — permanently invisible
+        to retrieval. That is why entity types outside the real-time subscriber's
+        five bus events had zero vectors.
+
+        The anti-join is what makes the reset cheap: a re-scan filters
+        already-embedded rows in SQL, so a sweep with nothing pending costs one
+        empty query and zero provider calls. It is also scoped to THIS pin's
+        (model, version), so a re-embed onto a new index correctly sees every
+        record as pending without touching the old index.
         """
         page_size = page_size or settings.embedding_backfill_page_size
         batch_size = batch_size or settings.embedding_backfill_batch_size
         progress = await self._progress(org_id, version)
 
-        stmt = select(MemoryRecord).where(MemoryRecord.organization_id == org_id)
+        already_embedded = (
+            select(MemoryEmbedding.id)
+            .where(
+                MemoryEmbedding.memory_id == MemoryRecord.memory_id,
+                MemoryEmbedding.model == self.pin.model,
+                MemoryEmbedding.version == version,
+            )
+            .exists()
+        )
+        stmt = select(MemoryRecord).where(
+            MemoryRecord.organization_id == org_id,
+            ~already_embedded,
+        )
         if progress.cursor_memory_id is not None:
             stmt = stmt.where(MemoryRecord.memory_id > progress.cursor_memory_id)
         records = (
@@ -423,9 +499,15 @@ class EmbeddingService:
 
         The cursor commits together with the vectors it accounts for, so a crash
         can only ever replay a page — never skip one.
+
+        On completion the cursor RESETS to NULL so the next sweep starts from the
+        beginning and can see records created below the previous high-water mark
+        (memory_id is content-derived, not time-ordered — see `backfill_page`).
+        `completed_at` is still stamped, so "has the initial backfill finished?"
+        remains answerable; it is a milestone, not a stop flag.
         """
         values: dict[str, Any] = {
-            "cursor_memory_id": cursor,
+            "cursor_memory_id": None if done else cursor,
             "embedded_count": EmbeddingBackfillProgress.embedded_count + embedded,
             "skipped_count": EmbeddingBackfillProgress.skipped_count + skipped,
         }
@@ -438,12 +520,16 @@ class EmbeddingService:
         )
 
     async def _mark_complete(self, progress: EmbeddingBackfillProgress) -> None:
-        if progress.completed_at is not None:
-            return
+        """Nothing left to embed at this pin. Reset the cursor so the next sweep
+        re-scans from the start (cheaply — the anti-join returns nothing until a
+        new record lands), and stamp `completed_at` the first time only."""
+        values: dict[str, Any] = {"cursor_memory_id": None}
+        if progress.completed_at is None:
+            values["completed_at"] = datetime.now(timezone.utc)
         await self.db.execute(
             update(EmbeddingBackfillProgress)
             .where(EmbeddingBackfillProgress.id == progress.id)
-            .values(completed_at=datetime.now(timezone.utc))
+            .values(**values)
         )
 
     async def embed_org(

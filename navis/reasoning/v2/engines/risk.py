@@ -8,7 +8,12 @@ from __future__ import annotations
 import re
 from html import unescape
 
-from navis.reasoning.v2.base import ReasoningContext, ReasoningEngine, days_between
+from navis.reasoning.v2.base import (
+    ReasoningContext,
+    ReasoningEngine,
+    days_between,
+    has_human_bearing_evidence,
+)
 from navis.reasoning.v2.contract import SignalDraft, SignalType
 from navis.state.v2.models import OrganizationalState
 
@@ -108,14 +113,47 @@ class CommitmentReasoningEngine(ReasoningEngine):
 
 
 class RelationshipReasoningEngine(ReasoningEngine):
+    """A RELATIONSHIP the organization actually has has gone quiet.
+
+    2.1.0 added the relevance gate. Every address on every email becomes a
+    RELATIONSHIP, and this engine had no filter at all, so it reported
+    "relationship cooling" for newsletters, billing robots and no-reply senders.
+    Live, that was microsoft-noreply@microsoft.com (invoice),
+    openscout+on-the-side@substack.com (newsletter), mail@mail.adobe.com
+    (marketing) and founders@mail.slashy.com (automated_other) — and Intelligence
+    then aggregated them into organizational RISK and RELATIONSHIP insights,
+    telling a founder that Adobe's mailing list was a business risk.
+
+    THE GATE REQUIRES POSITIVE EVIDENCE, unlike OpportunityEngine's, which only
+    suppresses on positive evidence of irrelevance. The asymmetry is deliberate
+    and follows from what a false positive costs each engine:
+
+      * OPPORTUNITY says "here is a warm window" — a wrong one costs a glance.
+      * COOLING says "a relationship you rely on is decaying", and now also
+        feeds org-level risk aggregates. A wrong one corrupts the organization's
+        picture of itself, which is the failure this product cannot afford.
+
+    So an UNKNOWN relationship yields no conclusion here rather than a
+    speculative one. That is affordable because it is not actually a gap: all 36
+    relationships across both live organizations carry classification evidence,
+    since `signal_importance` is written in the same transaction as every
+    ingested signal. If coverage ever regresses, this engine goes quiet rather
+    than wrong — the correct direction to fail.
+    """
+
     name = "relationship_reasoning"
-    version = "2.0.0"
+    # 2.1.0: relevance gate added. Mirrors OpportunityEngine's 2.0.0 -> 2.1.0
+    # bump for the same class of change.
+    version = "2.1.0"
 
     def analyze(self, state: OrganizationalState, ctx: ReasoningContext) -> list[SignalDraft]:
         out = []
         for r in state.relationships():
             age = days_between(ctx.as_of, r.last_interaction_at)
             if age is None or age < RELATIONSHIP_COOLING_DAYS or age > MAX_SURFACE_AGE_DAYS:
+                continue
+            observed = ctx.evidence.get(r.entity_id)
+            if not has_human_bearing_evidence(observed):
                 continue
             out.append(
                 SignalDraft(
@@ -127,7 +165,14 @@ class RelationshipReasoningEngine(ReasoningEngine):
                     confidence=min(0.9, 0.5 + age / 30),
                     severity=0.6,
                     dedup_key=r.entity_id,
-                    evidence={"days_since_contact": round(age, 2), "person_email": r.person_email},
+                    evidence={
+                        "days_since_contact": round(age, 2),
+                        "person_email": r.person_email,
+                        # Sorted for determinism. Makes the relevance call
+                        # auditable back to the signals it was derived from,
+                        # exactly as OpportunityEngine records it.
+                        "relevance_evidence": sorted(observed),
+                    },
                 )
             )
         return out

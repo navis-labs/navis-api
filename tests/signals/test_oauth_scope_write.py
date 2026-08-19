@@ -137,14 +137,13 @@ async def test_calendar_sender_rejects_readonly_integration(monkeypatch):
     monkeypatch.setattr(
         _senders, "session_scope", lambda: _StubSessionCM()
     )
-    # The sender now resolves the integration through the shared
+    # The sender resolves the integration through the shared
     # `resolve_calendar_integration` (which also self-heals a missing
     # google_calendar row), so the stub session must answer `scalars(...)`.
-    # decrypt no-ops on plaintext tokens because token_cipher rejects
-    # them — patch to identity so we can reach the scope check.
-    monkeypatch.setattr(
-        _senders, "_decrypt_tokens_inplace", lambda integration: None
-    )
+    #
+    # There is no longer a decrypt step to stub out: the sender snapshots the
+    # tokens AS STORED and hands the ciphertext to TokenManager, which is what
+    # decrypts. Nothing touches these stub tokens before the scope check refuses.
     payload = {
         "__ctx__": {
             "org_id": "11111111-1111-1111-1111-111111111111",
@@ -157,8 +156,15 @@ async def test_calendar_sender_rejects_readonly_integration(monkeypatch):
         "attendees": ["rahul@partner.com"],
         "time_zone": "UTC",
     }
-    # CalendarScopeInsufficient is a RuntimeError subclass, so the worker's
-    # existing failure handling is unchanged; the message still names the
-    # missing capability so the audit row tells the user what to do.
-    with pytest.raises(RuntimeError, match="write scope"):
+    # The sender resolves through the generic integration boundary, so the
+    # Google-specific CalendarScopeInsufficient is translated into the
+    # provider-neutral IntegrationUnavailable the Execution layer understands.
+    # The message still names the missing capability so the audit row tells the
+    # user what to do, and `reconsent_required` distinguishes "reconnect to grant
+    # more" from "connect Calendar" — a stronger assertion than the old match.
+    from navis.execution.integrations import IntegrationUnavailable
+
+    with pytest.raises(IntegrationUnavailable, match="write scope") as exc:
         await _senders.calendar_sender(payload)
+    assert exc.value.provider == "calendar"
+    assert exc.value.reconsent_required is True

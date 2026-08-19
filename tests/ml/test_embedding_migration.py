@@ -204,6 +204,82 @@ async def test_batch_rows_carry_the_pin_model_and_deterministic_ids():
 # ── Progress identity ──────────────────────────────────────────────────────
 
 
+# ── Recurring sweep: the cursor must not park at the high-water mark ───────
+#
+# `memory_id` is a CONTENT-derived UUIDv5 (navis.memory.ids), so it is NOT
+# time-ordered: a record ingested today is as likely to sort below the cursor as
+# above it. A completed backfill used to leave the cursor at the maximum id and
+# never reset it, so every later record sorting below that point could never be
+# visited again — which is why THREAD / MEETING / DOCUMENT / COMPANY facts had
+# zero vectors and retrieval could not reach them. The reset is what turns the
+# one-shot backfill into a sweeper.
+
+
+class _CapturingDB:
+    """Captures the UPDATE values `_advance` / `_mark_complete` emit."""
+
+    def __init__(self) -> None:
+        self.updates: list[dict] = []
+
+    async def execute(self, stmt):
+        params = getattr(stmt, "_values", None) or {}
+        # SQLAlchemy wraps literals in BindParameter; unwrap to the real value.
+        self.updates.append(
+            {
+                getattr(k, "name", str(k)): getattr(v, "value", v)
+                for k, v in params.items()
+            }
+        )
+        return FakeResult(1)
+
+
+class _Progress:
+    id = uuid.uuid4()
+    completed_at = None
+
+
+async def test_completing_a_sweep_resets_the_cursor_to_the_start():
+    db = _CapturingDB()
+    svc = EmbeddingService(db, pin=EmbeddingPin(DeterministicProvider(), "m", 1))
+
+    await svc._advance(_Progress(), uuid.uuid4(), 5, 0, done=True)
+
+    (update,) = db.updates
+    assert update["cursor_memory_id"] is None, (
+        "a finished sweep must rewind, or records created below the high-water "
+        "mark can never be embedded"
+    )
+    assert update["completed_at"] is not None  # still a recorded milestone
+
+
+async def test_an_unfinished_page_keeps_its_cursor():
+    db = _CapturingDB()
+    svc = EmbeddingService(db, pin=EmbeddingPin(DeterministicProvider(), "m", 1))
+    cursor = uuid.uuid4()
+
+    await svc._advance(_Progress(), cursor, 5, 0, done=False)
+
+    (update,) = db.updates
+    assert update["cursor_memory_id"] == cursor  # resumability is unchanged
+    assert "completed_at" not in update
+
+
+async def test_mark_complete_also_rewinds_and_stamps_once():
+    db = _CapturingDB()
+    svc = EmbeddingService(db, pin=EmbeddingPin(DeterministicProvider(), "m", 1))
+
+    first = _Progress()
+    await svc._mark_complete(first)
+    assert db.updates[-1]["cursor_memory_id"] is None
+    assert db.updates[-1]["completed_at"] is not None
+
+    already = _Progress()
+    already.completed_at = "2026-01-01T00:00:00+00:00"
+    await svc._mark_complete(already)
+    assert db.updates[-1]["cursor_memory_id"] is None   # still rewinds every pass
+    assert "completed_at" not in db.updates[-1]         # but the milestone is not moved
+
+
 def test_progress_id_is_deterministic_per_index():
     org = uuid.uuid4()
     a = compute_progress_id(org, "navis-hash-256", 1)

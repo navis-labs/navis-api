@@ -473,3 +473,259 @@ def test_embedding_backfill_task_is_celery_registered():
         "navis.ml.embeddings.jobs.embed_all_orgs",
     ):
         assert name in celery_app.tasks, f"Celery task {name} not registered"
+
+
+# ---- context composition (Phase 3E.1 / 3E.2) -------------------------------
+#
+# 3E.1: `build()` appended caller facts AFTER retrieval hits, so the org's own
+# conclusions ranked below raw recall and the model answered "cannot be
+# determined" to questions the reasoning signals already answered.
+#
+# 3E.2: the fix over-corrected. Ordering purely by kind put 8 conclusions + 22
+# State entities ahead of ALL retrieved evidence, and six questions that need
+# retrieval detail regressed to unanswerable — not from evidence loss (8/8 were
+# retained, ~900 of 1500 tokens) but because the model anchored on 30 derived
+# facts before reaching any. Both properties are pinned here.
+
+
+def _g(kind, source, text=""):
+    from navis.ml.rag.grounding import Grounding
+    return Grounding(kind=kind, source=source, text=text or source)
+
+
+def test_conclusions_lead_and_evidence_is_not_buried_under_state():
+    from navis.ml.rag.context_builder import _LEADING_STATE_FACTS, _compose
+
+    facts = (
+        [_g("memory", f"m{i}") for i in range(8)]
+        + [_g("reasoning", f"r{i}") for i in range(3)]
+        + [_g("state", f"s{i}") for i in range(22)]
+    )
+    out = [f.kind for f in _compose(facts, "which documents are being worked on?")]
+
+    assert out[:3] == ["reasoning"] * 3, "conclusions must lead"
+    # Evidence must appear before the State tail, and no later than
+    # conclusions + the bounded State slice.
+    first_memory = out.index("memory")
+    assert first_memory <= 3 + _LEADING_STATE_FACTS
+    # ALL retrieval evidence is kept — that is the property that regressed.
+    assert out.count("memory") == 8, "retrieval evidence must never be dropped"
+    # The LEADING band is what is bounded: thin pointers must not out-volume the
+    # detailed evidence the model reads first.
+    assert out[: 3 + _LEADING_STATE_FACTS].count("state") == _LEADING_STATE_FACTS
+    # 3E.2.1: the rest of State is APPENDED, not discarded. Ordering decides what
+    # is read first and — only if the budget binds — who is dropped first; it
+    # does not decide membership. Truncating here threw away 16 of 22 entities on
+    # every turn while a third of the token budget went unspent.
+    assert out.count("state") == 22, "State must not be silently truncated"
+    # ...and every retrieved fact still precedes the tail, so the tail can only
+    # spend budget the evidence has already left over.
+    last_memory = len(out) - 1 - out[::-1].index("memory")
+    assert out.index("state", 3 + _LEADING_STATE_FACTS) > last_memory
+
+
+def test_state_slice_is_question_ranked_and_deterministic():
+    from navis.ml.rag.context_builder import _compose
+
+    facts = [
+        _g("state", "s-irrelevant", "relationship with a vendor"),
+        _g("state", "s-match", "documents Product Spec owned by alice"),
+        _g("memory", "m1", "an email"),
+    ]
+    # NOTE: `_overlap` is exact-token (no stemming) — "documents" matches
+    # "documents", not "document". That is the reranker's existing definition,
+    # reused deliberately so retrieval and State share one notion of relevance.
+    out = _compose(facts, "which documents are being worked on?")
+    assert out[0].source == "s-match", "the question-relevant State fact leads"
+    # Deterministic: same inputs, same order, no clock and no model.
+    assert [f.source for f in _compose(facts, "which documents are being worked on?")] == [
+        f.source for f in out
+    ]
+
+
+def test_unknown_kinds_are_treated_as_evidence_not_conclusions():
+    """A connector-named fact from the workspace fallback must never outrank the
+    organization's own conclusions."""
+    from navis.ml.rag.context_builder import _compose
+
+    out = _compose([_g("gmail", "g1"), _g("reasoning", "r1")], "what changed?")
+    assert [f.kind for f in out] == ["reasoning", "gmail"]
+
+
+# ══ LEARNING → ML: the organization's own outcomes as grounded facts ══════════
+#
+# `learning_facts` is a pure function of a LearningSnapshot, so everything about
+# WHAT the model is told can be pinned without a database. The Observation →
+# Learning → ML chain on real Postgres is proved in
+# tests/integration/test_observation_contract.py.
+
+
+def _snapshot(**over):
+    """A LearningSnapshot built straight from primitives — no ORM, no session."""
+    from datetime import datetime, timezone
+
+    from navis.learning.metrics import AggregateFact, LearningSnapshot
+
+    fields = {
+        "org_id": ORG,
+        "learning_version": 4,
+        "as_of": datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+        "state_watermark": "wm-9",
+        "reasoning_version": 7,
+        "aggregates": (
+            AggregateFact("outcome", "action_executed", 0, 0, 9, 9),
+            AggregateFact("outcome", "action_failed", 0, 3, 0, 3),
+            AggregateFact("outcome", "action_rejected", 0, 2, 0, 2),
+            AggregateFact("outcome", "reply_received", 5, 0, 0, 5),
+        ),
+        "patterns": (),
+        "lineage": {},
+        "signal_lineage": {},
+    }
+    fields.update(over)
+    return LearningSnapshot(**fields)
+
+
+def _texts(facts):
+    return " ".join(f.text for f in facts)
+
+
+def test_learning_facts_are_pure_and_reproducible():
+    """Same org + same learning_version => byte-identical facts, in order.
+
+    Reproducibility is the whole claim: a learned fact the model cites must be
+    re-derivable, not something that happened to be true during one request.
+    """
+    from navis.ml.rag.context_builder import learning_facts
+
+    snap = _snapshot()
+    a = learning_facts(snap)
+    b = learning_facts(snap)
+    assert [(f.source, f.text, f.lineage) for f in a] == [
+        (f.source, f.text, f.lineage) for f in b
+    ]
+    assert a, "a snapshot with outcomes produced no facts at all"
+
+
+def test_delivery_judgement_and_world_stay_three_separate_facts():
+    """A channel fault must never reach the model as a reasoning failure.
+
+    The three surfaces are rendered as three separately-labelled facts; folding
+    them into one "3 failures" line would recreate, inside the prompt, exactly
+    the conflation Learning's two-axis classification removed.
+    """
+    from navis.ml.rag.context_builder import learning_facts
+
+    facts = learning_facts(_snapshot())
+    by_source = {f.source: f for f in facts}
+    assert "outcome_surface:delivery" in by_source
+    assert "outcome_surface:judgement" in by_source
+    assert "outcome_surface:world" in by_source
+
+    delivery = by_source["outcome_surface:delivery"].text
+    assert "action_failed" in delivery
+    assert "NOT a judgement" in delivery, "a delivery fault was not labelled as one"
+    # The delivery failure must not appear inside the judgement or world facts.
+    assert "action_failed" not in by_source["outcome_surface:judgement"].text
+    assert "action_failed" not in by_source["outcome_surface:world"].text
+    # And the human's rejection is named as a verdict, not as an error.
+    assert "action_rejected" in by_source["outcome_surface:judgement"].text
+    assert "reply_received" in by_source["outcome_surface:world"].text
+
+
+def test_an_organization_with_no_outcomes_gets_no_fabricated_feature():
+    """Absence of evidence must not become evidence.
+
+    No zeroes, no "insufficient data" placeholder — nothing, so the model has
+    nothing to cite and cannot report a learned fact that was never learned.
+    """
+    from navis.ml.rag.context_builder import learning_facts
+
+    assert learning_facts(_snapshot(learning_version=0, aggregates=())) == []
+
+
+def test_a_surface_with_no_outcomes_is_omitted_not_zeroed():
+    from navis.ml.rag.context_builder import learning_facts
+    from navis.learning.metrics import AggregateFact
+
+    facts = learning_facts(
+        _snapshot(aggregates=(AggregateFact("outcome", "action_executed", 0, 0, 2, 2),))
+    )
+    sources = {f.source for f in facts}
+    assert sources == {"outcome_surface:delivery"}
+    assert "outcome_surface:judgement" not in sources
+    assert "outcome_surface:world" not in sources
+
+
+def test_signal_reliability_is_rendered_not_recomputed():
+    """Learning already decided what "reliable" means and gated it on samples.
+
+    ML renders that verdict; if it re-thresholded here there would be two
+    definitions of signal reliability in the codebase, free to drift.
+    """
+    from navis.learning.metrics import SignalPattern
+    from navis.ml.rag.context_builder import learning_facts
+
+    facts = learning_facts(
+        _snapshot(
+            patterns=(SignalPattern("sig-A", "reliable", 0.87, 120),),
+            lineage={"sig-A": ["le-1", "le-2"]},
+        )
+    )
+    pattern_fact = next(f for f in facts if f.source == "signal_pattern:sig-A")
+    assert "87%" in pattern_fact.text and "120" in pattern_fact.text
+    assert "reliable" in pattern_fact.text
+    # Lineage travels with the fact: which signal, which evidence, which version.
+    assert "signal:sig-A" in pattern_fact.lineage
+    assert "learning_event:le-1" in pattern_fact.lineage
+    assert "learning_version:4" in pattern_fact.lineage
+
+
+def test_signal_facts_are_capped_deterministically_by_sample_weight():
+    """Most-evidenced first, signal_id to break ties — never arbitrary order."""
+    from navis.learning.metrics import SignalPattern
+    from navis.ml.rag.context_builder import _MAX_SIGNAL_FACTS, learning_facts
+
+    patterns = tuple(
+        SignalPattern(f"sig-{i:02d}", "reliable", 0.9, samples)
+        for i, samples in enumerate([10, 90, 30, 70, 50, 20, 80])
+    )
+    facts = [f for f in learning_facts(_snapshot(patterns=patterns))
+             if f.source.startswith("signal_pattern:")]
+    assert len(facts) == _MAX_SIGNAL_FACTS
+    assert [f.source for f in facts] == [
+        "signal_pattern:sig-01",  # 90
+        "signal_pattern:sig-06",  # 80
+        "signal_pattern:sig-03",  # 70
+        "signal_pattern:sig-04",  # 50
+        "signal_pattern:sig-02",  # 30
+    ]
+
+
+def test_learning_facts_land_in_the_state_band_not_the_conclusion_band():
+    """`_STATE_KINDS` already reserved "learning"; these facts must fill it.
+
+    A learned fact describes the organization, so it ranks with State — it must
+    not outrank the reasoning conclusions a founder actually asked about.
+    """
+    from navis.ml.rag.context_builder import LEARNING_KIND, _compose
+
+    out = _compose([_g(LEARNING_KIND, "l1"), _g("reasoning", "r1"), _g("memory", "m1")], "q")
+    assert [f.kind for f in out] == ["reasoning", LEARNING_KIND, "memory"]
+
+
+def test_ml_reads_learning_through_the_contract_not_its_tables():
+    """The whole point of the seam. ML may import navis.learning (its own AST
+    invariant says so), but only the read contract — never the ORM."""
+    offenders = []
+    for py in (NAVIS / "ml").rglob("*.py"):
+        text = py.read_text(encoding="utf-8")
+        for orm in ("LearningEvent", "LearningAggregate", "LearningPattern", "learning_events"):
+            if orm in text:
+                offenders.append(f"ml/{py.name} references {orm}")
+    assert not offenders, "ML reached into Learning's storage:\n" + "\n".join(offenders)
+
+    builder = (NAVIS / "ml" / "rag" / "context_builder.py").read_text(encoding="utf-8")
+    assert "from navis.learning.metrics import" in builder, (
+        "ML stopped consuming Learning through its contract"
+    )

@@ -5,6 +5,15 @@ The pipeline assembly (no business logic of its own):
 
 Decision consumes Reasoning only; orchestration is the seam that feeds it.
 Exposed both as a coroutine (for the API / tests) and a Celery task (schedule).
+
+It is also the seam that feeds INTELLIGENCE its second input. Intelligence reads
+Learning only — its repository imports `navis.learning.models` and nothing else
+from the pipeline, pinned by an AST test — so "what is true of this organization
+right now" cannot be fetched by Intelligence itself. It is projected here, from
+the State and ReasoningSignals this module already holds, and handed in as
+primitives. Same shape as the two joins this file already performs: `evidence`
+read here and handed to Reasoning, Adaptive policy resolved here and handed to
+Decision.
 """
 from __future__ import annotations
 
@@ -13,16 +22,178 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from navis.decisions.base import IntelligenceFact, IntelligenceView
 from navis.decisions.models import DailyBrief
 from navis.decisions.service import DecisionService
+from navis.intelligence.insights import (
+    OrganizationalRealityView,
+    RealitySignalRow,
+)
+from navis.memory.envelope import EntityType
+from navis.memory.lineage import classifications_by_entity
 from navis.platform.database import session_scope
 from navis.platform.events import DomainEvent, EventType, event_bus
 from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import metrics
 from navis.platform.queue import celery_app, run_async
+from navis.reasoning.store import persist_signals
 from navis.reasoning.v2 import REASONING_VERSION, run_reasoning_v2
+from navis.reasoning.v2.contract import ReasoningSignal
 from navis.state.v2 import StateService
+from navis.state.v2.models import OrganizationalState
 
 logger = get_logger("orchestration.brief")
+
+
+def _reality_view(
+    org_id: uuid.UUID,
+    state: OrganizationalState,
+    signals: list[ReasoningSignal],
+) -> OrganizationalRealityView:
+    """Flatten State + ReasoningSignals into the contract Intelligence accepts.
+
+    PURE — no clock, no I/O, no randomness. `as_of` is State's logical time and
+    the watermark is the memory record State actually folded to, so the same
+    snapshot always produces the same view.
+
+    ALL signals are carried, not just the decision-worthy ones. The five types
+    Decision drops as interpretation (`OPPORTUNITY`, `LEVERAGE_POINT`,
+    `ORG_DRIFT`, `PRIORITY_LOAD`, `CONTEXT_SUMMARY`) are exactly the material an
+    organizational insight is made of — `decisions/base.py` says so itself:
+    "They remain queryable as ReasoningSignals, so an engine or surface that
+    wants them as CONTEXT or EVIDENCE still can."
+
+    Nothing is recomputed. Each row carries the engine's own confidence,
+    severity and `evidence` verbatim; a signal that recorded no lineage
+    contributes none rather than an invented one.
+    """
+    watermark = state.watermark.last_memory_id
+    return OrganizationalRealityView(
+        org_id=org_id,
+        as_of=state.as_of,
+        state_watermark=str(watermark) if watermark else None,
+        # The second clock. Without it, a reasoning-version bump over an
+        # unchanged snapshot reuses the previous version's insight ids and the
+        # corrected conclusions are silently dropped by ON CONFLICT DO NOTHING.
+        reasoning_version=REASONING_VERSION,
+        entity_counts=state.counts(),
+        # Sorted by the deterministic signal id so the same pass always
+        # serialises identically, whatever order the engines ran in.
+        signals=tuple(
+            sorted(
+                (
+                    RealitySignalRow(
+                        signal_id=str(s.signal_id),
+                        signal_type=s.signal_type.value,
+                        entity_type=s.entity_type,
+                        entity_id=s.entity_id,
+                        confidence=s.confidence,
+                        severity=s.severity,
+                        engine_name=s.engine_name,
+                        engine_version=s.engine_version,
+                        evidence=s.evidence or {},
+                    )
+                    for s in signals
+                ),
+                key=lambda r: r.signal_id,
+            )
+        ),
+    )
+
+
+def _intelligence_view(org_id: uuid.UUID, rows) -> IntelligenceView:
+    """Flatten the org's CURRENT insights into the contract Decision accepts.
+
+    PURE — no clock, no I/O, no randomness. `as_of` is the newest logical time
+    among the folded insights, so the same stored rows always build the same view.
+
+    `rows` are whatever `IntelligenceRepository.get_insights` returned: the
+    current projection, already org-scoped, already deterministically ordered,
+    already free of superseded rows. Nothing about that rule is restated here —
+    this function reshapes, it does not select.
+
+    Each fact carries a COPY of the row's `evidence`. The ORM hands out the live
+    JSONB dict, and a view that shared it would let a consumer dirty a persisted
+    insight by touching what looks like a plain dict.
+    """
+    facts = tuple(
+        IntelligenceFact(
+            insight_id=str(r.insight_id),
+            insight_type=r.insight_type,
+            key=r.key,
+            summary=r.summary,
+            confidence=r.confidence,
+            sample_size=r.sample_size,
+            evidence=dict(r.evidence or {}),
+            # Recorded by `intelligence.service._provenance`; sorted there and
+            # kept in that order. Absent on a fact that folded no signals, and
+            # that emptiness is honest rather than a gap to fill.
+            supporting_reasoning_signal_ids=tuple(
+                (r.evidence or {}).get("supporting_reasoning_signal_ids") or ()
+            ),
+            state_watermark=r.state_watermark,
+            learning_version=r.learning_version,
+        )
+        for r in rows
+    )
+    return IntelligenceView(
+        org_id=org_id,
+        as_of=max((r.created_at for r in rows if r.created_at is not None), default=None),
+        facts=facts,
+    )
+
+
+async def _current_intelligence(db: AsyncSession, org_id: uuid.UUID) -> IntelligenceView:
+    """Read the org's current insights and project them for Decision.
+
+    Read through `IntelligenceRepository`, never with a query of our own: that
+    boundary owns which projection is current, and a second query here would be
+    the third read semantics for one append-only table.
+
+    Called AFTER `_project_intelligence`, deliberately — the projection commits in
+    its own session, so reading afterwards gives Decision the insights derived
+    from the very snapshot it is about to rank, rather than the previous one.
+    """
+    from navis.intelligence.repository import IntelligenceRepository
+
+    return _intelligence_view(org_id, await IntelligenceRepository(db).get_insights(org_id))
+
+
+async def _project_intelligence(
+    org_id: uuid.UUID, reality: OrganizationalRealityView
+) -> None:
+    """Re-project Intelligence with the current reality attached.
+
+    ITS OWN SESSION, deliberately. The projection reads committed `learning_*`
+    state and appends to `intelligence_insights`; running it inside the brief's
+    transaction would mean a failed insert aborts that transaction and takes the
+    just-written `reasoning_signals` and the brief itself down with it. A
+    rollback could not rescue them either — it would discard `persist_signals`.
+    Isolation is the only way a projection failure costs an insight and never
+    the brief. The LEARNING_UPDATED subscriber already opens its own session for
+    the same call, so this is the established pattern, not a new one.
+
+    Never fatal, for the same reason: the brief is the product's heartbeat and
+    must not stop because a downstream projection did. Failures are logged with
+    a metric rather than swallowed silently.
+    """
+    from navis.intelligence.repository import IntelligenceRepository
+    from navis.intelligence.service import IntelligenceService
+
+    try:
+        async with session_scope() as db:
+            rows = await IntelligenceService(IntelligenceRepository(db)).project(
+                org_id, reality=reality
+            )
+    except Exception:  # noqa: BLE001 — see docstring: never fail the brief
+        logger.exception("intelligence projection failed org=%s", org_id)
+        metrics.incr("intelligence.projection.failed")
+        return
+    metrics.incr("intelligence.reality.signals", value=len(reality.signals))
+    logger.info(
+        "intelligence projected org=%s insights=%d reality_signals=%d watermark=%s",
+        org_id, len(rows), len(reality.signals), reality.state_watermark,
+    )
 
 
 async def build_brief(db: AsyncSession, org_id: uuid.UUID) -> DailyBrief:
@@ -47,9 +218,32 @@ async def build_brief(db: AsyncSession, org_id: uuid.UUID) -> DailyBrief:
         DomainEvent(type=EventType.STATE_UPDATED, org_id=org_id, source="state.v2",
                     payload=state.counts())
     )
-    signals = run_reasoning_v2(state)
+    # Organizational-relevance evidence, read HERE (the composition root) and
+    # handed to Reasoning, so Reasoning stays a pure function and performs no
+    # I/O. See engines/meta.py: relevance is decided from the accumulated set of
+    # signal classifications, never from Memory's per-message `is_automated`.
+    evidence = await classifications_by_entity(
+        db, org_id, entity_type=EntityType.RELATIONSHIP.value
+    )
+    signals = run_reasoning_v2(state, evidence=evidence)
+    # Persist the provenance BEFORE Decision consumes it. Execution, Observation,
+    # Learning and Intelligence all store `reasoning_signal_ids`; without this
+    # they were permanent references to rows that never existed, and the ids
+    # cannot be recomputed because `compute_signal_id` hashes reasoning_version.
+    # Append-only and idempotent, so rebuilding a brief writes nothing new.
+    # Written here, not inside Reasoning: the engines stay a pure function of
+    # State and never touch a database.
+    await persist_signals(db, signals)
     watermark = state.watermark.last_memory_id
+    # Hand Intelligence the organization's CURRENT reality. Intelligence may not
+    # import State or Reasoning (its repository reads Learning only, pinned by an
+    # AST test), so the projection is assembled here — the same seam that already
+    # reads `evidence` for Reasoning and resolves Adaptive's policy for Decision.
+    await _project_intelligence(org_id, _reality_view(org_id, state, signals))
     policy = await resolve_policy(db, org_id)
+    # The fourth join at this seam, and the same shape as the other three: read
+    # here, flatten to primitives, hand in. Decision imports no Intelligence.
+    intelligence = await _current_intelligence(db, org_id)
     return await DecisionService(db).decide(
         org_id,
         signals,
@@ -57,17 +251,55 @@ async def build_brief(db: AsyncSession, org_id: uuid.UUID) -> DailyBrief:
         state_watermark=str(watermark) if watermark else None,
         as_of=state.as_of,
         policy=policy,
+        intelligence=intelligence,
     )
 
 
 async def run_brief_for_org(org_id: uuid.UUID) -> dict:
+    """The SCHEDULED brief: build it, then propose the actions it implies.
+
+    WHY THE PROPOSE STEP IS HERE.
+
+    `propose_actions` is described in its own docstring as "THE proactive
+    producer", every row it writes is stamped `ExecutionOrigin.PROACTIVE`, and
+    `GET /actions` filters on exactly that so the Action Center shows things
+    "Navis noticed". But nothing scheduled ever called it: Celery beat runs
+    `build_all_briefs` -> `build_brief_for_org` -> this function, and this
+    function stopped at `build_brief`. The ONLY caller was
+    `POST /brief/propose-actions`, a manual endpoint.
+
+    So the proactive queue was only ever populated when a client asked for it.
+    Navis did not notice an unanswered email and raise it; it noticed only when
+    something else prompted it to look. That is the difference between the
+    product being proactive and being on-demand, and it was a wiring gap rather
+    than a decision — nothing documented the omission and the bridge was built
+    for precisely this call site.
+
+    SAFE TO RUN UNATTENDED, which is why it belongs on the schedule at all:
+
+      * it creates REQUESTED rows only. Approval is still the single edge into
+        APPROVED, so nothing here can produce a side effect;
+      * it is idempotent by construction — execution ids are deterministic and
+        the obligation index is unique, so re-running the brief converges on the
+        same rows rather than accumulating duplicates (proven in
+        `test_re_running_the_brief_reuses_the_same_execution_identity`);
+      * a failure to propose must not lose the brief that was just built, so it
+        is caught: the brief is the founder-visible artefact and the next run
+        re-proposes from it.
+    """
     async with session_scope() as db:
         brief = await build_brief(db, org_id)
-        return {
+        result = {
             "org_id": str(org_id),
             "brief_id": str(brief.id),
             "decisions": len(brief.decisions),
         }
+        try:
+            result["proposed"] = await propose_actions(db, org_id)
+        except Exception:  # noqa: BLE001 — see docstring: never lose the brief
+            logger.exception("propose_actions failed for org=%s after building the brief", org_id)
+            result["proposed"] = 0
+        return result
 
 
 async def propose_actions(db: AsyncSession, org_id: uuid.UUID) -> int:

@@ -8,6 +8,8 @@ the pass.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from navis.platform.monitoring import get_logger
 from navis.reasoning.v2.base import ReasoningContext
 from navis.reasoning.v2.contract import (
@@ -47,8 +49,19 @@ def _stamp(draft: SignalDraft, engine, ctx: ReasoningContext) -> ReasoningSignal
 
 
 def run_reasoning_v2(
-    state: OrganizationalState, *, prior_state: OrganizationalState | None = None
+    state: OrganizationalState,
+    *,
+    prior_state: OrganizationalState | None = None,
+    evidence: Mapping[str, frozenset[str]] | None = None,
 ) -> list[ReasoningSignal]:
+    """Pure: (State, prior, evidence) -> ReasoningSignal[].
+
+    `evidence` maps entity_id -> observed `signal_importance.classification` set
+    (see `memory.lineage.classifications_by_entity`). It is READ by the caller
+    and handed in, never fetched here — Reasoning performs no I/O. Omitting it
+    is safe: every engine treats an absent entity as UNKNOWN and keeps its
+    prior behaviour.
+    """
     wm = state.watermark.last_memory_id
     ctx = ReasoningContext(
         org_id=state.org_id,
@@ -56,6 +69,7 @@ def run_reasoning_v2(
         watermark=str(wm) if wm else None,
         reasoning_version=REASONING_VERSION,
         prior=prior_state,
+        evidence=evidence or {},
     )
 
     signals: list[ReasoningSignal] = []

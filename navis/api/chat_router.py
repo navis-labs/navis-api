@@ -18,8 +18,10 @@ those flows are UX affordances that don't need the LLM to author.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -35,10 +37,14 @@ from navis.execution.models import ActionType, ExecutionOrigin
 from navis.execution.service import ExecutionService
 from navis.identity.authz import Principal, get_principal
 from navis.ml.generation.narratives import explanation, recommendation, summary
-from navis.ml.rag.context_builder import ContextBuilder
+from navis.ml.rag.context_builder import ContextBuilder, estimate_tokens
+from navis.ml.rag.grounding import Grounding, GroundedContext
 from navis.ml.rag.time_window import parse_time_window
 from navis.platform.database import get_session
 from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import metrics, timed
+from navis.memory.envelope import EntityType
+from navis.memory.lineage import classifications_by_entity
 from navis.reasoning.calendar_ops import (
     CalendarOpsAgent,
     CalendarOpsClarification,
@@ -60,6 +66,14 @@ from navis.reasoning.scheduling import (
     SchedulingContext,
 )
 from navis.reasoning.scheduling.contract import ChatTurn, PendingScheduling
+from navis.reasoning.v2 import run_reasoning_v2
+from navis.state.v2 import (
+    MorningBrief,
+    OrganizationalState,
+    StateService,
+    scope_for,
+)
+from navis.state.v2.scope import EntityRef, ScopedView
 
 logger = get_logger("api.chat_router")
 
@@ -329,6 +343,477 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Bound the State read on the chat path. State is cache-first here (`get_state`,
+# never `incremental_update`), but a cold cache is a full fold over memory_records
+# and was measured at ~13s against a serverless Postgres — unacceptable inside a
+# chat turn. On timeout we degrade to the pre-existing memory-only behaviour
+# rather than making the founder wait. Same `asyncio.wait_for` pattern the signal
+# sync uses to bound a hung connector.
+#
+# This budget expired on 100% of turns in the Phase 3E evaluation, so State and
+# Reasoning were dropped from every answer.
+#
+# The ROOT cause was `pool_pre_ping` spending an extra round trip on every
+# connection checkout against a remote Postgres (see settings.db_pool_pre_ping);
+# removing it took a fresh-session warm `get_state` from 2.7-2.9s to ~1.4s. That
+# fix is real and is the reason this number is not larger.
+#
+# 2.5s was then tried again on principle and measured back at 26/26 timeouts,
+# because the residual is network RTT to a remote database, which no code change
+# removes, and the distribution straddles the boundary:
+#
+#     warm, steady state      p50 1.4s   p95 1.6s
+#     first call in a process     3.9s   (snapshot read + deserialize)
+#     genuinely cold fold         5.4s   (still correctly refused)
+#
+# 4.0s is sized to that measured distribution: it covers the cold-start call that
+# every fresh process pays once, and still refuses a full rebuild. It is a small
+# share of a turn that already spends ~12s in retrieval and generation.
+_REASONING_GROUNDING_TIMEOUT_S = 4.0
+
+# `Grounding.kind` for a fact derived from a ReasoningSignal. The documented
+# vocabulary is memory | state | learning | intelligence; `kind` is a free string
+# with no validation layer, so this needs no change to the ml.rag type.
+_REASONING_KIND = "reasoning"
+# ...and for one scoped State entity (the canonical Context projection).
+_CONTEXT_KIND = "state"
+
+# Kinds that are DERIVED from State rather than retrieved for the question. They
+# are org-wide and present on nearly every turn, so they must never be counted as
+# "retrieval found something" — doing so permanently suppresses the workspace
+# fallback and silently loses raw Calendar/Gmail evidence.
+_DERIVED_KINDS = frozenset({_REASONING_KIND, _CONTEXT_KIND})
+
+# Keep one entity's rendered fact short: the prompt is a budgeted list of many
+# facts, not a record dump. State's full field dict stays out of the LLM.
+_CONTEXT_LABEL_MAX = 120
+# One rendered detail value (an owner, a subject, a timestamp) and the whole
+# rendered line. Both are hard caps, so a pathological field can never turn one
+# State entity into the entire prompt.
+_CONTEXT_DETAIL_MAX = 90
+_CONTEXT_TEXT_MAX = 320
+# How many members of a list-valued field (attendees, participants, owners) are
+# named before the rest are summarised as "+N more". Bounded, and the count is
+# read off the list itself — nothing is estimated.
+_CONTEXT_LIST_ITEMS = 4
+
+# The one token budget for this path — the same value ContextBuilder.build
+# enforces on the retrieval path, so both branches bound the prompt identically.
+_CONTEXT_TOKEN_BUDGET = 1500
+
+
+def _compose_within_budget(
+    base: GroundedContext, extra: list[Grounding]
+) -> GroundedContext:
+    """Append derived facts to the workspace context under the SAME token budget.
+
+    The workspace fallback constructs its GroundedContext directly instead of
+    going through ContextBuilder, so the builder's budget never applied to it.
+    That was harmless while it carried ~12 short facts; adding State (22) and
+    Reasoning (10) pushed the rendered prompt to ~1777 tokens — past the 1500 the
+    retrieval branch enforces. Same policy as ContextBuilder: admit greedily in
+    order, drop the tail, never summarise away a citation.
+
+    `token_estimate` is recomputed here; `dataclasses.replace` alone would have
+    carried the pre-append value forward and under-reported the real prompt size.
+
+    Costs the RENDERED line per fact, matching ContextBuilder — the citation
+    prefix and date are real prompt tokens, and counting `text` alone
+    under-reported every fact by roughly a third.
+    """
+    admitted = list(base.facts)
+    used = estimate_tokens(replace(base, facts=[]).render()) + sum(
+        estimate_tokens(f.render_line(i)) for i, f in enumerate(admitted, 1)
+    )
+    for fact in extra:
+        cost = estimate_tokens(fact.render_line(len(admitted) + 1))
+        if used + cost > _CONTEXT_TOKEN_BUDGET:
+            continue
+        admitted.append(fact)
+        used += cost
+    return replace(base, facts=admitted, token_estimate=used)
+
+
+# ── How one State entity is rendered for the LLM ────────────────────────────
+#
+# Phase 3E.2 established that the State groundings' problem is not their POSITION
+# in the prompt. It is their CONTENT: "{entity_type}: {label} ({reason})" spent a
+# prompt line on a pointer while the fold had already normalised the answer onto
+# `EntityRef.fields` — the commitment's owner and due date, the meeting's
+# attendees and times, the thread's counterparty and direction. Asked "who owns
+# this?", the model held a commitment whose owner was one dict key away and said
+# it could not tell.
+#
+# The rules for what may be rendered:
+#   * EXISTING fields only, read by name off `EntityRef.fields`. Nothing is
+#     computed, inferred, defaulted or joined — an absent field renders nothing
+#     rather than a guess, so a thin entity stays honestly thin.
+#   * A WHITELIST per entity type, never the dict. `fields` is whatever the
+#     connector's payload carried, so dumping it would leak raw connector shape
+#     into the prompt and break the "State carries pointers, not bodies" rule.
+#   * BOUNDED and DETERMINISTIC: fixed field order, clipped values, capped list
+#     members, capped line. Same entity in, same line out, no clock, no model.
+#   * Bodies stay out. A thread's `snippet` and a document's contents are
+#     retrieval's job; State says what EXISTS and who it involves.
+
+# Which field names the human-readable label is taken from, most identifying
+# first. Covers every type State can hold: person(name/email) company(domain)
+# thread(subject) meeting/document(title) channel/project/customer(name)
+# relationship(person_email). Without `person_email`, relationships rendered as
+# bare UUIDs — useless grounding.
+_LABEL_FIELDS_DEFAULT = (
+    "name", "title", "subject", "person_email", "email", "domain", "text",
+)
+# A commitment or a decision IS its text. The default order reaches `subject`
+# first, which labelled every commitment with the SUBJECT LINE OF THE EMAIL it
+# was extracted from: the org's one open promise reached the model as
+# "commitment: Invitation from an unknown sender: Rahul and Abhi @ Mon 17 Aug
+# ..." instead of "We'll connect NavisLabs to your workflow". The subject is
+# still rendered — as `re`, where it belongs.
+_LABEL_FIELDS: dict[str, tuple[str, ...]] = {
+    EntityType.COMMITMENT.value: ("text",) + _LABEL_FIELDS_DEFAULT,
+    EntityType.DECISION.value: ("text",) + _LABEL_FIELDS_DEFAULT,
+}
+
+# The decision-relevant fields per entity type, in render order: (prefix, keys).
+# Two keys means a name/address pair — "Abhi <a@b.com>" when both are present,
+# whichever exists when only one is. An empty prefix renders the value alone.
+_DETAIL_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    # WHO OWES IT, BY WHEN, ABOUT WHAT. `speaker_*` is the promise's owner in
+    # State's own terms — `folds.compute_links` builds the commitment's `owner`
+    # link from exactly this address.
+    EntityType.COMMITMENT.value: (
+        ("owner", ("speaker_name", "speaker_email")),
+        ("status", ("status",)),
+        # Both due fields render: `due_at` only exists when the promise stated a
+        # date, and `due_text` preserves what was actually said ("end of week").
+        ("due", ("due_at",)),
+        ("due stated as", ("due_text",)),
+        ("promised", ("promised_at",)),
+        ("re", ("subject",)),
+    ),
+    EntityType.DECISION.value: (
+        ("status", ("status",)),
+        # "record" (one the org made) vs "request" (one the org owes) — the whole
+        # difference between an answer and an obligation.
+        ("kind", ("kind",)),
+        ("asked by", ("asked_by_name", "asked_by")),
+        ("asked", ("asked_at",)),
+        ("re", ("subject",)),
+    ),
+    # WHEN and WHO — the two things every meeting question asks for, and the
+    # join that answers "which people appear across both meetings and email".
+    EntityType.MEETING.value: (
+        ("starts", ("starts_at",)),
+        ("ends", ("ends_at",)),
+        ("attendees", ("attendees",)),
+        ("status", ("status",)),
+    ),
+    # WHO is on the other side and WHICH WAY it last moved. `direction ==
+    # "inbound"` means they spoke last and nobody has replied — the fact behind
+    # every "still open / unanswered" question.
+    EntityType.THREAD.value: (
+        ("last message from", ("from_name", "from_email")),
+        ("direction", ("direction",)),
+        ("category", ("category",)),
+        ("participants", ("participants",)),
+    ),
+    # The address is what makes a person joinable to a thread, a meeting and a
+    # relationship. `category` says whether this "person" is a newsletter — a
+    # founder must not be told to re-engage noreply@.
+    EntityType.PERSON.value: (
+        ("", ("email",)),
+        ("category", ("category",)),
+    ),
+    EntityType.RELATIONSHIP.value: (
+        ("direction", ("direction",)),
+        ("via", ("via",)),
+        ("category", ("category",)),
+    ),
+    # A company folds from an email domain and carries only that; the label
+    # already shows it, so `_render_details` drops it as a duplicate. Declared
+    # anyway so a future company field lands in a table that already exists.
+    EntityType.COMPANY.value: (
+        ("domain", ("domain",)),
+    ),
+    EntityType.DOCUMENT.value: (
+        ("owners", ("owners",)),
+        ("status", ("status",)),
+    ),
+    EntityType.PROJECT.value: (
+        ("status", ("status",)),
+    ),
+    EntityType.CUSTOMER.value: (
+        ("ref", ("external_ref",)),
+    ),
+    EntityType.CHANNEL.value: (
+        ("visibility", ("visibility",)),
+    ),
+}
+
+
+def _field_text(value: Any) -> str | None:
+    """One field as prompt text, or None when it carries nothing to say.
+
+    Lists are capped at `_CONTEXT_LIST_ITEMS` with the remainder counted, so an
+    80-attendee meeting costs the same bounded number of tokens as a 2-attendee
+    one. Booleans and numbers are deliberately NOT rendered: no field on the
+    whitelist is one, and stringifying `False` would assert a fact the fold
+    never established.
+    """
+    if isinstance(value, str):
+        return value.strip()[:_CONTEXT_DETAIL_MAX] or None
+    if isinstance(value, (list, tuple)):
+        members = [v.strip() for v in value if isinstance(v, str) and v.strip()]
+        if not members:
+            return None
+        shown = ", ".join(m[:_CONTEXT_DETAIL_MAX] for m in members[:_CONTEXT_LIST_ITEMS])
+        extra = len(members) - _CONTEXT_LIST_ITEMS
+        return f"{shown} +{extra} more" if extra > 0 else shown
+    return None
+
+
+def _label_from_fields(entity_type: str, fields: dict[str, Any]) -> str | None:
+    """The entity's human name, or None when State knows no name for it.
+
+    None rather than the entity_id: a caller rendering a signal's subject wants
+    to say nothing rather than quote a uuid at the model.
+    """
+    for key in _LABEL_FIELDS.get(entity_type, _LABEL_FIELDS_DEFAULT):
+        text = _field_text(fields.get(key))
+        if text:
+            return text[:_CONTEXT_LABEL_MAX]
+    return None
+
+
+def _entity_label(entity: "EntityRef") -> str:
+    """A human-readable name for a scoped entity, whatever type it is.
+
+    Deliberately source-agnostic: it reads State's normalised field names, never
+    anything connector-shaped. A new source that folds into the same entity types
+    renders here with no change.
+    """
+    return _label_from_fields(entity.entity_type, entity.fields) or entity.entity_id
+
+
+def _render_details(entity_type: str, fields: dict[str, Any], label: str) -> str:
+    """The whitelisted fields of one entity, as `prefix value; prefix value`.
+
+    A detail equal to the label is dropped rather than repeated — a company
+    whose only field is the domain it is already named after adds no information
+    for the tokens it costs.
+    """
+    parts: list[str] = []
+    for prefix, keys in _DETAIL_FIELDS.get(entity_type, ()):
+        values = [t for t in (_field_text(fields.get(k)) for k in keys) if t]
+        if not values or values[0] == label:
+            continue
+        rendered = values[0] if len(values) == 1 else f"{values[0]} <{values[1]}>"
+        parts.append(f"{prefix} {rendered}" if prefix else rendered)
+    return "; ".join(parts)
+
+
+def _scoped_view_to_groundings(view: ScopedView) -> list[Grounding]:
+    """ScopedView → cited facts. Pure; no I/O, no org lookup of its own.
+
+    Takes the already-org-scoped view rather than an org_id precisely so this
+    cannot fetch the wrong tenant's state: every entity here came from one
+    `OrganizationalState` built for one org.
+
+    Provenance is preserved, not discarded — `source` is the State entity_id (a
+    deterministic, org-scoped identity) and `lineage` carries the entity's
+    `memory_ids` / `signal_ids` so a citation can still be drilled to the raw
+    record. The ScopedView itself never crosses into `navis.ml`.
+    """
+    groundings: list[Grounding] = []
+    for entity in view.entities:
+        citation = view.citations.get(entity.entity_id)
+        occurred_at: datetime | None = None
+        if entity.last_seen:
+            try:
+                occurred_at = datetime.fromisoformat(entity.last_seen)
+            except ValueError:  # non-ISO last_seen — a fact without a date is fine
+                occurred_at = None
+        label = _entity_label(entity)
+        details = _render_details(entity.entity_type, entity.fields, label)
+        groundings.append(
+            Grounding(
+                kind=_CONTEXT_KIND,
+                source=entity.entity_id,
+                # type: label — the decision-relevant fields State already holds
+                # (reason) — the projection's own explanation of why this entity
+                # made the cut ("open, oldest activity").
+                #
+                # An entity whose whitelisted fields are all absent renders
+                # exactly as it always did; nothing is padded to look richer than
+                # the fold actually is.
+                text=(
+                    f"{entity.entity_type}: {label}"
+                    + (f" — {details}" if details else "")
+                    + f" ({entity.reason})"
+                )[:_CONTEXT_TEXT_MAX],
+                occurred_at=occurred_at,
+                lineage=(
+                    tuple(f"memory:{m}" for m in citation.memory_ids)
+                    + tuple(f"signal:{s}" for s in citation.signal_ids)
+                    if citation
+                    else ()
+                ),
+            )
+        )
+    return groundings
+
+
+async def _reset_session(db) -> None:
+    """Return a session to a usable state after best-effort work failed on it.
+
+    `asyncio.wait_for` CANCELS the coroutine it is waiting on. When that
+    coroutine is a multi-statement DB read, the cancellation lands mid
+    transaction and SQLAlchemy marks it invalid — every later statement on that
+    session then raises `PendingRollbackError: Can't reconnect until invalid
+    transaction is rolled back`, whatever it was trying to do.
+
+    That is what turned a soft degradation into a 500: the timeout branch below
+    correctly returned `[]` and logged a warning, but handed the CALLER a
+    poisoned session, and the very next thing `_grounded_answer` does is
+    retrieval. The enrichment failing must cost the answer some context — never
+    the turn.
+
+    Rolling back discards nothing: everything on this path is read-only, and the
+    request session commits only at the end of `get_session`.
+    """
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001 — a cleanup failure must not mask the original
+        logger.exception("chat: could not reset session after failed enrichment")
+
+
+def _reasoning_text(state: OrganizationalState, signal: Any) -> str:
+    """One ReasoningSignal as a cited conclusion, NAMING whom it is about.
+
+    A signal already carries its subject as `(entity_type, entity_id)`, but the
+    id is a uuid, so rendering `title — why` alone dropped the only part a reader
+    can act on. Measured on the real org: four RELATIONSHIP_COOLING signals
+    reached the model as four identical lines, "Relationship cooling — 7 days
+    since the last interaction.", and every answer about who had gone quiet could
+    only say "several relationships".
+
+    The name is resolved through the SAME `_label_from_fields` the ScopedView
+    path uses, against the state the signal was computed from — one definition of
+    what an entity is called, and no second lookup or ranking. A signal with no
+    subject, a subject State no longer holds, or a subject already spelled out in
+    the title (the obligation engines inline it) renders exactly as before.
+    """
+    title, why = signal.title, signal.why
+    if not signal.entity_type or not signal.entity_id:
+        return f"{title} — {why}"
+    raw = state.entities.get(signal.entity_type, {}).get(signal.entity_id)
+    subject = _label_from_fields(signal.entity_type, (raw or {}).get("fields") or {})
+    if not subject or subject in title:
+        return f"{title} — {why}"
+    return f"{title} ({signal.entity_type}: {subject}) — {why}"
+
+
+async def _relevance_evidence(db, org_id: uuid.UUID) -> dict[str, frozenset[str]]:
+    """Organizational-relevance evidence for Reasoning, read at the composition root.
+
+    Reasoning performs no I/O, so the classification sets it decides relevance
+    from are fetched here and handed in (see `reasoning/v2/base.py`).
+
+    Degrades to `{}` on its OWN, rather than inside the caller's try-block: an
+    empty map means UNKNOWN, and every engine's documented response to UNKNOWN is
+    to keep its prior behaviour. Failing this read must therefore cost the answer
+    some precision, never the whole State/Context enrichment.
+    """
+    try:
+        return await classifications_by_entity(
+            db, org_id, entity_type=EntityType.RELATIONSHIP.value
+        )
+    except Exception:  # noqa: BLE001 — precision is never worth failing the turn
+        logger.exception("chat: relevance evidence unavailable org=%s", org_id)
+        metrics.incr("chat.relevance_evidence.failed")
+        # Same contract as `_state_groundings`: degrade without leaving the
+        # caller a session it cannot use.
+        await _reset_session(db)
+        return {}
+
+
+async def _state_groundings(
+    db: AsyncSession, org_id: uuid.UUID
+) -> list[Grounding]:
+    """Current organizational understanding, as cited facts for the LLM.
+
+    State is read ONCE and feeds the two parallel deterministic read-side
+    computations, exactly as the architecture defines them:
+
+        State ├─ scope_for(...)      -> ScopedView   -> Grounding(kind="state")
+              └─ run_reasoning_v2()  -> Signal[]     -> Grounding(kind="reasoning")
+
+    Context does NOT feed Reasoning and Reasoning never sees the model. What
+    crosses into `navis.ml` is a flat `list[Grounding]` — never a ScopedView,
+    never a ReasoningSignal, never an OrganizationalState.
+
+    Runs in the API layer on purpose: `navis.ml` may not import `navis.state` or
+    `navis.reasoning` and vice versa (both directions are pinned by AST
+    invariants in tests/ml/test_ml_layer.py), so the composition root is the only
+    place allowed to join them. Same argument as `workspace_fallback`.
+
+    Best-effort by construction. State unavailable, slow, or both projections
+    empty all degrade to `[]`, which leaves the memory → workspace-fallback path
+    exactly as it was. Chat must never fail because State is cold.
+    """
+    try:
+        with timed("chat.state_groundings"):
+            state = await asyncio.wait_for(
+                StateService(db).get_state(org_id),
+                timeout=_REASONING_GROUNDING_TIMEOUT_S,
+            )
+            # Policy is intentionally None: it only tunes `brief_max_items`, and
+            # resolving it costs a second round-trip inside a latency-bounded
+            # path. Chat takes the default per-type cap.
+            view = scope_for(state, MorningBrief(), None, as_of=state.as_of)
+            signals = run_reasoning_v2(
+                state, evidence=await _relevance_evidence(db, org_id)
+            )
+    except asyncio.TimeoutError:
+        # Expected on a cold projection — a normal degradation, not an incident.
+        # Logged at warning WITHOUT a traceback so a cold start doesn't emit a
+        # 100-line stack on every first request.
+        logger.warning(
+            "chat: state read exceeded %.1fs, answering without state/reasoning org=%s",
+            _REASONING_GROUNDING_TIMEOUT_S, org_id,
+        )
+        metrics.incr("chat.state_groundings.timeout")
+        await _reset_session(db)
+        return []
+    except Exception:  # noqa: BLE001 — enrichment is never worth failing the turn
+        logger.exception("chat: state grounding unavailable org=%s", org_id)
+        metrics.incr("chat.state_groundings.failed")
+        await _reset_session(db)
+        return []
+
+    context_groundings = _scoped_view_to_groundings(view)
+    reasoning_groundings = [
+        Grounding(
+            kind=_REASONING_KIND,
+            # The deterministic ReasoningSignal id — a real lineage pointer, so a
+            # citation resolves back to the engine + state watermark that produced it.
+            source=str(s.signal_id),
+            text=_reasoning_text(state, s),
+            occurred_at=s.state_as_of,
+        )
+        for s in signals
+    ]
+    metrics.incr("chat.state_groundings.context", value=len(context_groundings))
+    metrics.incr("chat.state_groundings.reasoning", value=len(reasoning_groundings))
+    # Context (what IS the case) before Reasoning (what it implies), so a squeezed
+    # token budget keeps the factual layer and drops interpretation first.
+    # Conclusions before the entities they describe. ContextBuilder re-sorts by
+    # kind anyway, but the workspace-fallback path composes this list directly
+    # (`_compose_within_budget`), so the order has to be right at the source too.
+    return [*reasoning_groundings, *context_groundings]
+
+
 async def _grounded_answer(
     db: AsyncSession,
     org_id: uuid.UUID,
@@ -352,16 +837,30 @@ async def _grounded_answer(
     now = datetime.now(timezone.utc)
     window = parse_time_window(question, now=now)
     since, until = window if window else (None, None)
+    # The org's current organizational understanding, supplied through the seam
+    # ContextBuilder already exposes for exactly this. `extra` ranks AFTER memory
+    # hits under the same unchanged token budget, so reasoning enriches an answer
+    # without displacing the evidence retrieval found.
+    extra = await _state_groundings(db, org_id)
     context = await ContextBuilder(db).build(
-        org_id, question, k=8, token_budget=1500, since=since, until=until, now=now
+        org_id, question, k=8, token_budget=_CONTEXT_TOKEN_BUDGET, extra=extra,
+        since=since, until=until, now=now,
     )
-    if not context.facts:
+    # The fallback decision is about RETRIEVAL, not about enrichment. State and
+    # reasoning groundings are org-wide and present on almost every turn, so
+    # counting them here would permanently suppress the workspace fallback and
+    # silently lose the raw Calendar/Gmail evidence it exists to provide.
+    if not [f for f in context.facts if f.kind not in _DERIVED_KINDS]:
         # Memory is empty for this question — but the WORKSPACE may not be.
         # Memory lags ingestion (extractors run behind the sync); raw Calendar
         # and Gmail signals do not. Answering "not enough memory" while three
         # meetings and a dozen threads sit in signal_events was simply wrong.
-        context = await build_workspace_context(db, org_id, question, now=now)
-        if not context.facts:
+        workspace = await build_workspace_context(db, org_id, question, now=now)
+        if workspace.facts:
+            # Compose: raw workspace evidence FIRST, org understanding after it,
+            # bounded by the same budget the retrieval branch uses.
+            context = _compose_within_budget(workspace, extra)
+        elif not extra:
             sources = await connected_source_labels(db, org_id)
             if sources:
                 return (
@@ -377,6 +876,8 @@ async def _grounded_answer(
                 "I'll answer from your real data, never from guesswork.",
                 [],
             )
+        # else: no memory, no workspace, but real reasoning signals — `context`
+        # already holds them, so answer from organizational understanding alone.
     if _is_prioritization(question):
         generator = recommendation
     elif _is_summarize(question):
@@ -405,9 +906,21 @@ async def _grounded_answer(
     # from the context that was fed to the model — that's the exact fact the
     # citation refers to.
     fact_text_by_source = {f.source: f.text for f in context.facts}
+    # Report WHICH truth layer each citation came from instead of stamping every
+    # one "episodic". A ScopedView entity and a ReasoningSignal are the
+    # organization's derived understanding, not a remembered email, and the user
+    # cannot judge an answer without knowing which it is. `ChatCitation.type`
+    # already allowed "state"; the mapping was simply never made.
+    #
+    # Reasoning maps to "state" rather than gaining its own type: both are the
+    # org's current understanding as opposed to raw recall, and the existing
+    # four-value vocabulary is shared with the frontend, which renders "state"
+    # as "Organizational state". Everything else — retrieved memory and the raw
+    # workspace-fallback facts, whose kind is the connector — is episodic recall.
+    kind_by_source = {f.source: f.kind for f in context.facts}
     citations = [
         ChatCitation(
-            type="episodic",
+            type="state" if kind_by_source.get(src) in _DERIVED_KINDS else "episodic",
             source=src,
             detail=(fact_text_by_source.get(src) or "")[:200] or None,
         )
@@ -472,13 +985,29 @@ async def _scheduling_response(
     decision_id = _chat_scheduling_decision_id(
         p.org_id, result.attendee.email, result.slot.start.isoformat()
     )
-    reasoning_signal_ids: list[str] = []
+    # SOURCE-EVENT provenance, not reasoning provenance. Both of these are
+    # `signal_events.id` values — `active_signal_id` is looked up as a
+    # SignalEventRecord by scheduling/context.py, and `source_signal_event_id`
+    # is derived from it — so neither can ever address a row in
+    # `reasoning_signals`.
+    #
+    # They were being written into `reasoning_signal_ids`, which Learning
+    # aggregates on and Intelligence cites as `supporting_reasoning_signal_ids`.
+    # A signal_event id there is a reference that can never resolve, and it
+    # would have keyed a `signal_intelligence` insight to something that is not
+    # a reasoning signal. Nothing recomputes it back into the right namespace.
+    #
+    # `reasoning_signal_ids` stays EMPTY here, and that is the honest answer: a
+    # scheduling request the founder typed was not concluded by any persisted
+    # ReasoningSignal. The email that prompted it is still recorded — beside it,
+    # in its own namespace.
+    source_signal_event_ids: list[str] = []
     if body.active_signal_id:
-        reasoning_signal_ids.append(str(body.active_signal_id))
+        source_signal_event_ids.append(str(body.active_signal_id))
     elif result.source_signal_event_id:
-        # Signal came from the pending state (attendee resolved on a
-        # prior turn from an email context).
-        reasoning_signal_ids.append(result.source_signal_event_id)
+        # Came from the pending state (attendee resolved on a prior turn from
+        # an email context).
+        source_signal_event_ids.append(str(result.source_signal_event_id))
 
     svc = ExecutionService(db)
     req, _created = await svc.request(
@@ -486,7 +1015,8 @@ async def _scheduling_response(
         decision_id,
         ActionType.SCHEDULE_MEETING.value,
         payload,
-        reasoning_signal_ids=reasoning_signal_ids,
+        reasoning_signal_ids=[],
+        source_signal_event_ids=source_signal_event_ids,
         reasoning_version=None,
         state_watermark=None,
         # Explicit, not defaulted: the founder asked for this in the

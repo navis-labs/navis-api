@@ -13,6 +13,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from navis.execution.actions import (
+    ActionPreconditionFailed,
+    ActionSpec,
+    UnknownAction,
+    awaiting_draft,
+    require_spec,
+)
 from navis.execution.config import MAX_EXECUTION_ATTEMPTS
 from navis.execution.drafts import (
     DraftNotApprovable,
@@ -29,6 +36,7 @@ from navis.identity.dependencies import CurrentContext, get_current_context
 from navis.identity.permissions import Permission
 from navis.organization.contract import Capability
 from navis.organization.guards import require_capability
+from navis.organization.service import OrganizationService
 from navis.platform.database import get_session
 from navis.platform.queue import celery_app
 
@@ -39,7 +47,11 @@ class ActionRequestBody(BaseModel):
     decision_id: uuid.UUID
     action_type: ActionType
     payload: dict[str, Any] = {}
+    # reasoning_signals.signal_id values ONLY — see execution/models.py. Raw
+    # captured events belong in `source_signal_event_ids`; mixing them makes
+    # every downstream reference unresolvable.
     reasoning_signal_ids: list[str] = []
+    source_signal_event_ids: list[str] = []
     reasoning_version: int | None = None
     state_watermark: str | None = None
 
@@ -52,7 +64,10 @@ def _serialize(r: ExecutionRequest) -> dict[str, Any]:
         "action_type": r.action_type,
         "status": r.status,
         "payload": r.payload,
+        # Two distinct namespaces, never merged: reasoning_signals.signal_id
+        # here, signal_events.id below.
         "reasoning_signal_ids": r.reasoning_signal_ids,
+        "source_signal_event_ids": r.source_signal_event_ids or [],
         "reasoning_version": r.reasoning_version,
         "state_watermark": r.state_watermark,
         "provider_reference": r.provider_reference,
@@ -64,9 +79,11 @@ def _serialize(r: ExecutionRequest) -> dict[str, Any]:
         # True while the action is a placeholder Navis proposed but has not
         # written yet. The card renders "needs a draft" instead of Approve,
         # and `approve` refuses it — see providers/reply.py.
-        "requires_draft": requires_draft(r.payload)
-        if r.action_type == ActionType.REPLY_TO_EMAIL.value
-        else False,
+        #
+        # Spec-driven: an action that does not support drafts can never be a
+        # placeholder, and a new draftable connector reports this correctly
+        # without editing the serializer.
+        "requires_draft": awaiting_draft(r.action_type, r.payload),
     }
 
 
@@ -113,6 +130,43 @@ async def _require_org(db: AsyncSession, eid: uuid.UUID, org_id: uuid.UUID) -> E
     return req
 
 
+async def _require_action_capability(
+    db: AsyncSession, org_id: uuid.UUID, action_type: str
+) -> ActionSpec:
+    """The org must hold the CONNECTOR capability this action consumes.
+
+    `require_capability(Capability.EXECUTION)` on the route is a blanket gate:
+    "may this org execute anything at all?". It does not answer "may this org
+    send Slack?" — so an org whose SLACK entitlement was explicitly revoked, or
+    whose `kill:gmail` switch is on, could still run a send_slack / send_email
+    action, because EXECUTION was the only thing anyone checked. The kill switch
+    on gmail stopped Navis READING mail and did nothing about SENDING it.
+
+    Both gates apply: EXECUTION (the route) and the spec's capability (here).
+    Resolution is per-org through the same EntitlementService every other gate
+    uses, so org isolation is inherited rather than re-implemented.
+
+    Enforced on APPROVE, which is the last boundary before the worker can claim
+    the row — so it covers every producer, including the chat surface that
+    creates executions without going through this router.
+    """
+    try:
+        spec = require_spec(action_type)
+    except UnknownAction as exc:
+        # A row whose action type is no longer registered (a connector removed, a
+        # legacy type) must not be approvable. It cannot execute either — the
+        # worker refuses to dispatch it — so refusing here just says so honestly
+        # instead of accepting an approval that can only dead-letter.
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    if not await OrganizationService(db).can_use(org_id, spec.capability):
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            f"action '{action_type}' requires the '{spec.capability.value}' "
+            "capability, which is not enabled for this organization",
+        )
+    return spec
+
+
 @router.post("", status_code=201, dependencies=[Depends(require_capability(Capability.EXECUTION))])
 async def request_action(
     body: ActionRequestBody,
@@ -122,6 +176,7 @@ async def request_action(
     req, created = await ExecutionService(db).request(
         p.org_id, body.decision_id, body.action_type.value, body.payload,
         reasoning_signal_ids=body.reasoning_signal_ids,
+        source_signal_event_ids=body.source_signal_event_ids,
         reasoning_version=body.reasoning_version,
         state_watermark=body.state_watermark,
     )
@@ -183,28 +238,54 @@ async def approve(
     db: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     row = await _require_org(db, execution_id, p.org_id)
-    # A proactive reply Navis has proposed but not yet WRITTEN cannot be
-    # approved — there is nothing to send. The provider also refuses it
-    # (providers/reply.py), which is the hard guarantee; this check exists so
-    # the user gets an honest 409 instead of an approval that silently
-    # dead-letters seconds later.
-    if row.action_type == ActionType.REPLY_TO_EMAIL.value and requires_draft(row.payload):
+    # Per-action capability, on top of the route's blanket EXECUTION gate. Runs
+    # BEFORE the draft is frozen and before any state changes, so an org that may
+    # not use this connector cannot get a row into APPROVED at all.
+    spec = await _require_action_capability(db, p.org_id, row.action_type)
+    # CONNECTOR READINESS, for EVERY action that declares it.
+    #
+    # This call used to live INSIDE the draft branch below, which made
+    # `ActionSpec.preflight` reachable only for a draftable action that still
+    # needed a draft. `reply_to_email` was the only spec that declared one, so
+    # the nesting was invisible — and it silently disqualified every other
+    # action from ever having one: a `schedule_meeting` preflight registered
+    # tomorrow would simply never run, and the connector author would have no
+    # way to tell from the spec that their readiness check was dead code.
+    #
+    # ORDERING IS THE POINT AND IT IS UNCHANGED FOR DRAFTS. Authorization
+    # (`_require_action_capability`, above) is asked FIRST and independently:
+    # possession of a credential must never imply permission to use it, so
+    # entitlements decide before anything resolves a token. Readiness is asked
+    # SECOND, still before the draft is frozen and before any state transition,
+    # so a founder is never asked to review a message that cannot be sent.
+    #
+    # Provider-neutral: the spec supplies the callable and the connector writes
+    # the message. This handler still does not know that Google exists.
+    if spec.preflight is not None:
+        try:
+            await spec.preflight(db, p.org_id)
+        except ActionPreconditionFailed as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    # An action Navis has proposed but not yet WRITTEN cannot be approved —
+    # there is nothing to send. The provider also refuses it (providers/reply.py),
+    # which is the hard guarantee; this check exists so the user gets an honest
+    # 409 instead of an approval that silently dead-letters seconds later.
+    #
+    # Spec-driven, not `action_type == REPLY_TO_EMAIL`: a future draftable action
+    # (a Notion page, a Jira issue) inherits this path by declaring
+    # supports_draft, without editing the generic approve handler.
+    if spec.supports_draft and requires_draft(row.payload):
         # A proactive reply is approved through the DRAFT, which is the only
         # thing a human can actually have reviewed. `DraftService.approve`
         # re-checks staleness at this instant and merges the reviewed text into
         # the payload — which is what clears `requires_draft` and lets the
         # execution proceed.
-        # Scope pre-flight BEFORE freezing the draft. Without it the founder
+        #
+        # The connector pre-flight that used to run here now runs above, for
+        # every action rather than only this one. It still runs BEFORE the draft
+        # is frozen, which is the property that mattered: without it the founder
         # reviews, edits, approves — and the send dead-letters minutes later on
-        # a 403 they had no way to anticipate. Refusing here costs one click and
-        # tells them exactly what to do.
-        if not await _gmail_send_ready(db, p.org_id):
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                "Navis can read your Gmail but is not yet allowed to send from "
-                "it. Reconnect Google Workspace to grant send access, then "
-                "approve this draft again.",
-            )
+        # a 403 they had no way to anticipate.
         try:
             await DraftService(db).approve(row, approver_id=p.subject_id)
         except DraftNotFound:
@@ -337,26 +418,27 @@ async def _sender_name(db: AsyncSession, org_id: uuid.UUID) -> str | None:
     None is a real answer, not a failure: the draft then ends with a bare
     "Best," rather than an invented name. Never guessed from an email address.
 
-    Resolved through the SAME capability-aware resolver the sender uses, so the
+    Resolved through the SAME integration boundary the sender uses, so the
     sign-off names the account the mail will actually go out from. Picking the
     newest Gmail row instead (as this did) signs a multi-account workspace's
     draft with one person's name and sends it from another's address.
+
+    Goes through `resolve_integration` rather than importing the Google resolver:
+    this is a generic HTTP handler, and connector authentication does not belong
+    in it. The provider name comes from the ActionSpec's registered provider, so
+    a future draftable connector reaches its own credential the same way.
 
     The read-only fallback is deliberate: an org that has not granted
     gmail.send must still be able to GENERATE and review drafts — the approve
     gate is what stops it, and stopping it here would mean losing the sign-off
     name for every org that has not reconsented yet.
     """
+    from navis.execution.integrations import IntegrationUnavailable, resolve_integration
     from navis.identity.models import Integration, IntegrationProvider, User
-    from navis.signals.google.resolve import (
-        GmailNotConnected,
-        GmailSendScopeInsufficient,
-        resolve_gmail_send_integration,
-    )
 
     try:
-        row = await resolve_gmail_send_integration(db, org_id)
-    except (GmailNotConnected, GmailSendScopeInsufficient):
+        row = await resolve_integration(db, org_id, "gmail")
+    except IntegrationUnavailable:
         row = await db.scalar(
             select(Integration)
             .where(
@@ -373,30 +455,13 @@ async def _sender_name(db: AsyncSession, org_id: uuid.UUID) -> str | None:
     return name or None
 
 
-async def _gmail_send_ready(db: AsyncSession, org_id: uuid.UUID) -> bool:
-    """Does this org's Gmail grant actually permit sending?
-
-    Orgs connected before the v4 scope set hold `gmail.readonly` only. Every
-    read feature keeps working; only the proactive send needs reconsent.
-
-    Asks the SAME resolver the sender will use. This previously ran its own
-    newest-row-wins query, which meant the gate and the sender could disagree on
-    a multi-account workspace — and worse, agree wrongly: both looked at a newly
-    connected read-only grant and ignored an older one that could send. Sharing
-    the resolver makes "will approve let this through?" and "can the worker
-    actually send it?" the same question by construction.
-    """
-    from navis.signals.google.resolve import (
-        GmailNotConnected,
-        GmailSendScopeInsufficient,
-        resolve_gmail_send_integration,
-    )
-
-    try:
-        await resolve_gmail_send_integration(db, org_id)
-    except (GmailNotConnected, GmailSendScopeInsufficient):
-        return False
-    return True
+# `_gmail_send_ready` lived here and was a Gmail-shaped credential question
+# inlined in the generic approve handler — the one place Execution knew that a
+# provider was Google. It now lives behind `ActionSpec.preflight` as
+# `_gmail_send_preflight` (execution/actions.py), asking the same resolver and
+# raising `ActionPreconditionFailed` with the same message. Deleted rather than
+# left unused: a generic-looking helper that hardcodes one connector is exactly
+# what the next connector would copy.
 
 
 def _draft_response(req: ExecutionRequest, draft) -> dict[str, Any]:

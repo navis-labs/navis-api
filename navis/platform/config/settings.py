@@ -16,13 +16,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Environment(str, enum.Enum):
     """The deployment environment. A CLOSED set, deliberately.
 
-    `is_production` gates six independent controls — production config checks,
-    field-encryption fail-fast, OAuth-token-encryption fail-fast, entitlement
-    enforcement, the capability guard, and plan defaults. It was previously a
-    free-form string compared with `== "production"`, so `ENVIRONMENT=prod`, a
-    trailing space, or a misspelling silently took the PERMISSIVE branch of all
-    six at once: credentials stored unencrypted, every capability granted, and
-    the startup safety net skipped — with no error and no log line.
+    `is_production` gates four independent controls — production config checks,
+    field-encryption fail-fast, OAuth-token-encryption fail-fast, and the default
+    plan a new org is provisioned with. It was previously a free-form string
+    compared with `== "production"`, so `ENVIRONMENT=prod`, a trailing space, or a
+    misspelling silently took the PERMISSIVE branch of all of them at once:
+    credentials stored unencrypted and the startup safety net skipped — with no
+    error and no log line.
+
+    It deliberately no longer gates authorization. Entitlement resolution and the
+    capability guard used to consult it and grant everything outside production,
+    which made a single missing env var equivalent to disabling the capability
+    boundary. Authorization now depends only on org state, never on deployment.
 
     Making it an enum means an unrecognised value fails at import, before the
     process can serve a request. Wrong config now cannot masquerade as dev.
@@ -214,6 +219,17 @@ class Settings(BaseSettings):
     db_max_overflow: int = 20
     db_pool_recycle_seconds: int = 300  # Neon drops idle conns ~5m; recycle below that
     db_pool_timeout_seconds: int = 30
+    # Liveness-check every pooled connection before handing it out. It costs a
+    # FULL EXTRA ROUND TRIP per checkout, which is invisible on a local database
+    # and dominant on a remote one: measured against the production Neon
+    # endpoint, `SELECT 1` on a fresh session went 2689ms -> 1457ms with this
+    # off — 1232ms, 46% of the checkout cost, paid by every HTTP request.
+    #
+    # `db_pool_recycle_seconds` (above) is the real protection: it retires
+    # connections before Neon's ~5m idle drop, so pre-ping was guarding a window
+    # recycling already closes. Left configurable because a deployment with an
+    # unreliable network path may legitimately want to trade the latency back.
+    db_pool_pre_ping: bool = False
     # Server-side cap: a single statement may not run longer than this. Prevents a
     # runaway query from pinning a pooled connection forever (reliability at scale).
     db_statement_timeout_seconds: float = 30.0
@@ -332,9 +348,11 @@ class Settings(BaseSettings):
             "production config safety checks (SECRET_KEY strength, DEBUG, /docs)",
             "field-encryption fail-fast (PII may be stored unencrypted if keys are unset)",
             "OAuth-token-encryption fail-fast (tokens may be stored plaintext if keys are unset)",
-            "organization entitlement enforcement (every capability granted)",
-            "capability guard on API routes",
-            "plan defaults (new orgs get ENTERPRISE, not FREE)",
+            # Entitlement ENFORCEMENT is no longer relaxed anywhere — the gate is the
+            # same code in every environment. What is still relaxed is the plan a new
+            # org is seeded with, which grants breadth through real entitlement rows
+            # the gate then evaluates normally.
+            "plan defaults / seeded entitlements (new orgs get ENTERPRISE, not FREE)",
         ]
 
     @property

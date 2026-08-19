@@ -381,15 +381,22 @@ async def test_the_sender_refuses_before_calling_google_when_scope_is_missing():
     monkey = _pytest.MonkeyPatch()
     try:
         monkey.setattr(_senders, "session_scope", lambda: _CM())
-        monkey.setattr(_senders, "_decrypt_tokens_inplace", lambda i: None)
+        # No decrypt step to stub: the sender snapshots the tokens AS STORED and
+        # hands the ciphertext to TokenManager. Nothing reads these stub tokens
+        # before the scope check refuses.
         monkey.setattr(_senders, "GmailClient", _never)
-        # Wording moved when the sender adopted the capability-aware resolver
-        # (navis.signals.google.resolve): the message is now the user-facing one
-        # the approve-gate shows, rather than the internal "send scope missing".
         # The guarantee under test is unchanged and is the assertion below plus
-        # `_never` — refuse BEFORE any Google call. GmailSendScopeInsufficient
-        # subclasses RuntimeError, so the worker's failure handling is the same.
-        with _pytest.raises(RuntimeError, match="without permission to send"):
+        # `_never` — refuse BEFORE any Google call.
+        #
+        # The sender now resolves through the generic integration boundary, so
+        # the Google-specific GmailSendScopeInsufficient is translated into the
+        # provider-neutral IntegrationUnavailable that the whole Execution layer
+        # understands. Asserting the flag too is strictly stronger than the old
+        # message match: `reconsent_required` is what makes the UI say "reconnect
+        # to grant send" rather than the wrong "connect Google".
+        from navis.execution.integrations import IntegrationUnavailable
+
+        with _pytest.raises(IntegrationUnavailable, match="not allowed to send") as exc:
             await _senders.gmail_sender(
                 {
                     "__ctx__": {
@@ -403,6 +410,8 @@ async def test_the_sender_refuses_before_calling_google_when_scope_is_missing():
                     "reply_thread_id": "t-1",
                 }
             )
+        assert exc.value.provider == "gmail"
+        assert exc.value.reconsent_required is True
         assert sent == []
     finally:
         monkey.undo()

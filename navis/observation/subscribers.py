@@ -52,3 +52,25 @@ async def on_action_executed(event: DomainEvent) -> None:
 @subscribe(EventType.ACTION_FAILED)
 async def on_action_failed(event: DomainEvent) -> None:
     await _capture(event, OutcomeType.ACTION_FAILED)
+
+
+# ── Human judgement ───────────────────────────────────────────────────
+#
+# Execution has always emitted these; nothing consumed them. A founder pressing
+# Reject on a proposal Navis made is the most informative event in the system —
+# it is a direct verdict on the proposal, arriving before any side effect — and
+# it was written to the outbox, relayed, and dropped because no handler existed.
+#
+# They travel the SAME path as every machine outcome (inbox-deduped, lineage
+# carried from the persisted row), so nothing new is introduced: this is the
+# existing contract finally applied to the events that already flowed through it.
+
+
+@subscribe(EventType.ACTION_REJECTED)
+async def on_action_rejected(event: DomainEvent) -> None:
+    await _capture(event, OutcomeType.ACTION_REJECTED)
+
+
+@subscribe(EventType.ACTION_CANCELLED)
+async def on_action_cancelled(event: DomainEvent) -> None:
+    await _capture(event, OutcomeType.ACTION_CANCELLED)

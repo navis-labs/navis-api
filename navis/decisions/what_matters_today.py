@@ -15,6 +15,8 @@ from datetime import datetime
 from navis.decisions.base import (
     Decision,
     DecisionCategory,
+    IntelligenceFact,
+    IntelligenceView,
     category_for,
     compute_decision_id,
 )
@@ -32,6 +34,74 @@ _CATEGORY_BIAS = {
     DecisionCategory.RISK: 0.12,
 }
 
+# ── Intelligence corroboration ────────────────────────────────────────
+#
+# NOT A NEW SCORING DIMENSION. It is the same additive nudge the category
+# system above already applies, and its ceiling IS that system's largest
+# nudge — so an organizational fact can corroborate what Reasoning found
+# and can never outweigh it. A decision whose signal weight leads by more
+# than one bias unit cannot be displaced by Intelligence at all.
+#
+# Scaled by the insight's OWN confidence, which is the only strength
+# measure an insight carries that is comparable across insight types.
+# `sample_size` deliberately does NOT enter: it counts decisive learning
+# samples on a Learning fold and affected ENTITIES on a reality fold, so
+# treating it as evidential weight would let a 110-entity footprint
+# recitation outrank a real obligation — the exact failure the category
+# map was rewritten to remove.
+_INTELLIGENCE_BIAS_CEILING = _CATEGORY_BIAS[DecisionCategory.RISK]
+
+
+def _relevant_facts(
+    signal: ReasoningSignal, intelligence: IntelligenceView | None
+) -> tuple[IntelligenceFact, ...]:
+    """The organizational facts that are ABOUT this signal. Deterministic.
+
+    Two relationships, both already recorded upstream, neither inferred:
+
+      1. the insight names this signal in `supporting_reasoning_signal_ids`
+         (written by `intelligence.service._provenance`) — it was folded FROM
+         this signal, so it is by construction about it;
+      2. the insight names this signal's entity among the entities in its
+         evidence (written by the reality engines' `_entities`).
+
+    Everything else is unrelated and contributes nothing. No fuzzy matching,
+    no text similarity, no model: an insight either names this signal or its
+    entity, or it does not.
+    """
+    if intelligence is None or not intelligence.facts:
+        return ()
+    signal_id = str(signal.signal_id)
+    out: list[IntelligenceFact] = []
+    for fact in intelligence.facts:
+        if signal_id in fact.supporting_reasoning_signal_ids:
+            out.append(fact)
+            continue
+        if not (signal.entity_type and signal.entity_id):
+            continue
+        for entity in (fact.evidence or {}).get("entities") or ():
+            if (
+                isinstance(entity, dict)
+                and entity.get("entity_type") == signal.entity_type
+                and entity.get("entity_id") == signal.entity_id
+            ):
+                out.append(fact)
+                break
+    return tuple(out)
+
+
+def _intelligence_bias(facts: tuple[IntelligenceFact, ...]) -> float:
+    """How much the corroborating facts may move this decision: [0, ceiling].
+
+    The STRONGEST relevant fact decides, not the sum. Summing would let a
+    handful of weak insights stack past the ceiling and outweigh the primary
+    evidence, which is precisely what this bound exists to prevent.
+    """
+    if not facts:
+        return 0.0
+    strongest = max(min(max(f.confidence, 0.0), 1.0) for f in facts)
+    return _INTELLIGENCE_BIAS_CEILING * strongest
+
 
 class WhatMattersTodayEngine:
     def __init__(self, max_items: int = 7, min_confidence: float = 0.45) -> None:
@@ -46,7 +116,19 @@ class WhatMattersTodayEngine:
         reasoning_version: int,
         state_watermark: str | None,
         as_of: datetime | None,
+        intelligence: IntelligenceView | None = None,
     ) -> list[Decision]:
+        """Rank signals into decisions, corroborated by what the org knows.
+
+        `intelligence` is the already-materialized `IntelligenceView` built once
+        per brief by orchestration. This engine performs NO I/O: it reads the
+        view it is handed and nothing else, so it stays a pure function of
+        (signals, policy, intelligence) and cannot add a query per decision.
+
+        Keyword-only with a `None` default, so every existing caller — and an
+        organization that knows nothing about itself yet — gets byte-identical
+        output to before.
+        """
         scored = []
         for s in signals:
             if s.confidence < self.min_confidence:
@@ -63,8 +145,13 @@ class WhatMattersTodayEngine:
             category = category_for(s.signal_type)
             if category is None:
                 continue
-            score = s.weight + _CATEGORY_BIAS.get(category, 0.0)
-            scored.append((score, s, category))
+            facts = _relevant_facts(s, intelligence)
+            score = (
+                s.weight
+                + _CATEGORY_BIAS.get(category, 0.0)
+                + _intelligence_bias(facts)
+            )
+            scored.append((score, s, category, facts))
 
         # Deterministic order: score desc, then signal_id as a stable tiebreak.
         scored.sort(key=lambda t: (-t[0], str(t[1].signal_id)))
@@ -92,9 +179,15 @@ class WhatMattersTodayEngine:
             deduped.append(entry)
 
         decisions: list[Decision] = []
-        for rank, (_score, s, category) in enumerate(deduped[: self.max_items], start=1):
+        for rank, (_score, s, category, facts) in enumerate(
+            deduped[: self.max_items], start=1
+        ):
             decisions.append(
                 Decision(
+                    # UNCHANGED, and deliberately: identity is (org, reasoning
+                    # version, watermark, signal). Intelligence corroborates a
+                    # decision, it does not make it a different decision, so
+                    # loading a view can never fork an id.
                     decision_id=compute_decision_id(
                         org_id, reasoning_version, state_watermark, s.signal_id
                     ),
@@ -109,6 +202,12 @@ class WhatMattersTodayEngine:
                     reasoning_version=reasoning_version,
                     state_watermark=state_watermark,
                     created_at=as_of,
+                    # Exactly the facts that were relevant to THIS signal —
+                    # the same set `_intelligence_bias` scored, so the stored
+                    # provenance and the applied nudge can never disagree.
+                    supporting_insight_ids=tuple(
+                        sorted(f.insight_id for f in facts)
+                    ),
                 )
             )
         return decisions

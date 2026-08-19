@@ -98,7 +98,36 @@ class ExecutionRequest(Timestamped, Base):
 
     # --- Lineage (structured, queryable: why was this done?) ---
     decision_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
-    reasoning_signal_ids: Mapped[list] = mapped_column(JSONB, default=list)
+    # TWO ID NAMESPACES, deliberately separate.
+    #
+    # `reasoning_signal_ids` -> reasoning_signals.signal_id ONLY. These are the
+    # deterministic ids Learning aggregates on and Intelligence cites, so a value
+    # from any other namespace makes those references permanently unresolvable.
+    #
+    # `source_signal_event_ids` -> signal_events.id — the raw captured event a
+    # chat turn was acting on (the email on screen). Real provenance, different
+    # question: "which observation prompted this?" rather than "which reasoning
+    # concluded it?". Chat used to write these INTO reasoning_signal_ids, which
+    # silently mixed the two.
+    # SERVER DEFAULTS MIRROR THE MIGRATIONS, for the same reason the partial
+    # index above does: `create_all` builds the schema the Postgres integration
+    # suite runs against, and without these it built a DIFFERENT schema from
+    # production. Migration 0007 gives every JSONB column here a server default
+    # and 0037 does the same for `source_signal_event_ids`; the model declared
+    # only a PYTHON-side `default=`, which the ORM applies but raw SQL does not.
+    #
+    # The visible failure: an INSERT that omits `source_signal_event_ids` — which
+    # production accepts, because the migrated column defaults to '[]' — raised
+    # NotNullViolationError against the test schema. So the one suite that
+    # exercises FOR UPDATE SKIP LOCKED and ON CONFLICT was doing it on a table
+    # shaped differently from the real one, which is exactly where that suite's
+    # value comes from.
+    reasoning_signal_ids: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    source_signal_event_ids: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
     reasoning_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     state_watermark: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
@@ -127,7 +156,9 @@ class ExecutionRequest(Timestamped, Base):
     # unique index in migration 0035. NULL for action types that have no
     # message-level identity, which is why the index is partial.
     obligation_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+    payload: Mapped[dict] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
 
     # --- Approval (human-in-the-loop) ---
     approved_by: Mapped[uuid.UUID | None] = mapped_column(
@@ -137,8 +168,10 @@ class ExecutionRequest(Timestamped, Base):
 
     # --- Execution result ---
     executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    provider_reference: Mapped[dict] = mapped_column(JSONB, default=dict)
-    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    provider_reference: Mapped[dict] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 

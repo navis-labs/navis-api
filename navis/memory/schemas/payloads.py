@@ -30,7 +30,20 @@ CURRENT_SCHEMA_VERSION: dict[EntityType, int] = {
 # keys (backward compatible — old records simply lack them; State reads via .get()), so they
 # do NOT bump the schema version. Breaking shape changes still bump + register an upcaster.
 PAYLOAD_FIELDS_V1: dict[EntityType, tuple[str, ...]] = {
-    EntityType.PERSON: ("email", "name", "role", "source", "slack_user_id"),
+    # `is_automated` / `category` are ADDITIVE (no version bump) and SENDER-SCOPED:
+    # they are written ONLY on the fact whose `role` is "from", because everything
+    # the classifier reads (List-Id, Precedence, Auto-Submitted, the Gmail tab
+    # label, a no-reply local-part) describes how that address MAILS and says
+    # nothing about who it was addressed to. Absent means "never observed as a
+    # sender" — which is not the same as "human", and readers must not treat it as
+    # a claim either way. Same key names and same value domain as THREAD below, so
+    # one classifier serves both. See extractors/email.py:sender_classification.
+    EntityType.PERSON: ("email", "name", "role", "source", "slack_user_id",
+                        "is_automated", "category"),
+    # COMPANY deliberately carries NEITHER: it is keyed by DOMAIN, and one domain
+    # legitimately hosts both human and automated senders, so a latest-wins flag
+    # there would track whichever mailed last rather than any fact about the
+    # company. See the note on CompanyExtractor.
     EntityType.COMPANY: ("domain", "name"),
     EntityType.CUSTOMER: ("external_ref", "name"),  # populated from a CRM signal source
     EntityType.PROJECT: ("folder_id", "name", "owners", "shared", "mime_type", "drive_id"),
@@ -58,7 +71,14 @@ PAYLOAD_FIELDS_V1: dict[EntityType, tuple[str, ...]] = {
                         # suppressed by a LATER message.
                         "fulfilment_at", "fulfilment_from",
                         "resolution_at", "resolution_from"),
-    EntityType.RELATIONSHIP: ("person_email", "direction", "via", "slack_user_id", "channel_id"),
+    # `is_automated` / `category` are ADDITIVE and SENDER-SCOPED — identical
+    # contract to PERSON above. Written only when this address was the `from` of
+    # the message (i.e. on the "inbound" fact), because that is the only party the
+    # classification describes. This is what lets a relationship be told apart
+    # from a newsletter blast without a second classifier; Slack-derived
+    # relationships have no equivalent notion and simply omit both keys.
+    EntityType.RELATIONSHIP: ("person_email", "direction", "via", "slack_user_id", "channel_id",
+                              "is_automated", "category"),
     # due_at / due_text / promised_at are ADDITIVE. `due_at` is present ONLY
     # when the sentence stated a deadline — a null means "no date given", never
     # "we could not parse one", so nothing downstream may invent it.

@@ -14,7 +14,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from navis.execution.contract import OutcomeReference, ProviderResult
+from navis.execution.actions import require_spec
+from navis.execution.contract import FailureKind, OutcomeReference, ProviderResult
 from navis.execution.idempotency import (
     execution_id,
     idempotency_key,
@@ -69,6 +70,10 @@ class ExecutionService:
         reasoning_signal_ids: list[str],
         reasoning_version: int | None,
         state_watermark: str | None,
+        # Raw signal_events.id values the caller was acting on. Optional and
+        # keyword-only so every existing call site is unchanged; see the model
+        # for why this is not folded into reasoning_signal_ids.
+        source_signal_event_ids: list[str] | None = None,
         origin: ExecutionOrigin = ExecutionOrigin.CHAT,
     ) -> tuple[ExecutionRequest, bool]:
         """`origin` decides which surface REVIEWS this, not how it executes.
@@ -77,7 +82,21 @@ class ExecutionService:
         payload is the same action whoever noticed it, and letting origin split
         the key would let one meeting be booked twice — once from chat, once
         from the proactive queue.
+
+        Raises `UnknownAction` for an action_type with no ActionSpec.
         """
+        # FAIL CLOSED AT INTAKE. Every producer — the execution router, chat, the
+        # proactive proposer — funnels through here, so this is the one place
+        # that can refuse an action Navis does not know how to perform.
+        #
+        # Before this, an unknown action_type wrote a REQUESTED row, appeared on
+        # the Action Center, accepted a human approval, and only died in the
+        # worker as "no provider for <type>" plus a dead letter. It never reached
+        # a provider — but failing AFTER a human has approved it is the wrong
+        # boundary: it spends the founder's attention on something that could
+        # never have worked, and it makes the DLQ the discovery mechanism for a
+        # typo. The spec registry knows the answer before the row exists.
+        require_spec(action_type)
         # A reply names the message it answers, and THAT is its identity. Using
         # the payload hash instead let one unanswered email become a new action
         # every time the state watermark moved — see execution/obligation.py.
@@ -95,6 +114,7 @@ class ExecutionService:
             organization_id=org_id,
             decision_id=decision_id,
             reasoning_signal_ids=reasoning_signal_ids,
+            source_signal_event_ids=source_signal_event_ids or [],
             reasoning_version=reasoning_version,
             state_watermark=state_watermark,
             action_type=action_type,
@@ -189,10 +209,26 @@ class ExecutionService:
         await self._emit(req, ExecutionStatus.EXECUTED)
         await self.repo.flush()
 
-    async def fail_execution(self, req: ExecutionRequest, error: str) -> None:
+    async def fail_execution(
+        self, req: ExecutionRequest, error: str, *, kind: FailureKind | None = None
+    ) -> None:
+        """`kind` is WHY, as a stable value; `error` stays the human sentence.
+
+        Optional and keyword-only so every existing call site is unchanged. An
+        omitted kind records no `failure_kind` rather than guessing one — a wrong
+        classification would be worse than an absent one for anything reading
+        these as evidence.
+        """
         self._transition(req, ExecutionStatus.FAILED)
         req.last_error = error[:2000]
-        await self._emit(req, ExecutionStatus.FAILED, extra={"error": error[:500]})
+        await self._emit(
+            req,
+            ExecutionStatus.FAILED,
+            extra={
+                "error": error[:500],
+                "failure_kind": kind.value if kind is not None else None,
+            },
+        )
         await self.repo.flush()
 
     # ---- internals ----
@@ -216,6 +252,10 @@ class ExecutionService:
             "action_type": req.action_type,
             "status": status.value,
             "reasoning_signal_ids": req.reasoning_signal_ids,
+            # Carried alongside, never merged: Observation/Learning key their
+            # aggregates on reasoning ids, so the two must stay distinguishable
+            # all the way down the outbox.
+            "source_signal_event_ids": req.source_signal_event_ids or [],
             "reasoning_version": req.reasoning_version,
             "state_watermark": req.state_watermark,
         }

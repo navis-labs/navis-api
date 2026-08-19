@@ -91,7 +91,38 @@ class _BaseView:
     provenance: dict[str, list]  # memory_ids, signal_ids
 
 
-class PersonState(_BaseView):
+# Both accessors below are deliberately TRI-STATE (None = never observed as the
+# sender of a message), unlike ThreadState's boolean coercion. A thread always
+# has a newest message to classify; an address may only ever have appeared on
+# `to`/`cc`, or predate the field entirely. Collapsing that "unknown" into False
+# would assert "this is a human" on no evidence — the exact class of overclaim
+# these fields exist to remove. Callers that want the permissive reading can
+# still write `if x.is_automated:` (None is falsy, so an unknown surfaces rather
+# than being silently suppressed); callers that need the distinction test
+# `is None`.
+class _SenderClassifiedView(_BaseView):
+    """Mixin for entities that carry the sender classification (see
+    memory/extractors/email.py:sender_classification). Written only from the
+    `from` address, so it describes how THIS address mails — never who mailed
+    it, and never whether it is a real party."""
+
+    @property
+    def is_automated(self):
+        """True | False | None — None means "never observed as a sender"."""
+        value = self.fields.get("is_automated")
+        return None if value is None else bool(value)
+
+    @property
+    def category(self):
+        """personal | promotional | social | forum | update | automated | spam,
+        or None when never observed as a sender. `category != "personal"` is
+        equivalent to `is_automated` by construction of `classify_email`; it is
+        kept because it says WHICH kind of automation, which is what
+        `engines/waiting.py` already gates on."""
+        return self.fields.get("category")
+
+
+class PersonState(_SenderClassifiedView):
     @property
     def email(self): return self.fields.get("email")
     @property
@@ -184,7 +215,7 @@ class ThreadState(_BaseView):
     def resolution_from(self): return self.fields.get("resolution_from")
 
 
-class RelationshipState(_BaseView):
+class RelationshipState(_SenderClassifiedView):
     @property
     def person_email(self): return self.fields.get("person_email")
     @property

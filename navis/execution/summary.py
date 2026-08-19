@@ -22,8 +22,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from navis.execution.models import ActionType, ExecutionRequest
-from navis.execution.providers.reply import requires_draft
+from navis.execution.actions import awaiting_draft
+from navis.execution.models import ExecutionRequest
 
 
 def execution_summary(r: ExecutionRequest | None) -> dict[str, Any] | None:
@@ -47,9 +47,11 @@ def execution_summary(r: ExecutionRequest | None) -> dict[str, Any] | None:
         "last_error": (r.last_error or None) and r.last_error[:500],
         # True while the action is a placeholder Navis proposed but has not
         # written yet — the card shows "needs a draft" rather than Approve.
-        "requires_draft": (
-            requires_draft(r.payload)
-            if r.action_type == ActionType.REPLY_TO_EMAIL.value
-            else False
-        ),
+        #
+        # Asks the ActionSpec rather than testing `action_type ==
+        # REPLY_TO_EMAIL`. This projection and `router._serialize` are two
+        # surfaces reporting the same fact; both now read it from the same
+        # authority, so a new draftable action cannot be draftable on one screen
+        # and not the other.
+        "requires_draft": awaiting_draft(r.action_type, r.payload),
     }

@@ -206,19 +206,29 @@ async def test_readonly_grant_stays_usable_for_reading_but_never_sends():
 # ── the approve-gate asks the same question as the sender ──────────────
 
 
-async def test_router_send_gate_agrees_with_the_resolver():
-    """`_gmail_send_ready` used to run its OWN newest-wins query, so the gate and
-    the sender could disagree. Sharing the resolver makes them one question."""
-    from navis.execution.router import _gmail_send_ready
+async def test_approve_preflight_agrees_with_the_resolver():
+    """The approve gate used to run its OWN newest-wins query, so the gate and
+    the sender could disagree. Sharing the resolver makes them one question.
 
-    assert await _gmail_send_ready(
+    The check now reaches the approve handler through `ActionSpec.preflight`
+    rather than being inlined in the router (which is what made a generic handler
+    know about Google), and signals refusal by raising rather than returning
+    False. Same resolver, same three cases.
+    """
+    from navis.execution.actions import ActionPreconditionFailed, require_spec
+
+    preflight = require_spec("reply_to_email").preflight
+    assert preflight is not None, "the reply action must carry a send preflight"
+
+    # A send-capable grant wins even when a newer read-only grant exists.
+    await preflight(
         _StubDB([
             _grant("readonly@navis.ai", READONLY, age_hours=0),
             _grant("sender@navis.ai", SEND, age_hours=2),
         ]),
         ORG,
     )
-    assert not await _gmail_send_ready(
-        _StubDB([_grant("readonly@navis.ai", READONLY)]), ORG
-    )
-    assert not await _gmail_send_ready(_StubDB([]), ORG)
+    with pytest.raises(ActionPreconditionFailed):
+        await preflight(_StubDB([_grant("readonly@navis.ai", READONLY)]), ORG)
+    with pytest.raises(ActionPreconditionFailed):
+        await preflight(_StubDB([]), ORG)

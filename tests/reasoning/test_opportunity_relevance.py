@@ -25,7 +25,7 @@ import pytest
 from navis.memory.envelope import EntityType
 from navis.reasoning.v2 import run_reasoning_v2
 from navis.reasoning.v2.contract import SignalType
-from navis.reasoning.v2.engines.meta import _HUMAN_BEARING_EVIDENCE
+from navis.reasoning.v2.base import HUMAN_BEARING_EVIDENCE as _HUMAN_BEARING_EVIDENCE
 from navis.state.v2.builders import MemoryRecordView, build_projection
 
 NS = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
@@ -270,3 +270,178 @@ def test_reasoning_stays_deterministic_with_evidence():
     a = _opportunities(records, ev)
     b = _opportunities(records, ev)
     assert [x.to_dict() for x in a] == [x.to_dict() for x in b]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 4.1.1 — RELATIONSHIP_COOLING relevance
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The same vocabulary, now shared from base.py and applied by
+# RelationshipReasoningEngine. Live, that engine had NO gate and reported
+# "relationship cooling" for microsoft-noreply@microsoft.com,
+# openscout+on-the-side@substack.com, mail@mail.adobe.com and
+# founders@mail.slashy.com — which Intelligence then aggregated into
+# organizational RISK insights.
+
+_COOLING_DAYS = 12.0  # inside [RELATIONSHIP_COOLING_DAYS, MAX_SURFACE_AGE_DAYS]
+
+
+def _cooling(records, evidence=None, *, org_id: uuid.UUID = ORG_A):
+    """Run the REAL reasoning pass and keep the cooling signals."""
+    state = build_projection(org_id, list(records), as_of=NOW)
+    return [
+        s for s in run_reasoning_v2(state, evidence=evidence or {})
+        if s.signal_type is SignalType.RELATIONSHIP_COOLING
+    ]
+
+
+def test_one_shared_relevance_definition_not_two():
+    """Both engines must read the SAME set — a second copy would drift."""
+    from navis.reasoning.v2.base import HUMAN_BEARING_EVIDENCE
+    from navis.reasoning.v2.engines import meta
+
+    assert meta._HUMAN_BEARING_EVIDENCE is HUMAN_BEARING_EVIDENCE
+
+
+# ── 1/2. Real human and business relationships still cool ──────────────
+
+
+@pytest.mark.parametrize("cls", sorted(_HUMAN_BEARING_EVIDENCE))
+def test_a_human_bearing_relationship_still_cools(cls):
+    signals = _cooling(
+        [_rel("alice@acme.com", days_ago=_COOLING_DAYS)],
+        {_entity_id("alice@acme.com"): frozenset({cls})},
+    )
+    assert len(signals) == 1, f"{cls} must keep the cooling conclusion"
+    assert signals[0].evidence["person_email"] == "alice@acme.com"
+    assert signals[0].evidence["relevance_evidence"] == [cls]
+
+
+# ── 3/4. The exact production offenders ────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "email,observed",
+    [
+        # Live evidence, read from signal_importance on 2026-08-17.
+        ("microsoft-noreply@microsoft.com", {"invoice"}),
+        ("openscout+on-the-side@substack.com", {"newsletter"}),
+        ("mail@mail.adobe.com", {"marketing"}),
+        ("founders@mail.slashy.com", {"automated_other"}),
+        ("noreply@github.com", {"automated_other"}),
+        ("no-reply@spotify.com", {"automated_other"}),
+        ("info@join.netflix.com", {"marketing"}),
+    ],
+)
+def test_the_production_offenders_no_longer_cool(email, observed):
+    assert _cooling(
+        [_rel(email, days_ago=_COOLING_DAYS)],
+        {_entity_id(email): frozenset(observed)},
+    ) == []
+
+
+# ── 5. Mixed history: human evidence qualifies ─────────────────────────
+
+
+def test_a_relationship_with_any_human_evidence_survives_automation():
+    """astravision.global@gmail.com live: newsletter + marketing + invoice +
+    automated_other AND commitment + meeting. The human evidence decides."""
+    observed = frozenset({
+        "automated_other", "commitment", "invoice",
+        "marketing", "meeting", "newsletter",
+    })
+    signals = _cooling(
+        [_rel("astravision.global@gmail.com", days_ago=_COOLING_DAYS)],
+        {_entity_id("astravision.global@gmail.com"): observed},
+    )
+    assert len(signals) == 1
+    assert signals[0].evidence["relevance_evidence"] == sorted(observed)
+
+
+# ── UNKNOWN: the deliberate asymmetry between the two engines ──────────
+
+
+def test_unknown_yields_no_cooling_conclusion():
+    """"Absence of evidence = no relationship conclusion." A cooling claim that
+    cannot establish a counterparty is exactly the fabrication this forbids."""
+    assert _cooling([_rel("unknown@x.com", days_ago=_COOLING_DAYS)], {}) == []
+    assert _cooling(
+        [_rel("unknown@x.com", days_ago=_COOLING_DAYS)],
+        {_entity_id("unknown@x.com"): frozenset()},
+    ) == []
+
+
+def test_unknown_still_yields_an_opportunity():
+    """The asymmetry, pinned. OPPORTUNITY keeps UNKNOWN (a wrong warm window
+    costs a glance); COOLING drops it (a wrong risk corrupts the org's picture
+    of itself). Both are correct, for different reasons."""
+    assert len(_opportunities([_rel("unknown@x.com")], {})) == 1
+
+
+# ── 6/7. Determinism and organization isolation ────────────────────────
+
+
+def test_cooling_is_deterministic_with_evidence():
+    records = [_rel("alice@acme.com", days_ago=_COOLING_DAYS)]
+    ev = {_entity_id("alice@acme.com"): frozenset({"meeting", "marketing"})}
+    a, b = _cooling(records, ev), _cooling(records, ev)
+    assert [x.to_dict() for x in a] == [x.to_dict() for x in b]
+
+
+def test_cooling_evidence_is_org_scoped():
+    """A's evidence cannot qualify B's identically-addressed relationship."""
+    ev_a = {_entity_id("shared@acme.com", ORG_A): frozenset({"meeting"})}
+    in_a = _cooling([_rel("shared@acme.com", days_ago=_COOLING_DAYS)], ev_a)
+    assert len(in_a) == 1 and in_a[0].org_id == ORG_A
+    # In B the same address is UNKNOWN, so no conclusion is drawn.
+    assert _cooling(
+        [_rel("shared@acme.com", org_id=ORG_B, days_ago=_COOLING_DAYS)],
+        ev_a, org_id=ORG_B,
+    ) == []
+
+
+# ── 9/10. Neighbouring engines are untouched by the gate ───────────────
+
+
+def test_the_gate_does_not_reach_commitments_or_other_risk_engines():
+    """The gate is relationship-scoped. A commitment from an address with only
+    automated evidence is still an unmet promise."""
+    import datetime as _dt
+
+    from tests.state.fakes import corpus
+
+    records = corpus(ORG_A)
+    as_of = max(r.event_timestamp for r in records) + _dt.timedelta(days=10)
+    state = build_projection(ORG_A, records, as_of=as_of)
+    # Every relationship observed as purely automated => no cooling at all...
+    ev = {r.entity_id: frozenset({"automated_other"}) for r in state.relationships()}
+    types = {s.signal_type for s in run_reasoning_v2(state, evidence=ev)}
+    assert SignalType.RELATIONSHIP_COOLING not in types
+    # ...while the obligation and decay engines keep their own conclusions.
+    assert SignalType.COMMITMENT_SLIPPING in types
+    assert SignalType.CONTEXT_SUMMARY in types
+
+
+def test_priority_load_counts_cooling_under_the_same_gate():
+    """PRIORITY_LOAD recounts from State, so without the gate it would report
+    cooling relationships that produced no signal — and organizational_status
+    surfaces both numbers side by side."""
+    import datetime as _dt
+
+    from tests.state.fakes import corpus
+
+    records = corpus(ORG_A)
+    as_of = max(r.event_timestamp for r in records) + _dt.timedelta(days=10)
+    state = build_projection(ORG_A, records, as_of=as_of)
+
+    automated = {r.entity_id: frozenset({"marketing"}) for r in state.relationships()}
+    load = [s for s in run_reasoning_v2(state, evidence=automated)
+            if s.signal_type is SignalType.PRIORITY_LOAD]
+    assert load and load[0].evidence["cooling"] == 0
+
+    human = {r.entity_id: frozenset({"meeting"}) for r in state.relationships()}
+    load_h = [s for s in run_reasoning_v2(state, evidence=human)
+              if s.signal_type is SignalType.PRIORITY_LOAD]
+    cooling_signals = [s for s in run_reasoning_v2(state, evidence=human)
+                       if s.signal_type is SignalType.RELATIONSHIP_COOLING]
+    assert load_h[0].evidence["cooling"] == len(cooling_signals) > 0

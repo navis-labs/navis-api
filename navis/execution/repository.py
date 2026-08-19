@@ -145,10 +145,41 @@ class ExecutionRepository:
 
     # ---- hardening: executable claim (APPROVED or retryable FAILED) ----
 
+    async def authorize(
+        self, org_id: uuid.UUID, capabilities: Sequence[Any]
+    ) -> tuple[bool, list[str], str | None]:
+        """Is this org CURRENTLY entitled to all of these capabilities?
+
+        The worker's re-check runs through here rather than importing the
+        entitlement service directly, for two reasons:
+
+          * it uses the CLAIM'S OWN SESSION, so the re-check is one extra query
+            on a connection already checked out — no second pool checkout, no
+            nested session while a row lock is held;
+          * it is part of the repository surface the in-memory fakes mirror, so
+            the unit suite drives the same call the worker makes in production.
+
+        The DECISION is not made here. `EntitlementService._decide` stays the one
+        authority (lifecycle -> kill switch -> explicit row -> plan); this only
+        routes the question to it with the right session.
+        """
+        from navis.organization.entitlements import EntitlementService
+        from navis.organization.repository import OrganizationRepository
+
+        return await EntitlementService(OrganizationRepository(self.db)).can_use_all(
+            org_id, list(capabilities)
+        )
+
     async def claim_executable(
-        self, *, max_attempts: int, limit: int = 100
+        self, *, max_attempts: int, limit: int = 100, exclude: Sequence[uuid.UUID] | None = None
     ) -> Sequence[ExecutionRequest]:
-        """Claim work: APPROVED, or FAILED with attempts remaining (retry)."""
+        """Claim work: APPROVED, or FAILED with attempts remaining (retry).
+
+        `exclude` skips rows the caller has already set aside THIS pass — the
+        worker rate-limits per provider and leaves a throttled row APPROVED, so
+        without this the next single-row claim would return the same row again
+        and spin the pass against it instead of moving on to other work.
+        """
         stmt = (
             select(ExecutionRequest)
             .where(
@@ -164,6 +195,8 @@ class ExecutionRepository:
             .limit(limit)
             .with_for_update(skip_locked=True)
         )
+        if exclude:
+            stmt = stmt.where(ExecutionRequest.id.notin_(list(exclude)))
         return (await self.db.scalars(stmt)).all()
 
     # ---- hardening: stale EXECUTING recovery ----
@@ -189,6 +222,35 @@ class ExecutionRepository:
     async def add_dead_letter(
         self, req: ExecutionRequest, *, provider: str | None, error: str
     ) -> None:
+        """Record a terminal failure — ONCE per unresolved failure.
+
+        A dead letter is a work item for an operator, not a log line. The worker
+        re-claims a FAILED row on every pass while attempts remain, and the
+        unrecoverable paths (`no provider`, ProviderValidationError) recorded
+        here unconditionally, so ONE execution produced one dead letter PER
+        ATTEMPT — five rows describing a single stuck action, each looking like
+        separate work. Measured on the concurrency suite: 10 workers racing one
+        unroutable request wrote a dead letter each time a pass re-drove it.
+
+        Guarded by a read rather than a constraint because `execution_id` is not
+        unique on this table BY DESIGN: an operator replay resolves the row
+        (`resolved_at`), and a later genuine failure of the same execution is a
+        NEW work item that must be recordable. So the rule is "at most one
+        UNRESOLVED dead letter per execution", which is exactly this predicate
+        and needs no migration.
+
+        The read is race-free in production: only the worker writes here, and
+        after the claim/execute split a request is leased to a single worker by
+        its EXECUTING status before any provider call happens.
+        """
+        existing = await self.db.scalar(
+            select(ExecutionDeadLetter.id).where(
+                ExecutionDeadLetter.execution_id == req.id,
+                ExecutionDeadLetter.resolved_at.is_(None),
+            )
+        )
+        if existing is not None:
+            return
         self.db.add(
             ExecutionDeadLetter(
                 organization_id=req.organization_id,

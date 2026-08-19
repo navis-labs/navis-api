@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.memory.models import MemoryRecord
@@ -60,6 +60,90 @@ class Hit:
     event_timestamp: datetime | None = None
 
 
+# Width of the typed `embedding_vec` column (migration 0038). Vectors of any
+# other width — e.g. the 256-dim deterministic index kept for rollback — have no
+# typed column and take the Python path below.
+ANN_DIM = 1536
+
+
+async def _search_pgvector(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    query_vector: list[float],
+    *,
+    model: str,
+    version: int,
+    k: int,
+    since: datetime | None,
+    until: datetime | None,
+) -> list[Hit] | None:
+    """Exact top-k computed in Postgres. Returns None if unavailable.
+
+    EXACT, NOT APPROXIMATE. There is no ANN index behind this: `ORDER BY
+    embedding_vec <=> :q LIMIT k` is a full scan done server-side, so it returns
+    what scoring every vector in Python returns — it simply stops shipping 785
+    rows x 1536 floats of JSONB across the network to do it. That transfer, not
+    the arithmetic, was the 7.2s cost in a 17.7s chat turn.
+
+    An HNSW/IVFFlat index would make this approximate and could silently drop the
+    best match, which tests/ml/test_vector_search_determinism.py exists to
+    prevent. That is an accuracy decision to take deliberately, not a free win.
+
+    `<=>` is cosine DISTANCE, so similarity is `1 - distance` — the same value
+    `navis.ml.math.cosine` produces. Ties break on `memory_id` exactly as
+    `_rank_key` does, so ordering is identical to the Python path.
+
+    Returns None (rather than raising) when the typed column is absent or holds
+    no rows for this index, so a database that has not run migration 0038, or the
+    rollback pin, transparently keeps the previous behaviour.
+    """
+    literal = "[" + ",".join(repr(float(x)) for x in query_vector) + "]"
+    params: dict[str, object] = {
+        "q": literal, "org": org_id, "model": model, "version": version, "k": k,
+    }
+    # Added conditionally, never as `:since IS NULL OR ...`: asyncpg cannot infer
+    # a type for an untyped NULL parameter and the whole statement fails — which
+    # this function would then swallow, silently costing the speedup while the
+    # results still looked right.
+    window = ""
+    if since is not None:
+        window += " AND r.event_timestamp >= :since"
+        params["since"] = since
+    if until is not None:
+        window += " AND r.event_timestamp < :until"
+        params["until"] = until
+    sql = text(
+        f"""
+        SELECT e.memory_id, e.entity_type, e.source_text, r.event_timestamp,
+               1 - (e.embedding_vec <=> CAST(:q AS vector)) AS score
+          FROM memory_embeddings e
+          JOIN memory_records r ON r.memory_id = e.memory_id
+         WHERE e.organization_id = :org
+           AND e.model = :model
+           AND e.version = :version
+           AND e.embedding_vec IS NOT NULL
+           {window}
+         ORDER BY e.embedding_vec <=> CAST(:q AS vector), e.memory_id
+         LIMIT :k
+        """
+    )
+    try:
+        rows = (await db.execute(sql, params)).all()
+    except Exception:  # noqa: BLE001 — degrade to the Python path, never fail a search
+        logger.exception("pgvector search unavailable; falling back to in-process scan")
+        metrics.incr("ml.retrieval.pgvector_unavailable")
+        return None
+    if not rows:
+        # No typed rows for this index — the caller's model may predate the
+        # backfill. Let the JSONB path answer rather than returning "no results".
+        return None
+    metrics.incr("ml.retrieval.pgvector_hit")
+    return [
+        Hit(r.memory_id, float(r.score), r.entity_type, r.source_text, r.event_timestamp)
+        for r in rows
+    ]
+
+
 def _rank_key(hit: Hit) -> tuple[float, str]:
     """The one ordering rule: best score first, then lowest memory_id.
 
@@ -88,6 +172,16 @@ async def search(
     the running top-k is trimmed with the SAME key used for the final order, so
     a fact can only be dropped once k strictly better facts have been seen.
     """
+    # Fast path: let Postgres do the comparison and return only the k best rows.
+    # Same answer, without shipping the corpus — see `_search_pgvector`.
+    if len(query_vector) == ANN_DIM:
+        hits = await _search_pgvector(
+            db, org_id, query_vector, model=model, version=version, k=k,
+            since=since, until=until,
+        )
+        if hits is not None:
+            return hits
+
     base = (
         select(MemoryEmbedding, MemoryRecord.event_timestamp)
         .join(MemoryRecord, MemoryRecord.memory_id == MemoryEmbedding.memory_id)

@@ -28,6 +28,22 @@ class FakeExecutionRepo:
         self.events: list[SimpleNamespace] = []
         self.dead_letters: list[SimpleNamespace] = []
         self.inbox: set[tuple] = set()
+        # The worker's pre-provider authorization re-check goes through the
+        # repository (see ExecutionRepository.authorize). Assign a real
+        # `EntitlementService` over a FakeOrgRepo to exercise the genuine
+        # decision function — `test_execution_authorization.py` does exactly
+        # that, so the gate is validated against production logic and not a
+        # stub. None means "this org is fully entitled", which is the right
+        # default for the many tests about worker MECHANICS (retry, rate
+        # limiting, telemetry, DLQ, read-after-write) that are not about
+        # authorization and would otherwise all need an org seeded.
+        self.entitlements = None
+
+    async def authorize(self, org_id, capabilities):
+        """Mirrors ExecutionRepository.authorize."""
+        if self.entitlements is None:
+            return True, [], "active"
+        return await self.entitlements.can_use_all(org_id, list(capabilities))
 
     async def upsert_request(self, values: dict[str, Any]):
         idem = (values["organization_id"], values["idempotency_key"])
@@ -72,9 +88,15 @@ class FakeExecutionRepo:
     async def flush(self):
         pass
 
-    async def claim_executable(self, *, max_attempts, limit=100):
+    async def claim_executable(self, *, max_attempts, limit=100, exclude=None):
+        # Mirrors ExecutionRepository.claim_executable, including `exclude` —
+        # the worker sets a rate-limited row aside for the pass and must not
+        # re-claim it on the next single-row claim.
+        skip = set(exclude or ())
         out = []
         for r in self.rows.values():
+            if r.id in skip:
+                continue
             if r.status == ExecutionStatus.APPROVED.value:
                 out.append(r)
             elif r.status == ExecutionStatus.FAILED.value and (r.attempts or 0) < max_attempts:
@@ -89,6 +111,13 @@ class FakeExecutionRepo:
         ][:limit]
 
     async def add_dead_letter(self, req, *, provider, error):
+        # Mirrors ExecutionRepository.add_dead_letter: at most one UNRESOLVED
+        # dead letter per execution, so the fake cannot report a duplicate-free
+        # DLQ that production would not deliver.
+        if any(
+            d.execution_id == req.id and d.resolved_at is None for d in self.dead_letters
+        ):
+            return
         self.dead_letters.append(
             SimpleNamespace(
                 id=uuid.uuid4(), organization_id=req.organization_id, execution_id=req.id,

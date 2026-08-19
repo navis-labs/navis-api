@@ -13,13 +13,85 @@ from __future__ import annotations
 
 import enum
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 from navis.reasoning.v2.contract import SignalType
 
 _DECISION_NAMESPACE = uuid.UUID("c4f1e2d3-5a6b-5c8d-9e0f-1a2b3c4d5e6f")
+
+
+# ── What the organization knows about itself (the second input) ───────────────
+#
+# Decision has only ever consumed ReasoningSignal[], so it could rank what is
+# true of the organization RIGHT NOW and nothing about what the organization has
+# LEARNED about itself. Intelligence holds that answer, and Decision may not
+# import it — the dependency would invert the pipeline and make the ranker a
+# reader of an append-only projection it has no business querying.
+#
+# So it arrives the way every other cross-layer input in this system arrives: as
+# a flat, primitive-only projection assembled by the composition root and handed
+# in. `navis.orchestration.brief` is that root; it already reads State for
+# Reasoning, builds `OrganizationalRealityView` for Intelligence, and resolves
+# Adaptive policy for Decision. This is the fourth join at the same seam.
+#
+# THE DIRECTION IS DELIBERATE and mirrors `intelligence.insights`'s reality
+# contract exactly: the CONSUMER owns the shape it accepts, the producer owns
+# nothing about it. Nothing below carries an ORM row, a session, a repository or
+# an IntelligenceInsight, so `navis/decisions/**` stays free of Intelligence.
+#
+# THIS PHASE IS THE CONTRACT AND THE WIRING. No ranking reads a fact yet, and
+# that is the point: `compute_decision_id`, the ordering, and the brief payload
+# are all provably unchanged by handing Decision this view. See
+# `DecisionService.decide`.
+
+
+@dataclass(frozen=True, slots=True)
+class IntelligenceFact:
+    """One current organizational insight, flattened to primitives.
+
+    Exactly the fields an insight already carries — nothing is recomputed,
+    re-derived or enriched, and a fact that recorded no supporting signals says
+    so with an empty tuple rather than an invented one.
+
+    `supporting_reasoning_signal_ids` is hoisted out of `evidence` because it is
+    the JOIN between the two things Decision now holds: the signals it ranks and
+    the insights folded from them. It is the one field a consumer would otherwise
+    have to reach into a JSONB blob to find.
+    """
+
+    insight_id: str
+    insight_type: str
+    key: str
+    summary: str
+    confidence: float
+    sample_size: int
+    # The engine's own measurements, verbatim (named entities included). A dict
+    # rather than a frozen mapping for the same reason `RealitySignalRow` uses
+    # one: the builder hands over a copy, so the ORM row's JSONB can never be
+    # mutated through this view.
+    evidence: dict[str, Any] = field(default_factory=dict)
+    supporting_reasoning_signal_ids: tuple[str, ...] = ()
+    state_watermark: str | None = None
+    learning_version: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class IntelligenceView:
+    """The organization's CURRENT insights, as Decision is allowed to see them.
+
+    `facts` is a tuple, not a list: a frozen dataclass wrapped around a mutable
+    list is not actually frozen, and this is an input to a deterministic ranker.
+
+    `as_of` is logical time — the newest `created_at` among the folded insights,
+    which is State's clock for a reality fold and Learning's for a Learning fold.
+    Never wall clock, so the same stored insights always build the same view.
+    """
+
+    org_id: uuid.UUID
+    as_of: datetime | None = None
+    facts: tuple[IntelligenceFact, ...] = ()
 
 
 class DecisionCategory(str, enum.Enum):
@@ -160,6 +232,17 @@ class Decision:
     reasoning_version: int
     state_watermark: str | None
     created_at: datetime | None  # logical time = state.as_of (deterministic)
+    # WHICH ORGANIZATIONAL FACTS informed this decision, sorted. Empty when
+    # Intelligence contributed nothing — which is the normal case and stays
+    # honestly empty rather than being filled with everything the org knows.
+    #
+    # Rides in the existing serialized representation rather than in a new
+    # column: `daily_briefs.decisions` is JSONB, so the contract widens with no
+    # migration, and `execution/proposer.py` reads only named keys so it is
+    # unaffected. Deliberately NOT written into `evidence` — that dict is the
+    # ReasoningSignal's own, shared by reference and already persisted, and
+    # injecting decision-scoped provenance into it would mutate a stored signal.
+    supporting_insight_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -175,4 +258,7 @@ class Decision:
             "reasoning_version": self.reasoning_version,
             "state_watermark": self.state_watermark,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            # Always present, never conditional: a reader must be able to tell
+            # "no insight informed this" from "this build predates provenance".
+            "supporting_insight_ids": list(self.supporting_insight_ids),
         }

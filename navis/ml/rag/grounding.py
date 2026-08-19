@@ -19,10 +19,33 @@ from datetime import datetime
 class Grounding:
     """One cited fact. `source` is the lineage pointer (e.g. a memory_id)."""
 
-    kind: str            # memory | state | learning | intelligence
+    kind: str            # memory | state | reasoning | learning | intelligence
     source: str          # id / key the fact came from
     text: str
     occurred_at: datetime | None = None
+    # Deeper provenance, when the fact was DERIVED rather than retrieved. A State
+    # entity is a fold over many memory records, so its single `source` (the
+    # entity_id) cannot express what it was built from — this carries the drill-down
+    # without inventing a second provenance system.
+    #
+    # Prefixed, self-describing ids ("memory:<uuid>", "signal:<uuid>"), matching the
+    # convention `api/workspace_fallback.py` already uses for its `source` values.
+    # Optional and last, so every existing construction site — including the
+    # positional ones in tests/ml — is unaffected. Never rendered into the prompt;
+    # `render()` emits `source` only, so this adds no tokens.
+    lineage: tuple[str, ...] = ()
+
+    def render_line(self, index: int) -> str:
+        """This fact EXACTLY as it appears in the prompt.
+
+        The single definition of a rendered fact. `GroundedContext.render` emits
+        it and `ContextBuilder`'s budget loop costs it, so what is counted and
+        what is sent are the same string — previously the budget counted `text`
+        alone while the prompt also carried the index, date and `(kind:source)`
+        citation, undercounting every fact by roughly a third.
+        """
+        when = f" [{self.occurred_at.date().isoformat()}]" if self.occurred_at else ""
+        return f"[{index}]{when} ({self.kind}:{self.source}) {self.text}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,9 +69,7 @@ class GroundedContext:
         if self.as_of is not None:
             lines.append(f"Today's date is: {self.as_of.date().isoformat()} (UTC)")
         lines += ["", "Grounded facts (cite by [n]):"]
-        for i, f in enumerate(self.facts, 1):
-            when = f" [{f.occurred_at.date().isoformat()}]" if f.occurred_at else ""
-            lines.append(f"[{i}]{when} ({f.kind}:{f.source}) {f.text}")
+        lines += [f.render_line(i) for i, f in enumerate(self.facts, 1)]
         return "\n".join(lines)
 
     def sources(self) -> list[str]:

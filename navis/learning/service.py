@@ -74,6 +74,10 @@ class LearningService:
                     "reasoning_signal_ids": o.reasoning_signal_ids,
                     "reasoning_version": o.reasoning_version,
                     "outcome_type": o.outcome_type,
+                    # Both axes, never one: `result` alone does not say whether
+                    # this was a channel fact, a human's verdict or the world
+                    # answering, and those three do not mean the same thing.
+                    "outcome_surface": o.outcome_surface,
                     "result": o.result,
                 },
             )

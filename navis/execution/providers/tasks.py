@@ -39,6 +39,12 @@ _UNSUPPORTED = (
 class TasksProvider(Provider):
     name = "tasks"
     action_type = "create_task"
+    # Deliberately unsupported, and honest about it: validate() below refuses
+    # every payload, so this provider can never report work it did not do. That
+    # is what makes it safe to keep in the production registry (which withholds
+    # providers that would silently simulate) and is why historical create_task
+    # rows still resolve to a provider that can explain itself.
+    unsupported = True
 
     async def validate(self, payload: dict[str, Any]) -> None:
         # Rejected at VALIDATE, not execute: validation runs before any

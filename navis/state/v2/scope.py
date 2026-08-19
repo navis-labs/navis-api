@@ -26,10 +26,13 @@ function that declares its own citation strategy.
 """
 from __future__ import annotations
 
+import itertools
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Union
 
+from navis.memory.envelope import EntityType
 from navis.state.v2.models import OrganizationalState, _BaseView
 
 
@@ -186,15 +189,129 @@ def _ref(entity_type: str, view: _BaseView, rank: int, reason: str) -> EntityRef
     )
 
 
-def _sort_desc_by_last_seen(views: list[_BaseView]) -> list[_BaseView]:
+def _sort_desc_by_last_seen(views: Sequence[_BaseView]) -> list[_BaseView]:
     # last_seen is ISO-8601 (see builders.py); lexical sort == chronological.
     # entity_id tiebreaker so two entities with identical last_seen produce a
     # stable order across runs.
     return sorted(views, key=lambda v: (v.last_seen or "", v.entity_id), reverse=True)
 
 
-def _sort_asc_by_last_seen(views: list[_BaseView]) -> list[_BaseView]:
+def _sort_asc_by_last_seen(views: Sequence[_BaseView]) -> list[_BaseView]:
     return sorted(views, key=lambda v: (v.last_seen or "￿", v.entity_id))
+
+
+def _open_only(views: Sequence[_BaseView]) -> list[_BaseView]:
+    """Entities whose fact-derived `status` has not closed out. Absent == open,
+    matching CommitmentState/DecisionState's own default."""
+    return [v for v in views if (v.fields or {}).get("status", "open") == "open"]
+
+
+# ── Per-type selection policy ───────────────────────────────────────────────
+#
+# THE DEFECT THIS REPLACES. `_scope_morning_brief` used to hardcode five
+# `state.<type>()` calls, so State could hold meetings, documents, decisions,
+# projects, customers and channels and Context would silently drop every one of
+# them — a real organizational entity could never reach Reasoning or ML. Worse,
+# the failure was invisible and recurring: every entity type added to State
+# since the function was written was dropped by default.
+#
+# The projection is now keyed by EntityType and asserted EXHAUSTIVE by
+# `tests/state/test_scope_projection.py`, so a new entity type cannot be added
+# without deciding how it is scoped. Complete by construction, not by vigilance.
+#
+# Every rule ranks on NORMALIZED State fields only — `last_seen`, `status`,
+# link counts. There is deliberately no branch on source/connector anywhere in
+# this module: a Google Calendar meeting and a Teams meeting are both a
+# MeetingState, and a Drive doc and a Notion page are both a DocumentState.
+
+
+@dataclass(frozen=True, slots=True)
+class _TypePolicy:
+    """How one entity type is selected and ranked, and why it made the cut."""
+
+    reason: str
+    select: Callable[[OrganizationalState], list[_BaseView]]
+
+
+_MORNING_BRIEF: dict[EntityType, _TypePolicy] = {
+    # "What's slipping" — open promises, least recently touched first.
+    EntityType.COMMITMENT: _TypePolicy(
+        "open, oldest activity",
+        lambda s: _sort_asc_by_last_seen(_open_only(s.commitments())),
+    ),
+    # "Who's going cold" — stalest counterparty first.
+    EntityType.RELATIONSHIP: _TypePolicy(
+        "stalest interaction",
+        lambda s: _sort_asc_by_last_seen(s.relationships()),
+    ),
+    # "What's active" — freshest conversation first.
+    EntityType.THREAD: _TypePolicy(
+        "most recently active",
+        lambda s: _sort_desc_by_last_seen(s.threads()),
+    ),
+    EntityType.PERSON: _TypePolicy(
+        "most recently seen",
+        lambda s: _sort_desc_by_last_seen(s.people()),
+    ),
+    # "Which orgs matter" — most connected by known people.
+    EntityType.COMPANY: _TypePolicy(
+        "most connected",
+        lambda s: sorted(
+            s.companies(), key=lambda c: (-len(c.links.get("people", [])), c.entity_id)
+        ),
+    ),
+    # Ranked by last_seen like every other type, NOT by start time. Ordering by
+    # `starts_at` would make a meeting outrank live organizational pressure
+    # purely for being on the calendar; `fields` still carries starts_at/ends_at/
+    # attendees/status/conference_id, so downstream reasoning decides what the
+    # timing means. Selection here is not a judgement about importance.
+    EntityType.MEETING: _TypePolicy(
+        "most recently updated",
+        lambda s: _sort_desc_by_last_seen(s.meetings()),
+    ),
+    # Title/owners/status only — never contents. Context carries pointers, not
+    # document bodies; a body belongs to retrieval, not to a state projection.
+    EntityType.DOCUMENT: _TypePolicy(
+        "most recently updated",
+        lambda s: _sort_desc_by_last_seen(s.documents()),
+    ),
+    # Decisions recorded AND decisions owed share this type (discriminated by
+    # payload `kind`), so both compete here on the same footing.
+    EntityType.DECISION: _TypePolicy(
+        "open, oldest activity",
+        lambda s: _sort_asc_by_last_seen(_open_only(s.decisions())),
+    ),
+    EntityType.PROJECT: _TypePolicy(
+        "most recently active",
+        lambda s: _sort_desc_by_last_seen(s.projects()),
+    ),
+    EntityType.CUSTOMER: _TypePolicy(
+        "most recently active",
+        lambda s: _sort_desc_by_last_seen(s.customers()),
+    ),
+    EntityType.CHANNEL: _TypePolicy(
+        "most recently active",
+        lambda s: _sort_desc_by_last_seen(s.channels()),
+    ),
+}
+
+# Tie-break order WITHIN one round-robin tier (see `_scope_morning_brief`).
+# The first five preserve the ordering this intent has always had; the rest
+# follow. This decides nothing but which of two equally-ranked entities is
+# listed first — no type can starve another, because selection is round-robin.
+_TIER_ORDER: tuple[EntityType, ...] = (
+    EntityType.COMMITMENT,
+    EntityType.RELATIONSHIP,
+    EntityType.THREAD,
+    EntityType.PERSON,
+    EntityType.COMPANY,
+    EntityType.MEETING,
+    EntityType.DOCUMENT,
+    EntityType.DECISION,
+    EntityType.PROJECT,
+    EntityType.CUSTOMER,
+    EntityType.CHANNEL,
+)
 
 
 def _scope_morning_brief(
@@ -203,14 +320,17 @@ def _scope_morning_brief(
     *,
     as_of: datetime | None,
 ) -> ScopedView:
-    """Top-N per entity type shaped for the daily brief.
+    """Top-N per entity type shaped for the daily brief, across EVERY entity
+    type State can hold (see `_MORNING_BRIEF`).
 
-    Ranking:
-      * commitments (open, oldest first)  → "what's slipping"
-      * relationships (stalest first)     → "who's going cold"
-      * threads (freshest first)          → "what's active"
-      * people (most recently active)     → "who's in the mix"
-      * companies (most connected)        → "which orgs matter"
+    EMISSION ORDER IS ROUND-ROBIN BY RANK, not grouped by type: the best
+    commitment, then the best relationship, ... then the SECOND commitment, and
+    so on. Consumers downstream truncate this list against a token budget
+    (`api/chat_router.py`), so a type-grouped order would mean whichever type
+    was concatenated last got dropped first — a meeting or a document could
+    never survive a full inbox. Interleaving makes the types compete on rank
+    instead, and guarantees each contributes its single most relevant entity
+    before any type contributes a second.
 
     Note: this is pure entity SELECTION and RANKING. Any judgement about
     "slipping" / "cooling" (with thresholds, severities, why-strings) lives
@@ -221,34 +341,29 @@ def _scope_morning_brief(
     entities: list[EntityRef] = []
     citations: dict[str, Citation] = {}
 
-    def emit(bucket: list[EntityRef], view: _BaseView, entity_type: str, reason: str) -> None:
-        bucket.append(_ref(entity_type, view, rank=len(bucket), reason=reason))
+    def emit(view: _BaseView, entity_type: str, reason: str) -> None:
+        entities.append(_ref(entity_type, view, rank=len(entities), reason=reason))
+        # Lineage rides along for EVERY type, from the entity's own provenance —
+        # never re-derived, never connector ids. A type with no provenance keeps
+        # an honestly empty citation rather than a fabricated one.
         citations[view.entity_id] = _cite(view)
 
-    # Commitments — open, oldest last_seen first (most likely to have slipped).
-    open_commits = [c for c in state.commitments() if c.fields.get("status", "open") == "open"]
-    for c in _sort_asc_by_last_seen(open_commits)[:cap]:
-        emit(entities, c, "commitment", reason="open, oldest activity")
-
-    # Relationships — stalest first (highest chance of "cooling").
-    for r in _sort_asc_by_last_seen(state.relationships())[:cap]:
-        emit(entities, r, "relationship", reason="stalest interaction")
-
-    # Threads — freshest first (what's active in the inbox).
-    for t in _sort_desc_by_last_seen(state.threads())[:cap]:
-        emit(entities, t, "thread", reason="most recently active")
-
-    # People — most recently active (who's in the mix).
-    for p in _sort_desc_by_last_seen(state.people())[:cap]:
-        emit(entities, p, "person", reason="most recently seen")
-
-    # Companies — ranked by connected people count (most represented in org).
-    companies_by_size = sorted(
-        state.companies(),
-        key=lambda c: (-len(c.links.get("people", [])), c.entity_id),
-    )
-    for co in companies_by_size[:cap]:
-        emit(entities, co, "company", reason="most connected")
+    # Each type independently selects its own top-N by its own rule ...
+    per_type = [
+        [
+            (et.value, view, _MORNING_BRIEF[et].reason)
+            for view in _MORNING_BRIEF[et].select(state)[:cap]
+        ]
+        for et in _TIER_ORDER
+    ]
+    # ... then they interleave, tier by tier. `zip_longest` pads exhausted types
+    # with None, so a type with fewer entities (or none at all) simply stops
+    # contributing instead of shifting anyone else's position.
+    for tier in itertools.zip_longest(*per_type):
+        for item in tier:
+            if item is not None:
+                entity_type, view, reason = item
+                emit(view, entity_type, reason)
 
     policy_version = None
     if policy:
