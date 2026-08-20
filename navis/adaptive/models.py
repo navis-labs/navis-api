@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -46,6 +46,28 @@ class PolicyProposal(Base):
 
 class PolicySnapshot(Base):
     __tablename__ = "policy_snapshots"
+    __table_args__ = (
+        # AT MOST ONE ACTIVE POLICY PER ORGANIZATION, enforced by the database.
+        #
+        # This index has existed in production since migration 0012
+        # (`uq_ps_one_active`) but was never declared on the model, so
+        # `Base.metadata.create_all` — which every test fixture and disposable
+        # database uses — produced a schema WITHOUT it. The invariant that makes
+        # concurrent approval safe was therefore real in production and absent
+        # everywhere it could be tested, which is the worst possible split: a
+        # double activation raises a unique violation live and silently corrupts
+        # policy history in a test.
+        #
+        # Declared here so both paths agree. `get_active_snapshot` uses
+        # `db.scalar()`, which relies on there being at most one row to return a
+        # deterministic answer; this is what makes that true.
+        Index(
+            "uq_ps_one_active",
+            "organization_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+    )
 
     policy_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     organization_id: Mapped[uuid.UUID] = mapped_column(

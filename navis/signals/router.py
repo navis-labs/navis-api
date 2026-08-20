@@ -17,7 +17,6 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-import os
 import secrets
 import time
 import uuid
@@ -383,17 +382,48 @@ async def google_callback(
 async def google_pubsub_webhook(request: Request) -> dict[str, str]:
     """Gmail push. Pub/Sub posts {message:{data:base64(json)}}. We decode the target
     mailbox + historyId and enqueue an incremental sync (deduped), then ack 200."""
-    # Primary auth: Google's signed OIDC token (rejects forged requests).
-    if pubsub_auth_configured():
-        try:
-            verify_pubsub_request(request.headers.get("Authorization"))
-        except PubSubAuthError as exc:
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"pubsub auth failed: {exc}")
-    else:
-        token = request.query_params.get("token")
-        expected = os.environ.get("GOOGLE_WEBHOOK_VERIFICATION_TOKEN")
-        if expected and token != expected:
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bad webhook token")
+    # ── AUTHENTICATION — UNCONDITIONAL, AND BEFORE ANYTHING IS ENQUEUED ──
+    #
+    # This block previously read:
+    #
+    #     if pubsub_auth_configured():          # bool(GOOGLE_PUBSUB_AUDIENCE)
+    #         verify_pubsub_request(...)
+    #     else:
+    #         expected = os.environ.get("GOOGLE_WEBHOOK_VERIFICATION_TOKEN")
+    #         if expected and token != expected:    # `expected` unset => NO CHECK
+    #             raise 401
+    #
+    # With neither variable set — which is this deployment's actual state — an
+    # internet-reachable endpoint accepted anonymous POSTs and enqueued
+    # `sync_google_account` for any mailbox address the caller named. Two
+    # fail-opens, one behind the other.
+    #
+    # The `?token=` fallback is gone rather than repaired: it was a SECOND
+    # authentication mechanism for a channel Google already authenticates with a
+    # signed OIDC JWT, and it carried its secret in a query string, where it lands
+    # in access logs, proxies and browser history.
+    #
+    # 503 vs 401 is a real distinction, not cosmetic: 503 means Navis has not
+    # provisioned push yet (nothing to authenticate against), 401 means the caller
+    # is not the service account we authorized. Neither accepts the request. This
+    # mirrors `observation/webhooks/router.py::_verify`, which fixed the identical
+    # shape.
+    if not pubsub_auth_configured():
+        logger.error(
+            "pubsub webhook is not configured (GOOGLE_PUBSUB_AUDIENCE + "
+            "GOOGLE_PUBSUB_SA_EMAIL/SUB); refusing the request"
+        )
+        metrics.incr("pubsub.auth.failure", labels={"reason": "not_configured"})
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Google Pub/Sub push is not configured for this deployment",
+        )
+    try:
+        verify_pubsub_request(request.headers.get("Authorization"))
+    except PubSubAuthError as exc:
+        # `exc` names the failing check (bad_audience / bad_signature / …), never
+        # token material — see PubSubAuthError.reason.
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"pubsub auth failed: {exc}")
 
     body = await request.json()
     message = (body or {}).get("message", {})

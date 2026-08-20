@@ -96,6 +96,39 @@ class AdaptiveService:
         if prop.status != ProposalStatus.PENDING_APPROVAL.value:
             raise ValueError(f"proposal not pending (status={prop.status})")
 
+        # RESOLVE AND VALIDATE THE TARGET *BEFORE* TOUCHING ANYTHING.
+        #
+        # `supersede_active` used to run before anything checked that there was
+        # a snapshot to activate. `policy_id` is nullable and
+        # `set_snapshot_status` is a no-op when the row is missing, so a proposal
+        # with a null or dangling `policy_id` retired the organization's active
+        # policy and activated nothing — silently dropping it to code defaults on
+        # what the founder experienced as a successful approval. Fail closed:
+        # nothing is superseded unless the replacement is known-good.
+        if prop.policy_id is None:
+            raise ValueError("proposal has no draft policy to activate")
+        target = await self.repo.get_snapshot(prop.policy_id)
+        if target is None or target.organization_id != org_id:
+            raise LookupError("draft policy not found")
+        if target.status != SnapshotStatus.DRAFT.value:
+            raise ValueError(f"draft policy not activatable (status={target.status})")
+
+        # THE INDEPENDENT SAFETY GATE, ON THE PATH THAT ACTUALLY ACTIVATES.
+        #
+        # `governance.validate_proposal` documents itself as the check that "a
+        # malformed proposal can never be activated even if generation is
+        # bypassed" — but it was only ever called from `propose()`, which
+        # validates against the policy active AT PROPOSAL TIME. A rollback or
+        # kill switch between proposal and approval moves that baseline, and the
+        # 25% magnitude cap is defined relative to it: approving a stale proposal
+        # could apply a jump far larger than the cap allows from where the
+        # organization actually stands. Re-validating here against the CURRENT
+        # active policy is what makes the cap a guarantee rather than a
+        # description of one moment.
+        governance.validate_changes(
+            prop.proposed_changes or [], await self.repo.get_active_payload(org_id)
+        )
+
         await self.repo.append_approval({
             "approval_id": compute_approval_id(proposal_id, approver_id, "approved"),
             "organization_id": org_id,

@@ -113,6 +113,30 @@ def principal_cache_evict_user(user_id: uuid.UUID) -> None:
         )
 
 
+def principal_cache_evict_org(org_id: uuid.UUID) -> int:
+    """Drop every cached Principal belonging to an organization.
+
+    Called on a lifecycle transition (see `organization.lifecycle`). Suspending or
+    churning an organization does not change anyone's PERMISSIONS — the capability
+    gate reads lifecycle from the database on every request, so entitlements need
+    no invalidation — but it does change whether those permissions may be used at
+    all, and an operator suspending a tenant reasonably expects that to take
+    effect now rather than within a TTL.
+
+    Returns the number of entries evicted, so the caller can report it. Cheap: the
+    cache is bounded at `_PRINCIPAL_CACHE_MAX`, so this is a walk of at most a
+    thousand entries and runs only on a lifecycle change.
+    """
+    victims = [k for k, (_exp, _uid, p) in _PRINCIPAL_CACHE.items() if p.org_id == org_id]
+    for k in victims:
+        _PRINCIPAL_CACHE.pop(k, None)
+    if victims:
+        metrics.incr(
+            "auth.cache.evict", value=len(victims), labels={"reason": "org_lifecycle"}
+        )
+    return len(victims)
+
+
 def principal_cache_clear() -> None:
     """Public-in-tests helper. Only auth-cache tests should call this."""
     _PRINCIPAL_CACHE.clear()
@@ -142,7 +166,14 @@ class Principal:
         return permission in self.permissions
 
 
-async def _grants_for(db: AsyncSession, org_id: uuid.UUID, role: str) -> list[str]:
+async def grants_for(db: AsyncSession, org_id: uuid.UUID, role: str) -> list[str]:
+    """Per-org permission grants layered on a role's code defaults.
+
+    PUBLIC because membership administration must resolve a TARGET's effective
+    permissions exactly as this resolves the ACTOR's. Two queries with the same
+    intent would be free to drift, and a drift here means an authorization
+    comparison between two differently-computed permission sets.
+    """
     rows = (
         await db.scalars(
             select(RolePermission).where(
@@ -206,7 +237,7 @@ async def _principal_from_jwt(db: AsyncSession, token: str) -> Principal:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "no active org membership")
 
     role = membership.role.value if membership.role else None
-    grants = await _grants_for(db, membership.organization_id, role or "")
+    grants = await grants_for(db, membership.organization_id, role or "")
 
     # Detach the User row from this request's session before caching so a
     # future cache hit — served under a DIFFERENT session — can safely read

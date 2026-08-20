@@ -26,15 +26,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.adaptive.contract import (
     AdaptiveView,
-    AggRow,
     InsightRow,
-    PatternRow,
+    LearningEvidence,
+    OutcomeEvidence,
     SnapshotStatus,
 )
 from navis.adaptive.models import PolicyApproval, PolicyProposal, PolicySnapshot
 from navis.adaptive.policy import merge_defaults
 from navis.intelligence.repository import IntelligenceRepository
-from navis.learning.models import AggregateDimension, LearningAggregate, LearningPattern
+from navis.learning.metrics import learning_snapshot
 
 
 class AdaptiveRepository:
@@ -43,16 +43,69 @@ class AdaptiveRepository:
 
     # ---- read model (Intelligence + Learning only) ----
 
-    async def _aggs(self, org_id: uuid.UUID, dimension: str) -> list[AggRow]:
-        rows = (
-            await self.db.scalars(
-                select(LearningAggregate).where(
-                    LearningAggregate.organization_id == org_id,
-                    LearningAggregate.dimension == dimension,
+    # THE LEARNING BOUNDARY. Adaptive reads NO Learning table. It reads
+    # Intelligence through `IntelligenceRepository.get_insights`, and when it
+    # eventually needs raw learned evidence that an insight does not carry, that
+    # evidence arrives through `navis.learning.metrics.learning_snapshot` — the
+    # same contract Intelligence and ML consume — and never through a private
+    # query against `learning_*`.
+    #
+    # No such call exists yet ON PURPOSE: candidate generation is a later phase,
+    # and a read with no consumer is the exact dead weight the two removals below
+    # describe. The boundary is declared and pinned by a test; it is not
+    # pre-wired.
+    #
+    # `_aggs()` USED TO BE HERE, and it is gone rather than kept "for later".
+    #
+    # It ran three unbounded `learning_aggregates` reads per view — SIGNAL,
+    # DECISION and OUTCOME — and nothing in this package ever read the fields
+    # they filled. The DECISION one was the worst of them: `learning_aggregates`
+    # holds one decision row per decision the organization has ever made, so on
+    # a 100k-decision org this fetched 100k rows, built 100k `AggRow` objects,
+    # and threw all of them away.
+    #
+    # Deleting it also removed Adaptive's only direct read of a Learning TABLE.
+    # What Adaptive needs from Learning now arrives through
+    # `navis.learning.metrics.learning_snapshot` — the contract Intelligence and
+    # ML already consume — rather than through a private copy of Learning's
+    # storage layout.
+
+    @staticmethod
+    def _evidence(org_id: uuid.UUID, snap) -> LearningEvidence:
+        """Flatten Learning's snapshot to the evidence Adaptive may reason about.
+
+        Deliberately NARROW. The snapshot also carries signal and decision
+        aggregates and `learning_patterns`; none of them are passed on, because
+        their keys are opaque uuids and a rule cannot say what tuning a threshold
+        for `sig-8f3c…` would MEAN. Outcome types are named, so they are the only
+        learned evidence a policy rule can act on without guessing — the same
+        limitation `proposals.py` has documented since V1, now expressed as a
+        boundary rather than a comment.
+        """
+        outcomes = []
+        for surface, aggs in sorted(snap.outcomes_by_surface().items()):
+            for agg in aggs:
+                outcomes.append(
+                    OutcomeEvidence(
+                        outcome_type=agg.key,
+                        surface=surface,
+                        successes=agg.successes,
+                        failures=agg.failures,
+                        neutrals=agg.neutrals,
+                        total=agg.total,
+                        # The events behind this counter, so a candidate can cite
+                        # what caused it rather than asserting it.
+                        supporting_learning_event_ids=tuple(
+                            snap.lineage.get(agg.key, [])
+                        ),
+                    )
                 )
-            )
-        ).all()
-        return [AggRow(r.key, r.successes, r.failures, r.neutrals, r.total) for r in rows]
+        return LearningEvidence(
+            org_id=org_id,
+            learning_version=snap.learning_version,
+            as_of=snap.as_of,
+            outcomes=tuple(sorted(outcomes, key=lambda o: o.outcome_type)),
+        )
 
     async def build_view(self, org_id: uuid.UUID) -> AdaptiveView:
         # The org's CURRENT insights — the same rows GET /intelligence/insights
@@ -73,17 +126,35 @@ class AdaptiveRepository:
             )
             for r in insight_rows
         ]
-        adaptive_version = max((i.learning_version for i in insights), default=0)
+        evidence = self._evidence(org_id, await learning_snapshot(self.db, org_id))
+        # WHICH CLOCK VERSIONS A PROPOSAL — the high-water mark of BOTH inputs.
+        #
+        # `proposal_id` is `uuid5(org, adaptive_version)` and proposals are
+        # appended with ON CONFLICT DO NOTHING, so any evidence change that does
+        # NOT move this number is silently discarded: the write is a no-op and
+        # the older proposal stands.
+        #
+        # A max over insights alone was safe while insights were the only input.
+        # They no longer are — `_judgement_changes` folds Learning's own counters
+        # — so the number has to move when EITHER moves:
+        #
+        #   * Intelligence current  -> both agree, nothing changes;
+        #   * Intelligence lagging  -> Learning's count is higher and wins, so a
+        #     new rejection cannot be lost to a stale id while the projection
+        #     catches up;
+        #   * no insights at all    -> Learning's count is the only clock, which
+        #     is what lets a purely learned candidate exist (`service.propose`
+        #     short-circuits on `adaptive_version == 0`);
+        #   * insights but no learning events (fixtures / an imported
+        #     projection) -> the insight max wins and behaviour is unchanged.
+        #
+        # Monotonic in both arguments, so an id is never reused for weaker
+        # evidence.
+        adaptive_version = max(
+            max((i.learning_version for i in insights), default=0),
+            evidence.learning_version,
+        )
         as_of = max((r.created_at for r in insight_rows if r.created_at is not None), default=None)
-
-        patterns = [
-            PatternRow(p.signal_id, p.kind, p.success_rate, p.samples)
-            for p in (
-                await self.db.scalars(
-                    select(LearningPattern).where(LearningPattern.organization_id == org_id)
-                )
-            ).all()
-        ]
 
         active = await self.get_active_payload(org_id)
         return AdaptiveView(
@@ -92,10 +163,7 @@ class AdaptiveRepository:
             as_of=as_of,
             active_policy=active,
             insights=insights,
-            signal_aggs=await self._aggs(org_id, AggregateDimension.SIGNAL.value),
-            decision_aggs=await self._aggs(org_id, AggregateDimension.DECISION.value),
-            outcome_aggs=await self._aggs(org_id, AggregateDimension.OUTCOME.value),
-            patterns=patterns,
+            learning=evidence,
         )
 
     # ---- policy resolution ----

@@ -43,9 +43,29 @@ async def _embed_org(org_id: uuid.UUID, version: int, max_pages: int) -> int:
     where this one stopped rather than restarting.
     """
     async with session_scope() as db:
-        count = await EmbeddingService(db).embed_org(
-            org_id, version=version, max_pages=max_pages
-        )
+        # ── ENTITLEMENT GATE (T-14) ──────────────────────────────────────────
+        # Embedding is the most expensive per-organization scheduled work in the
+        # system: it calls a paid provider once per unembedded memory record, on a
+        # five-minute sweep, for every organization that exists. It ran for
+        # suspended and churned tenants too. `Capability.ML` is the entitlement the
+        # provider call consumes.
+        #
+        # Imported inside the function, not at module scope: `runtime_policy` pulls
+        # in Adaptive and Organization, and `navis/ml/**` is held to a narrow
+        # import surface by tests/ml/test_ml_layer.py.
+        from navis.orchestration.runtime_policy import scheduled_work_allowed
+        from navis.organization.contract import Capability
+        from navis.platform.monitoring import org_context
+
+        if not await scheduled_work_allowed(db, org_id, Capability.ML, task="embed_org"):
+            return 0
+
+        # Tenant log context (T-21) so provider errors and page progress are
+        # attributable — this loop is where LLM spend happens.
+        with org_context(org_id):
+            count = await EmbeddingService(db).embed_org(
+                org_id, version=version, max_pages=max_pages
+            )
     logger.info("embedded org=%s version=%d new=%d", org_id, version, count)
     return count
 

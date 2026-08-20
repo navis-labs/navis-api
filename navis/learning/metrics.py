@@ -26,7 +26,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from navis.learning.aggregates import success_rate
 from navis.learning.models import (
@@ -35,6 +35,10 @@ from navis.learning.models import (
     LearningEvent,
     LearningPattern,
 )
+# Learning's OWN minimum-evidence threshold, the one it already uses to decide
+# whether a signal has earned a pattern. Imported, never restated: a second copy
+# of the number is how the read contract and the derivation drift apart.
+from navis.learning.patterns import MIN_SAMPLES
 
 # Bounded lineage: how many supporting ids one key may carry, and how many
 # events a single lineage pass will scan. Full counts always come from the
@@ -142,40 +146,15 @@ async def learning_snapshot(db, org_id: uuid.UUID) -> LearningSnapshot:
     this module, which is what makes "Org A's learning cannot influence Org B"
     a property of the boundary rather than of each consumer's diligence.
     """
-    learning_version = int(
-        await db.scalar(
-            select(func.count(LearningEvent.id)).where(
-                LearningEvent.organization_id == org_id
-            )
-        )
-        or 0
-    )
-    as_of = await db.scalar(
-        select(func.max(LearningEvent.occurred_at)).where(
-            LearningEvent.organization_id == org_id
-        )
-    )
-    # The watermark and reasoning version of the NEWEST learning event. Ordered
-    # by (occurred_at, id) so the choice stays deterministic when two events
-    # share a timestamp. Read in ONE row rather than two queries — they describe
-    # the same event and picking them separately could straddle two.
-    newest = (
-        await db.execute(
-            select(LearningEvent.state_watermark, LearningEvent.reasoning_version)
-            .where(
-                LearningEvent.organization_id == org_id,
-                LearningEvent.state_watermark.is_not(None),
-            )
-            .order_by(LearningEvent.occurred_at.desc(), LearningEvent.id.desc())
-            .limit(1)
-        )
-    ).first()
-    state_watermark = newest[0] if newest else None
-    reasoning_version = newest[1] if newest else None
+    stats = await _event_stats(db, org_id)
+    learning_version, as_of, state_watermark, reasoning_version = stats
 
     agg_rows = (
         await db.scalars(
-            select(LearningAggregate).where(LearningAggregate.organization_id == org_id)
+            select(LearningAggregate).where(
+                LearningAggregate.organization_id == org_id,
+                _has_enough_evidence(),
+            )
         )
     ).all()
     pattern_rows = (
@@ -204,6 +183,92 @@ async def learning_snapshot(db, org_id: uuid.UUID) -> LearningSnapshot:
     )
 
 
+def _has_enough_evidence():
+    """Drop DECISION counters that cannot become evidence, in SQL.
+
+    THE UNBOUNDED READ. `learning_aggregates` gets one DECISION row per decision
+    the organization has ever made, and most decisions produce one or two
+    outcomes and then stop. The snapshot returned all of them: on the benchmarked
+    25k-event org that was 2,000 decision rows, and it grows with the org's
+    entire history rather than with its evidence. Nothing consumed them —
+    `LearningView.decision_aggs` is read in exactly one place in the codebase
+    (`intelligence.insights.decision_intelligence`) and its first statement is
+    `if agg.decisive < MIN_SAMPLES: continue`.
+
+    So this is not a new rule. It is the threshold Learning ALREADY applies when
+    deriving `learning_patterns` (`patterns.MIN_SAMPLES`, imported rather than
+    restated), moved from after the rows cross the wire to before, so the
+    database discards what the reader was going to discard anyway.
+
+    ONLY the DECISION dimension:
+      * SIGNAL rows stay whole — the set is bounded by the reasoning engines, and
+        `signal_lineage` keys off them;
+      * OUTCOME rows stay whole — there are at most as many as there are
+        `OutcomeType` members, and `outcomes_by_surface()` reports their raw
+        counts with no threshold at all. Filtering those would silently delete
+        the delivery/judgement/world evidence ML renders.
+
+    Neutrals deliberately do not count toward `decisive`, matching `AggregateFact
+    .decisive` and `patterns.derive_signal_patterns` exactly: an attempt that
+    never resolved is not a sample for or against anything.
+    """
+    return or_(
+        LearningAggregate.dimension != AggregateDimension.DECISION.value,
+        (LearningAggregate.successes + LearningAggregate.failures) >= MIN_SAMPLES,
+    )
+
+
+async def _event_stats(
+    db, org_id: uuid.UUID
+) -> tuple[int, datetime | None, str | None, int | None]:
+    """How much has been learned, as of when, against which world — in ONE trip.
+
+    These were three separate statements over the SAME table and the same
+    organization: `count(*)`, `max(occurred_at)`, and a newest-row pick for
+    (state_watermark, reasoning_version). Three round trips to a hosted database
+    is three times the network latency for one logical question, and on the
+    measured path latency — not query time — was the whole cost.
+
+    Correctness is unchanged, and deliberately so:
+      * the two aggregates still scan the org's events exactly as before;
+      * the watermark still comes from the NEWEST event that recorded one,
+        ordered by (occurred_at, id) so a tie is broken deterministically;
+      * the watermark and the reasoning version still come from the SAME row —
+        a correlated subquery cannot straddle two events any more than the
+        previous single ordered SELECT could.
+
+    Not folded into the lineage scan below, which would have been one trip
+    fewer: that scan is capped at `_LINEAGE_SCAN_LIMIT`, so deriving the count
+    from it would silently under-report `learning_version` for exactly the large
+    organizations this function has to stay exact for. `learning_version` is an
+    identity key for Intelligence's insights; it is not allowed to be
+    approximate.
+    """
+    newest = (
+        select(LearningEvent.state_watermark, LearningEvent.reasoning_version)
+        .where(
+            LearningEvent.organization_id == org_id,
+            LearningEvent.state_watermark.is_not(None),
+        )
+        .order_by(LearningEvent.occurred_at.desc(), LearningEvent.id.desc())
+        .limit(1)
+        .subquery()
+    )
+    row = (
+        await db.execute(
+            select(
+                func.count(LearningEvent.id),
+                func.max(LearningEvent.occurred_at),
+                select(newest.c.state_watermark).scalar_subquery(),
+                select(newest.c.reasoning_version).scalar_subquery(),
+            ).where(LearningEvent.organization_id == org_id)
+        )
+    ).first()
+    if row is None:  # defensive: an aggregate select always returns one row
+        return 0, None, None, None
+    return int(row[0] or 0), row[1], row[2], row[3]
+
+
 async def _lineage(db, org_id: uuid.UUID) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """Bounded supporting lineage per signal/decision key.
 
@@ -214,10 +279,35 @@ async def _lineage(db, org_id: uuid.UUID) -> tuple[dict[str, list[str]], dict[st
     A decision key's signal lineage is the union of the reasoning signals on the
     events that decided it, so a decision can be traced back through Learning to
     the Reasoning that triggered it.
+
+    KEYS ARE AGGREGATE KEYS. Signal ids, decision ids AND outcome types — the
+    three things `learning_aggregates` is keyed on — so `lineage[k]` answers
+    "which events support this counter?" for every counter the snapshot exposes.
+    `outcome_type` was the omission: it is the only TYPE-STABLE key Learning has
+    (signal and decision keys are opaque uuids), which makes it the one a
+    consumer can reason about by name — and until now a consumer citing it had
+    no events to cite. Bounded like the rest: at most `_MAX_LINEAGE` ids across
+    at most one key per `OutcomeType` member.
     """
-    events = (
-        await db.scalars(
-            select(LearningEvent)
+    # THREE COLUMNS, NOT THE ENTITY. This selected whole `LearningEvent` objects,
+    # which meant the scan carried every column — including `provider_reference`
+    # and the rest of the JSONB — across the wire and then built one ORM instance
+    # per row, identity-mapped, for up to `_LINEAGE_SCAN_LIMIT` rows. On the
+    # measured 25k-event organization that was the single most expensive thing
+    # `learning_snapshot` did, and lineage needs exactly three fields.
+    #
+    # A projected select returns lightweight Row tuples: no instance
+    # construction, no identity map, and only the bytes the maps are built from.
+    # Same rows, same order, same cap — nothing about WHICH events are consulted
+    # changes, so the maps are byte-identical to what the entity scan produced.
+    rows = (
+        await db.execute(
+            select(
+                LearningEvent.id,
+                LearningEvent.reasoning_signal_ids,
+                LearningEvent.decision_id,
+                LearningEvent.outcome_type,
+            )
             .where(LearningEvent.organization_id == org_id)
             .order_by(LearningEvent.id.asc())
             .limit(_LINEAGE_SCAN_LIMIT)
@@ -231,16 +321,18 @@ async def _lineage(db, org_id: uuid.UUID) -> tuple[dict[str, list[str]], dict[st
         if value not in slot and len(slot) < _MAX_LINEAGE:
             slot.append(value)
 
-    for e in events:
-        eid = str(e.id)
-        signal_ids = [str(s) for s in (e.reasoning_signal_ids or [])]
+    for event_id, raw_signal_ids, decision_id, outcome_type in rows:
+        eid = str(event_id)
+        if outcome_type:
+            _add(lineage, outcome_type, eid)
+        signal_ids = [str(s) for s in (raw_signal_ids or [])]
         for sid in signal_ids:
             _add(lineage, sid, eid)
             # A signal insight's key IS its ReasoningSignal id; recording it
             # keeps the map total, so every key answers the same question.
             _add(signal_lineage, sid, sid)
-        if e.decision_id is not None:
-            did = str(e.decision_id)
+        if decision_id is not None:
+            did = str(decision_id)
             _add(lineage, did, eid)
             for sid in signal_ids:
                 _add(signal_lineage, did, sid)

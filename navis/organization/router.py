@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.authz import Principal, get_principal, require_permission
 from navis.identity.permissions import Permission
+from navis.organization.billing import PlanEscalationDenied
 from navis.organization.contract import Capability, OnboardingStage, Plan, stage_index
 from navis.organization.feature_flags import FeatureFlagService
 from navis.organization.repository import OrganizationRepository
@@ -125,7 +126,25 @@ async def set_plan(
     p: Principal = Depends(require_permission(Permission.MANAGE_BILLING)),
     db: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    await OrganizationService(db).billing.set_plan(p.org_id, body.plan, actor_id=p.subject_id)
+    """Change this organization's plan. Downgrades only.
+
+    `MANAGE_BILLING` says the caller may MANAGE billing for their organization; it
+    does not say they may GRANT it capabilities, and every founder holds it by
+    default. `set_plan` is called WITHOUT `billing_authorized`, so a change that
+    would add a capability is refused — see `BillingService.PlanEscalationDenied`
+    for what that previously allowed.
+
+    402 PAYMENT_REQUIRED, matching `require_capability`'s use of the same code for
+    "your plan does not cover this": the request is well-formed and the caller is
+    authenticated and permitted — what is missing is a payment authority this
+    deployment does not have yet.
+    """
+    try:
+        await OrganizationService(db).billing.set_plan(
+            p.org_id, body.plan, actor_id=p.subject_id
+        )
+    except PlanEscalationDenied as exc:
+        raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, str(exc))
     return {"plan": body.plan.value}
 
 

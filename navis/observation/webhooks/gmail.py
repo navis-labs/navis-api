@@ -29,4 +29,9 @@ def parse_gmail(body: dict[str, Any]) -> ObservationWebhookEvent | None:
         occurred_at=occurred,
         source_event_id=str(body.get("event_id") or f"gmail:{external_id}:{body.get('reply_id', '')}"),
         raw={"from": body.get("from"), "snippet": body.get("snippet")},
+        # WHICH MAILBOX received the reply. `emailAddress` is the key Google's own
+        # Gmail push payload uses (see signals/router.py::google_pubsub_webhook),
+        # so a real notification already carries it; `mailbox` is accepted as the
+        # generic alias. Absent -> the edge refuses rather than scanning tenants.
+        external_account=(body.get("emailAddress") or body.get("mailbox") or None),
     )

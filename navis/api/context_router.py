@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.authz import Principal
+from navis.identity.throttle import rate_limit
 from navis.organization.contract import Capability
 from navis.organization.guards import require_capability
 from navis.platform.database import get_session
@@ -30,7 +31,11 @@ logger = get_logger("context")
 router = APIRouter(prefix="/context", tags=["context"])
 
 
-@router.get("")
+@router.get(
+    "",
+    # T-23: context assembly runs vector search + state projection per call.
+    dependencies=[Depends(rate_limit("read", "rate_limit_read_per_window"))],
+)
 async def context_bundle(
     user_id: str | None = None,  # accepted for FE compat; scoping is org-wide today
     p: Principal = Depends(require_capability(Capability.DECISION)),

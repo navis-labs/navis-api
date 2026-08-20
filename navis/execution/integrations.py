@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import uuid
 from importlib import import_module
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from navis.platform.monitoring import get_logger
 
@@ -136,13 +136,30 @@ def _load(provider: str) -> IntegrationResolver:
     return getattr(import_module(module_path), attr)
 
 
-async def resolve_integration(db: Any, org_id: uuid.UUID, provider: str) -> Any:
+async def resolve_integration(
+    db: Any,
+    org_id: uuid.UUID,
+    provider: str,
+    *,
+    integration_id: uuid.UUID | None = None,
+) -> Any:
     """The org's credential for this provider, or raise.
 
     THE only way generic Execution obtains a credential. Every caller — the
     approve pre-flight, the draft sign-off, the production senders — goes through
     here, so organization scoping is enforced in one place rather than re-argued
     at each call site.
+
+    `integration_id` PINS THE ACCOUNT (T-11). When an execution recorded which
+    connected account it is for, that account is the only acceptable answer: the
+    row is loaded directly, re-checked against `org_id` and the provider, and
+    returned or refused. There is no path where a pinned account falls back to a
+    different one — a wrong-account send is a real failure (wrong identity, wrong
+    thread) that no retry fixes, so refusing is the honest outcome.
+
+    When it is None the org-scoped resolver runs as before, but the resolvers
+    themselves now refuse an organization holding SEVERAL candidate accounts
+    rather than breaking the tie by recency.
     """
     if not org_id:
         # Fail closed. A resolver that ran without an organization would be free
@@ -159,7 +176,124 @@ async def resolve_integration(db: Any, org_id: uuid.UUID, provider: str) -> Any:
             "this connector cannot perform write actions in this deployment",
             provider=provider,
         )
+    if integration_id is not None:
+        return await _resolve_pinned(db, org_id, provider, integration_id)
     return await _load(provider)(db, org_id)
+
+
+# Which Integration.provider values may serve each ActionSpec provider.
+#
+# DECLARED BY THE CONNECTOR, NOT LISTED HERE. A connector knows its own family —
+# the Google grant writes one Integration row per granted service, all sharing a
+# token, so a `gmail` action can legitimately be pinned to any of them, while a
+# `slack` action can never be served by a Google row. Naming those provider values
+# in this module would put connector knowledge back into the generic layer, which
+# `tests/execution/test_runtime_hardening.py::
+# test_generic_execution_contains_no_drive_or_docs_branch` exists to prevent (and
+# caught on the first attempt at this). The strings live in
+# `providers/_senders.py`, next to the resolvers that already own this knowledge.
+_ACCEPTED: dict[str, frozenset[str]] = {}
+
+# provider name -> the connector's own "can THIS row actually do it?" check.
+#
+# See `register_accepted_providers` for why this is a separate question from
+# `_ACCEPTED`, and `_resolve_pinned` for why omitting it made pinning the weaker
+# path.
+PinVerifier = Callable[[Any], None]
+_PIN_VERIFIERS: dict[str, PinVerifier] = {}
+
+
+def register_accepted_providers(
+    provider: str,
+    accepts: frozenset[str] | set[str],
+    *,
+    verify: PinVerifier | None = None,
+) -> None:
+    """Declare which `Integration.provider` values may serve this action provider.
+
+    Called by the connector module alongside its credential resolver. A provider
+    that never registers cannot be pinned at all (see `_resolve_pinned`) — the
+    fail-closed direction, because an unregistered family is one nobody has
+    decided the compatibility rules for.
+
+    `verify` IS WHAT KEEPS PINNING FROM BEING THE WEAKER PATH (T-11).
+
+    `accepts` answers a structural question — may a `gmail` row serve a `calendar`
+    action? — and one Google consent writes a gmail, a google_calendar and a drive
+    row that all share a token, so the answer is yes for the whole family. It says
+    nothing about whether THIS row was granted the scope the action needs, or
+    whether it still holds tokens. The org-scoped resolvers have always asked
+    both: `resolve_gmail_send_integration` filters on `gmail_send_granted` and on
+    stored tokens before it returns anything.
+
+    `_resolve_pinned` asked neither. Reproduced before this parameter existed: a
+    Gmail row carrying only `gmail.readonly`, and a send-scoped row with no stored
+    tokens, BOTH resolved when pinned while the unpinned resolver refused each
+    with `reconsent_required`. The consequence is not a wrong account — the pin
+    prevents that — it is losing the permanent, actionable refusal ("reconnect
+    Google to grant send access") and getting an opaque provider 403 at send time
+    instead, which the worker classifies as transient and retries five times.
+
+    The callable is the CONNECTOR's, and raises `IntegrationUnavailable` in its
+    own words. Optional so a connector that has no capability distinction
+    registers nothing and behaves exactly as before.
+    """
+    _ACCEPTED[provider] = frozenset(accepts)
+    if verify is not None:
+        _PIN_VERIFIERS[provider] = verify
+
+
+async def _resolve_pinned(
+    db: Any, org_id: uuid.UUID, provider: str, integration_id: uuid.UUID
+) -> Any:
+    """Load exactly the pinned integration, or refuse. Never substitutes.
+
+    Five checks, each fail-closed, in the order that leaks least: existence,
+    OWNERSHIP, provider compatibility, active status, then the connector's own
+    capability check. Ownership is checked against the caller's trusted `org_id` —
+    which the worker takes from the persisted execution row — so a pinned id
+    belonging to another tenant is indistinguishable from one that does not exist.
+
+    The last check is what makes a pinned resolution AT LEAST as strict as an
+    unpinned one; see `register_accepted_providers`.
+    """
+    from navis.identity.models import Integration
+
+    # Force the connector module to import so its `register_accepted_providers`
+    # side effect has run. `_load` is the same lazy import the unpinned path uses,
+    # so this costs nothing extra on any request that was going to resolve anyway.
+    _load(provider)
+
+    row = await db.get(Integration, integration_id)
+    if row is None or row.organization_id != org_id:
+        # Deliberately one message for both cases: an execution must not be able
+        # to probe whether an integration id exists in some other organization.
+        raise IntegrationUnavailable(
+            "the connected account this action was created for is no longer "
+            "available; reconnect the account or recreate the action",
+            provider=provider,
+        )
+    row_provider = row.provider.value if hasattr(row.provider, "value") else str(row.provider)
+    if row_provider not in _ACCEPTED.get(provider, frozenset()):
+        raise IntegrationUnavailable(
+            f"the connected account this action was created for cannot perform a "
+            f"{provider} action",
+            provider=provider,
+        )
+    if not row.is_active:
+        raise IntegrationUnavailable(
+            f"the {provider} account this action was created for has been "
+            "disconnected; reconnect it to run this action",
+            provider=provider,
+            reconsent_required=True,
+        )
+    verifier = _PIN_VERIFIERS.get(provider)
+    if verifier is not None:
+        # Raises IntegrationUnavailable in the connector's own words. Not wrapped:
+        # the connector already writes the message a human has to act on, and
+        # re-phrasing it here would put connector knowledge back in this module.
+        verifier(row)
+    return row
 
 
 async def integration_preflight(db: Any, org_id: uuid.UUID, provider: str) -> None:

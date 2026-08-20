@@ -143,12 +143,39 @@ class ObservationService:
             payload=payload,
         )
 
-    async def record_from_webhook(self, webhook) -> Outcome | None:
-        """Map a provider webhook to an outcome by its provider_reference, inheriting
-        the lineage of the original action's outcome. Unknown references are ignored."""
-        prior = await self.repo.by_provider_external_id(webhook.provider, webhook.external_id)
+    async def record_from_webhook(self, webhook, *, org_id: uuid.UUID) -> Outcome | None:
+        """Map a provider webhook to an outcome WITHIN a known organization.
+
+        `org_id` IS THE TENANT AND IT IS NOT NEGOTIABLE HERE. It is resolved by the
+        caller from a persisted `Integration` row (the connected account the
+        notification named) and passed in already trusted — the same shape as the
+        Gmail push and Slack event paths, where orchestration resolves the tenant
+        and hands the domain a `SignalContext` it does not get to second-guess.
+
+        THE DEFECT THIS REPLACES. This method used to take no organization at all:
+        it called `by_provider_external_id(provider, external_id)` with no org
+        filter — a scan across EVERY tenant's outcomes, `ORDER BY occurred_at DESC
+        LIMIT 1` — and then adopted `prior.organization_id` as the answer. So the
+        tenant was decided by whichever organization happened to hold the most
+        recent row matching an id supplied in the request body. Two tenants sharing
+        an external id (a shared mailbox), or a caller who could guess one, chose
+        the victim. The lookup is now scoped, so a reference belonging to another
+        organization simply does not match.
+
+        Returns None — recording nothing, publishing nothing — when the reference
+        is unknown WITHIN this organization. That is deliberate: an unmatched
+        reference has no lineage to inherit, and inventing an outcome without one
+        would put an unattributable fact into an append-only log that Learning
+        consumes and cannot retract.
+        """
+        prior = await self.repo.by_provider_external_id(
+            webhook.provider, webhook.external_id, org_id=org_id
+        )
         if prior is None:
-            logger.warning("webhook %s ref=%s matched no prior outcome", webhook.provider, webhook.external_id)
+            logger.warning(
+                "webhook %s ref=%s matched no prior outcome in org=%s",
+                webhook.provider, webhook.external_id, org_id,
+            )
             return None
         return await self.record(
             org_id=prior.organization_id,

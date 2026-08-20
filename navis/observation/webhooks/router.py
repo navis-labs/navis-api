@@ -12,17 +12,31 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from fastapi import Depends
 
+from navis.identity.models import IntegrationProvider
+from navis.identity.org_service import AmbiguityReason, resolve_owning_integration
 from navis.observation.service import ObservationService
 from navis.observation.webhooks.calendar import parse_calendar
 from navis.observation.webhooks.gmail import parse_gmail
 from navis.platform.database import get_session
 from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import metrics
 
 logger = get_logger("observation.webhooks")
 
 router = APIRouter(prefix="/webhooks/observation", tags=["observation"])
 
 _PARSERS = {"gmail": parse_gmail, "calendar": parse_calendar}
+
+# Observation's provider vocabulary -> the Integration row that owns the account.
+# Resolution happens HERE, at the edge, for the same reason `get_principal` resolves
+# the tenant at the edge for HTTP: the domain service should receive an organization
+# it can trust, not the raw material to guess one from. Keeping the map here also
+# keeps `navis/observation/**` free of any Identity import — it stayed a pure
+# bounded context before this change and it still is.
+_PROVIDER_INTEGRATION: dict[str, IntegrationProvider] = {
+    "gmail": IntegrationProvider.GMAIL,
+    "calendar": IntegrationProvider.GOOGLE_CALENDAR,
+}
 
 
 def _verify(provider: str, token: str | None) -> None:
@@ -75,7 +89,51 @@ async def receive(
     if webhook is None:
         return {"status": "ignored"}  # ack so the provider stops retrying
 
-    outcome = await ObservationService(db).record_from_webhook(webhook)
+    # ── TENANT RESOLUTION — FROM A PERSISTED INTEGRATION, NEVER FROM THE BODY ──
+    #
+    # The shared secret verified above proves the CALLER is authorized to deliver
+    # notifications. It says nothing about WHICH organization this one concerns,
+    # because there is one secret per provider for the whole deployment. So the
+    # organization is resolved the same way every other inbound provider event
+    # resolves it: the notification names an external account, and that account is
+    # looked up against `integrations` to find its owner.
+    #
+    # Every outcome is fail-closed. An unnamed account, an account we have no
+    # active integration for, or an account two organizations have both connected
+    # all ACK (200, `status: unresolved`) WITHOUT recording anything.
+    #
+    # ACK rather than 4xx because a provider retries a 4xx into the same refusal
+    # forever, and the delivery itself was well-formed and authenticated — what is
+    # missing is a tenant, which retrying cannot supply. The `reason` in the body
+    # and the bounded metric are how an operator sees it instead.
+    #
+    # Recording nothing because `outcomes` is append-only and feeds Learning: a
+    # fact written under the wrong tenant cannot be retracted, only out-voted.
+    integration_provider = _PROVIDER_INTEGRATION.get(provider)
+    if integration_provider is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown provider {provider}")
+
+    integration, reason = await resolve_owning_integration(
+        db,
+        provider=integration_provider,
+        external_account=webhook.external_account,
+    )
+    if integration is None:
+        # Identifier-only. `external_account` is an address the caller supplied and
+        # is NOT logged, so a probe cannot use the log as an oracle; the bounded
+        # reason label is what an operator alerts on.
+        logger.warning(
+            "observation webhook %s refused: tenant unresolved (%s)", provider, reason
+        )
+        metrics.incr(
+            "observation.webhook.unresolved",
+            labels={"provider": provider, "reason": reason or AmbiguityReason.NO_MATCH},
+        )
+        return {"status": "unresolved", "reason": reason, "outcome_id": None}
+
+    outcome = await ObservationService(db).record_from_webhook(
+        webhook, org_id=integration.organization_id
+    )
     return {
         "status": "recorded" if outcome else "unmatched",
         "outcome_id": str(outcome.outcome_id) if outcome else None,

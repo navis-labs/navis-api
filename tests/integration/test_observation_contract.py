@@ -1126,9 +1126,16 @@ async def test_a_world_outcome_is_represented_as_world(Session, orgs):
         outcome_type = OutcomeType.REPLY_RECEIVED
         occurred_at = NOW
         raw = {"thread": "t-1"}
+        # The connected mailbox the notification named. The HTTP edge resolves
+        # this to an owning Integration and passes the organization in; this test
+        # exercises the service directly, so it supplies the resolved tenant.
+        external_account = "founder@org-a.test"
 
     async with Session() as s:
-        assert await ObservationService(s).record_from_webhook(_Webhook()) is not None
+        assert (
+            await ObservationService(s).record_from_webhook(_Webhook(), org_id=ORG_A)
+            is not None
+        )
         await s.commit()
 
     facts = await _learning_ml_facts(Session, ORG_A)
@@ -1197,3 +1204,320 @@ async def test_a_learning_outage_degrades_the_context_instead_of_failing_it(
         context = await ContextBuilder(s).build(ORG_A, "how are we doing?")
     assert [f for f in context.facts if f.kind == LEARNING_KIND] == []
     assert context.org_id == str(ORG_A)  # the turn still produced a context
+
+
+# ══ THE LEARNING READ PATH, HARDENED ═══════════════════════════════════
+#
+# `learning_snapshot` folded three separate learning_events statements into one
+# and stopped hydrating whole ORM entities for the lineage scan. Neither is
+# allowed to change a single value it returns, so these pin the semantics that
+# the collapse could plausibly have broken.
+
+
+async def test_snapshot_stats_come_from_one_consistent_newest_event(Session, orgs):
+    """count, as_of, watermark and reasoning_version, folded into one query.
+
+    The watermark and the reasoning version must come from the SAME event — the
+    newest one that recorded a watermark. Picking them with separate statements
+    could straddle two events; a correlated subquery cannot.
+    """
+    user_id = orgs
+    await _approved(Session, ORG_A, user_id)      # watermark "w-42", reasoning 7
+    await _drain(Session)
+    await _relay(Session)
+
+    snap = await _snapshot(Session, ORG_A)
+    events = await _learning_events(Session, ORG_A)
+    assert snap.learning_version == len(events) == 1
+    assert snap.as_of == max(e.occurred_at for e in events)
+    assert snap.state_watermark == "w-42"
+    assert snap.reasoning_version == 7
+
+
+async def test_an_org_with_no_learning_reports_zero_not_a_crash(Session, orgs):
+    """The aggregate select always returns a row; the subqueries return NULL.
+
+    An org that has learned nothing must read as (0, None, None, None) rather
+    than raising or inventing a version.
+    """
+    snap = await _snapshot(Session, ORG_A)
+    assert snap.learning_version == 0
+    assert snap.as_of is None
+    assert snap.state_watermark is None
+    assert snap.reasoning_version is None
+    assert snap.aggregates == () and snap.patterns == ()
+
+
+async def test_events_without_a_watermark_still_count_toward_the_version(
+    Session, orgs
+):
+    """The watermark subquery filters on `state_watermark IS NOT NULL`; the
+    count must NOT. An execution that recorded no watermark is still learning
+    that happened, and `learning_version` is an identity key for Intelligence —
+    under-counting it would collide two different projections."""
+    from navis.execution.service import ExecutionService
+
+    user_id = orgs
+    async with Session() as s:
+        req, _ = await ExecutionService(s).request(
+            ORG_A, uuid.uuid4(), "send_email",
+            {"to": "a@b.com", "subject": "s", "body": "b"},
+            reasoning_signal_ids=["sig-nw"], reasoning_version=2,
+            state_watermark=None,           # nothing recorded a watermark
+        )
+        await ExecutionService(s).reject(req.id, user_id, reason="no")
+        await s.commit()
+    await _relay(Session)
+
+    snap = await _snapshot(Session, ORG_A)
+    assert snap.learning_version == 1, "an unwatermarked event vanished from the count"
+    assert snap.as_of is not None
+    assert snap.state_watermark is None    # honestly absent, not fabricated
+
+
+async def test_the_projected_lineage_scan_returns_the_same_maps(Session, orgs):
+    """The scan selects three columns instead of whole entities. It must consult
+    the same events, in the same order, and build byte-identical maps."""
+    from sqlalchemy import select
+
+    from navis.learning.metrics import _LINEAGE_SCAN_LIMIT, _MAX_LINEAGE
+    from navis.learning.models import LearningEvent
+
+    user_id = orgs
+    for _ in range(3):
+        await _approved(Session, ORG_A, user_id)
+    await _drain(Session)
+    await _relay(Session)
+
+    snap = await _snapshot(Session, ORG_A)
+
+    # Rebuild the maps the OLD way — full entities — and compare.
+    async with Session() as s:
+        events = (await s.scalars(
+            select(LearningEvent)
+            .where(LearningEvent.organization_id == ORG_A)
+            .order_by(LearningEvent.id.asc())
+            .limit(_LINEAGE_SCAN_LIMIT)
+        )).all()
+
+    lineage: dict[str, list[str]] = {}
+    signal_lineage: dict[str, list[str]] = {}
+
+    def _add(bucket, key, value):
+        slot = bucket.setdefault(key, [])
+        if value not in slot and len(slot) < _MAX_LINEAGE:
+            slot.append(value)
+
+    for e in events:
+        eid = str(e.id)
+        sigs = [str(x) for x in (e.reasoning_signal_ids or [])]
+        for sid in sigs:
+            _add(lineage, sid, eid)
+            _add(signal_lineage, sid, sid)
+        if e.decision_id is not None:
+            did = str(e.decision_id)
+            _add(lineage, did, eid)
+            for sid in sigs:
+                _add(signal_lineage, did, sid)
+
+    assert snap.lineage == lineage
+    assert snap.signal_lineage == signal_lineage
+    assert snap.lineage, "the comparison proved nothing — both maps were empty"
+
+
+# ══ THE BOUNDED AGGREGATE READ ═════════════════════════════════════════
+#
+# `learning_aggregates` holds one DECISION row per decision the org ever made,
+# and the snapshot used to return all of them — a read that grows with history
+# rather than with evidence. The snapshot now applies Learning's OWN
+# `patterns.MIN_SAMPLES` to that dimension in SQL. These prove the filter drops
+# exactly what its only reader was already discarding, and nothing else.
+
+
+async def _seed_decision_aggregates(Session, org, *, low: int, qualifying: int):
+    """Decision counters written directly, so the shape is exact.
+
+    `low` rows sit below MIN_SAMPLES decisive; `qualifying` sit at or above it.
+    Neutrals are added to the low rows on purpose: a row can have a large `total`
+    and still be no evidence at all, and the filter must key on decisive samples
+    rather than on volume.
+    """
+    from sqlalchemy import text
+
+    async with Session() as s:
+        await s.execute(
+            text("""
+            INSERT INTO learning_aggregates
+              (organization_id, dimension, key, successes, failures, neutrals, total)
+            SELECT :org, 'decision', 'low-' || g, 1, 1, 40, 42
+              FROM generate_series(1, :n) g
+            """),
+            {"org": org, "n": low},
+        )
+        await s.execute(
+            text("""
+            INSERT INTO learning_aggregates
+              (organization_id, dimension, key, successes, failures, neutrals, total)
+            SELECT :org, 'decision', 'ok-' || g, 4, 1, 0, 5
+              FROM generate_series(1, :n) g
+            """),
+            {"org": org, "n": qualifying},
+        )
+        await s.commit()
+
+
+async def test_only_decision_aggregates_with_enough_evidence_reach_the_snapshot(
+    Session, orgs
+):
+    """THE REGRESSION PROOF. 100 low-sample rows, 20 qualifying rows."""
+    from navis.learning.models import AggregateDimension
+    from navis.learning.patterns import MIN_SAMPLES
+
+    await _seed_decision_aggregates(Session, ORG_A, low=100, qualifying=20)
+
+    snap = await _snapshot(Session, ORG_A)
+    decisions = snap.by_dimension(AggregateDimension.DECISION)
+
+    assert len(decisions) == 20, f"expected the 20 qualifying rows, got {len(decisions)}"
+    assert all(a.key.startswith("ok-") for a in decisions)
+    assert all(a.decisive >= MIN_SAMPLES for a in decisions)
+    # A high `total` built entirely from neutrals is not evidence and must not
+    # sneak through: every low row had total=42.
+    assert not any(a.key.startswith("low-") for a in decisions)
+
+
+async def test_the_low_sample_aggregates_are_still_stored(Session, orgs):
+    """Filtered from the READ, never deleted. They keep accumulating and appear
+    the moment they cross the threshold — this is a projection rule, not a
+    retention policy."""
+    from sqlalchemy import func, select
+
+    from navis.learning.models import LearningAggregate
+
+    await _seed_decision_aggregates(Session, ORG_A, low=100, qualifying=20)
+
+    async with Session() as s:
+        stored = await s.scalar(
+            select(func.count())
+            .select_from(LearningAggregate)
+            .where(
+                LearningAggregate.organization_id == ORG_A,
+                LearningAggregate.dimension == "decision",
+            )
+        )
+    assert stored == 120, "the filter deleted learning data"
+
+
+async def test_a_low_sample_decision_appears_once_it_earns_its_place(Session, orgs):
+    """The boundary, from both sides. Nothing is lost — only deferred."""
+    from sqlalchemy import text
+
+    from navis.learning.models import AggregateDimension
+
+    async with Session() as s:
+        await s.execute(
+            text("""
+            INSERT INTO learning_aggregates
+              (organization_id, dimension, key, successes, failures, neutrals, total)
+            VALUES (:org, 'decision', 'borderline', 2, 2, 9, 13)
+            """),
+            {"org": ORG_A},
+        )
+        await s.commit()
+
+    snap = await _snapshot(Session, ORG_A)
+    assert [a.key for a in snap.by_dimension(AggregateDimension.DECISION)] == []
+
+    async with Session() as s:  # one more decisive outcome -> 5 decisive
+        await s.execute(
+            text("UPDATE learning_aggregates SET successes = 3, total = 14 "
+                 "WHERE organization_id = :org AND key = 'borderline'"),
+            {"org": ORG_A},
+        )
+        await s.commit()
+
+    snap = await _snapshot(Session, ORG_A)
+    rows = snap.by_dimension(AggregateDimension.DECISION)
+    assert [a.key for a in rows] == ["borderline"]
+    assert rows[0].decisive == 5
+
+
+async def test_signal_and_outcome_aggregates_are_untouched_by_the_filter(
+    Session, orgs
+):
+    """Only DECISION is bounded.
+
+    A single executed action produces a SIGNAL row with 0 decisive samples and an
+    OUTCOME row with 0 decisive samples. Both must survive: ML reports raw
+    delivery/judgement/world counts with no threshold, and filtering them would
+    delete the surface evidence rather than trim it.
+    """
+    from navis.learning.models import AggregateDimension
+
+    user_id = orgs
+    await _approved(Session, ORG_A, user_id)
+    await _drain(Session)
+    await _relay(Session)
+
+    snap = await _snapshot(Session, ORG_A)
+    signals = snap.by_dimension(AggregateDimension.SIGNAL)
+    outcomes = snap.by_dimension(AggregateDimension.OUTCOME)
+
+    assert {a.key for a in signals} == {"sig-1", "sig-2"}
+    assert all(a.decisive == 0 for a in signals), "the fixture stopped proving the point"
+    assert [a.key for a in outcomes] == ["action_executed"]
+    # And the surface grouping ML renders still sees it.
+    assert "delivery" in snap.outcomes_by_surface()
+
+
+async def test_intelligence_output_is_unchanged_by_the_bounded_read(Session, orgs):
+    """Equivalence, not similarity: the projected rows must be identical.
+
+    Builds the view the production way (filtered), then rebuilds `LearningView`
+    from the UNFILTERED aggregates and projects both through the same generators.
+    """
+    from sqlalchemy import select
+
+    from navis.intelligence.insights import AggRow, project as project_view
+    from navis.intelligence.repository import IntelligenceRepository
+    from navis.intelligence.service import project_values
+    from navis.learning.models import LearningAggregate
+
+    await _seed_decision_aggregates(Session, ORG_A, low=100, qualifying=20)
+    user_id = orgs
+    await _approved(Session, ORG_A, user_id)
+    await _drain(Session)
+    await _relay(Session)
+
+    async with Session() as s:
+        filtered_view = await IntelligenceRepository(s).build_view(ORG_A)
+        unfiltered_rows = (await s.scalars(
+            select(LearningAggregate).where(
+                LearningAggregate.organization_id == ORG_A,
+                LearningAggregate.dimension == "decision",
+            )
+        )).all()
+
+    # 120 seeded + 1 from the real executed action above. That real one is
+    # `action_executed` — a DELIVERY attempt, neutral, 0 decisive — so it is
+    # exactly the kind of row the filter is meant to hold back, and it makes the
+    # comparison below stronger rather than weaker.
+    assert len(unfiltered_rows) == 121, "the unfiltered arm proved nothing"
+
+    # Same view, but with every decision row the database holds.
+    import dataclasses
+
+    unfiltered_view = dataclasses.replace(
+        filtered_view,
+        decision_aggs=[
+            AggRow(r.key, r.successes, r.failures, r.neutrals, r.total)
+            for r in unfiltered_rows
+        ],
+    )
+
+    assert len(filtered_view.decision_aggs) == 20
+    assert project_values(filtered_view) == project_values(unfiltered_view)
+    # And the decision insights that DO get emitted are the qualifying ones.
+    keys = {d.key for d in project_view(filtered_view)
+            if d.insight_type.value == "decision_intelligence"}
+    assert keys == {f"ok-{i}" for i in range(1, 21)}

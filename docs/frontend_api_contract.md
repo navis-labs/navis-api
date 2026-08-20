@@ -182,7 +182,7 @@ Both the access JTI AND the bound refresh session are revoked. Subsequent calls 
 
 ---
 
-## 1.6 `GET /api/v1/auth/me` — Current user + org + role
+## 1.6 `GET /api/v1/auth/me` — Current user, org, role, and effective permissions
 
 **Headers:** `Authorization: Bearer <access_token>`
 
@@ -203,11 +203,65 @@ Both the access JTI AND the bound refresh session are revoked. Subsequent calls 
     "slug": "acme-co"
   },
   "role": "founder",
+  "permissions": ["execute_actions", "manage_members", "view_decisions", "…"],
+  "organizations": [
+    { "id": "82ddae08-…", "name": "Acme Co", "slug": "acme-co", "is_current": true }
+  ],
   "onboarding_completed": false
 }
 ```
 
-**Use this** to populate the user menu, role badge, and to gate routes that need to know if onboarding is finished.
+**Use this** to populate the user menu, role badge, gate routes that need to know
+if onboarding is finished, and — via `permissions` — decide what to render.
+
+### `permissions` — read it, do not recompute it
+
+`permissions` is the caller's **effective** permission set for the current
+organization: the role's defaults **plus** any per-org grants this organization
+has configured. It is the exact set the backend's own authorization gate checks.
+
+**Do not derive permissions from `role` on the client.** A client-side copy of the
+§4.1 table is wrong in two ways it cannot detect:
+
+- per-org grants live only in the database, so a role's real powers in *this*
+  org may exceed the defaults;
+- the table drifts the moment the backend changes a default.
+
+Read `permissions` and check membership of the array. It is sorted, so it is safe
+to diff or cache. Discovering permissions by provoking `403`s is likewise
+unnecessary — and was never reliable, since a `403` can also mean a capability
+(plan) gate, not a permission gate.
+
+This is still **presentation only**. Every protected route re-checks server-side;
+holding a string here has never been what grants access (§6.1).
+
+### `role` can be `null`
+
+`role` is `null` when the membership has no usable role — a row that predates the
+`NOT NULL` constraint, or a role value the running build does not recognise. When
+it is `null`, `permissions` is `[]`. Treat that as "no privileges" and fail
+closed; the endpoint reports it rather than erroring.
+
+### `organizations` — reporting only, no switching
+
+`organizations` lists every organization the user holds a seat in, with exactly
+one entry flagged `is_current: true`. That entry is always the same organization
+as the top-level `organization` object: the tenant this access token
+authenticated into.
+
+Each entry carries **identity only** — `id`, `name`, `slug`, `is_current`. There
+is deliberately no `role` and no `permissions` per entry, because authorization
+is published for the active organization and nothing else.
+
+**There is no organization-switch endpoint.** Multi-org switching — an active-org
+token mechanism, an org picker, per-org onboarding — is **Phase 7** work. Today,
+changing the active organization means authenticating into it. Use this list to
+*show* that the account has more than one organization; do not build a switcher
+against it.
+
+**Errors:** `401` with no credentials, an invalid/expired/revoked token, or an API
+key (this endpoint describes a human session; machine principals are rejected).
+`403` when the token names an organization the user has no membership in.
 
 ---
 
@@ -509,6 +563,11 @@ Same pattern as API keys but represent a bot identity (not a key for a user). Ad
 
 # 4. Roles & Permissions Reference
 
+> **This section is documentation, not an implementation spec.** Read the
+> caller's actual permissions from `GET /auth/me` (§1.6) — that response
+> accounts for per-org grants, which this table cannot. Reproducing the table
+> below in client code creates a second source of truth that will drift.
+
 ## 4.1 Built-in roles
 
 | Role | Default permissions |
@@ -528,7 +587,38 @@ Same pattern as API keys but represent a bot identity (not a key for a user). Ad
 
 **Administration:** `manage_members`, `manage_roles`, `manage_api_keys`, `manage_service_accounts`, `manage_sso`, `manage_billing`
 
-UI tip: hide buttons/menus the user lacks permission for. The exact permission required for each Layer-1 admin route is in the table in §3.
+UI tip: hide buttons/menus the user lacks permission for — gate on
+`permissions.includes('…')` from §1.6, not on a locally derived set. The exact
+permission required for each Layer-1 admin route is in the table in §3.
+
+---
+
+## 4.3 Routes that were never real (removed)
+
+These five paths used to answer `200` with an empty payload **without checking
+credentials**. They had no backing implementation, so an anonymous caller, an
+expired session, and a genuinely empty organization were indistinguishable on the
+wire — a dead session rendered as "nothing to do today" instead of a re-login.
+
+They are **gone**. All five now `404`:
+
+| Removed path | What to use instead |
+|---|---|
+| `GET /decide/stack` | `GET /brief/today` — the ranked decision list |
+| `GET /skills` | nothing; no skills domain is shipped |
+| `GET /signals` | `GET /signals/gmail/recent`, `/signals/calendar/upcoming`, `/signals/drive/recent` |
+| `GET /execution/slack/blockers` | nothing; not shipped |
+| `GET /workspace/meetings/{id}/brief` | nothing; not shipped |
+
+The frontend already tolerates four of these (`fetchJsonOr` maps `404` to the
+empty fallback). `getMeetingBrief` uses `fetchJson`, so the meeting-brief drawer
+now renders its existing error state rather than a fabricated blank brief —
+switch it to `fetchJsonOr` if an empty state reads better than an error.
+
+**Every remaining route requires authentication.** The only endpoints that serve
+an anonymous caller are `/auth/*` (which mint or exchange credentials), the
+Google OAuth callback (signed `state`), and the `/webhooks/*` endpoints
+(provider signature). A `200` from anything else means you were authenticated.
 
 ---
 

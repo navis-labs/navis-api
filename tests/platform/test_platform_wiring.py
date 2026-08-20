@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 
+import pytest
 from fastapi.security import HTTPAuthorizationCredentials
 
 
@@ -112,3 +113,106 @@ def test_purge_tasks_registered_and_scheduled():
     scheduled = {e["task"]: e["schedule"] for e in celery_app.conf.beat_schedule.values()}
     assert scheduled.get(sessions) == 60 * 60   # hourly
     assert scheduled.get(tokens) == 60 * 60
+
+
+# ---- T-21: background work binds tenant context from a persisted row ----
+#
+# `set_org_id` was called in exactly ONE place — get_principal — so every log line
+# emitted by a Celery task, an event subscriber or an outbox relay carried
+# org_id="-". Since sync, brief generation, execution, observation, learning,
+# intelligence and adaptive all run in workers, the MAJORITY of tenant-affecting
+# work in the system was unattributable in logs.
+
+
+def test_org_context_binds_and_restores():
+    from navis.platform.monitoring import get_org_id, org_context, set_org_id
+
+    set_org_id(None)
+    assert get_org_id() == "-"
+    with org_context("org-a"):
+        assert get_org_id() == "org-a"
+    assert get_org_id() == "-", "context leaked out of the block"
+
+
+def test_org_context_restores_rather_than_clears():
+    """RESTORE, not clear: on the request path an inner block must not wipe the
+    org the auth dependency bound for the rest of the request."""
+    from navis.platform.monitoring import get_org_id, org_context, set_org_id
+
+    set_org_id("outer-org")
+    try:
+        with org_context("inner-org"):
+            assert get_org_id() == "inner-org"
+        assert get_org_id() == "outer-org", "restored the default instead of the caller's org"
+    finally:
+        set_org_id(None)
+
+
+def test_org_context_restores_even_when_the_body_raises():
+    from navis.platform.monitoring import get_org_id, org_context, set_org_id
+
+    set_org_id(None)
+    with pytest.raises(RuntimeError):
+        with org_context("org-a"):
+            raise RuntimeError("boom")
+    assert get_org_id() == "-", "a failing task poisoned the next task's context"
+
+
+def test_org_context_accepts_a_uuid_and_none():
+    from navis.platform.monitoring import get_org_id, org_context, set_org_id
+
+    org = uuid.uuid4()
+    set_org_id(None)
+    with org_context(org):
+        assert get_org_id() == str(org)
+    with org_context(None):
+        assert get_org_id() == "-"
+
+
+def test_two_tenants_tasks_do_not_bleed_into_each_other():
+    """Org A's task logs org A, org B's logs org B, and neither survives the
+    other — the property that makes worker logs usable at all."""
+    from navis.platform.monitoring import get_org_id, org_context, set_org_id
+
+    set_org_id(None)
+    seen = []
+    for org in ("org-a", "org-b", "org-c"):
+        with org_context(org):
+            seen.append(get_org_id())
+        assert get_org_id() == "-", f"{org} leaked past its own task"
+    assert seen == ["org-a", "org-b", "org-c"]
+
+
+def test_every_tenant_bound_background_entry_point_binds_context():
+    """Structural: the day a new background producer is added, this fails unless
+    it binds the tenant it is acting for."""
+    import ast
+    import inspect
+    import textwrap
+
+    import navis.execution.worker as W
+    import navis.ml.embeddings.jobs as J
+    import navis.orchestration.brief as B
+    import navis.orchestration.sync as S
+
+    for fn in (
+        S.sync_integration,
+        S._process_slack_event,
+        B.run_brief_for_org,
+        J._embed_org,
+        W._execute_one,
+    ):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        assert "org_context" in names, f"{fn.__qualname__} does not bind tenant log context"
+
+
+def test_background_context_is_never_taken_from_a_task_payload():
+    """The org bound by the sync path comes from the FRESHLY RE-READ row, not the
+    caller's argument — pinning that the re-read is what feeds it."""
+    import inspect
+
+    import navis.orchestration.sync as S
+
+    src = inspect.getsource(S.sync_integration)
+    assert "with org_context(fresh.organization_id)" in src

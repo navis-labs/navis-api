@@ -100,12 +100,27 @@ async def _resolve_google_calendar(
     return integration
 
 
-def _decrypt_integration_tokens(integration: Integration) -> None:
-    """TokenManager expects plaintext; DB stores encrypted."""
-    if integration.access_token:
-        integration.access_token = token_cipher.decrypt(integration.access_token)
-    if integration.refresh_token:
-        integration.refresh_token = token_cipher.decrypt(integration.refresh_token)
+# `_decrypt_integration_tokens` lived here and WROTE PLAINTEXT TOKENS TO THE
+# DATABASE. It assigned the decrypted values back onto the live `Integration` ORM
+# row, which marks the row dirty — and this router's session comes from
+# `get_session`, which COMMITS on success (platform/database/session.py). On the
+# ordinary path (access token still valid, so `_persist_refreshed_token` returns
+# without re-encrypting) that commit persisted the real access AND refresh tokens
+# in plaintext.
+#
+# It then stayed silent, because `token_cipher.decrypt` returns an untagged value
+# as-is (the legacy-plaintext path), so everything kept working while
+# encryption-at-rest was gone for those columns. The 5-minute `sync_all_sources`
+# pass rewrites `access_token` encrypted and so kept repairing it; nothing
+# rewrites `refresh_token` unless Google rotates it, which is why the damage
+# accumulated on exactly that column.
+#
+# The helper was also NEVER NEEDED: `TokenManager.get_token` decrypts what it is
+# given (signals/google/oauth.py), so handing it the stored CIPHERTEXT is both
+# correct and what it already expects — this was decrypting twice. Deleted rather
+# than fixed, for the same reason `execution/providers/_senders.py` deleted its
+# identical `_decrypt_tokens_inplace`: a helper that hands a live ORM row its own
+# plaintext is the shape that reintroduces this bug.
 
 
 async def _persist_refreshed_token(
@@ -197,7 +212,9 @@ async def available_slots(
         )
 
     integration = await _resolve_google_calendar(db, p.org_id)
-    _decrypt_integration_tokens(integration)
+    # The row is handed over with its tokens still CIPHERTEXT — TokenManager
+    # decrypts internally. Nothing here may assign plaintext onto this ORM row:
+    # the request's session commits on success. See the note above.
     token_manager = TokenManager(integration)
     transport = GoogleTransport(
         token_manager.token_provider(), on_auth_failure=token_manager.invalidate

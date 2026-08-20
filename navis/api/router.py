@@ -1,4 +1,27 @@
-"""Aggregate router. Each domain owns its routes; the edge just mounts them."""
+"""Aggregate router. Each domain owns its routes; the edge just mounts them.
+
+EVERY ROUTE MOUNTED HERE RESOLVES A PRINCIPAL, with four deliberate exceptions
+that authenticate by other means: `/auth/*` (mints credentials, and `/auth/logout`
+validates its own bearer), `/integrations/google/callback` (signed OAuth state),
+and the `/webhooks/*` endpoints (provider signature verification).
+
+`compat_router` used to be a fifth exception and was not one of these. It served
+`/decide/stack`, `/skills`, `/signals`, `/execution/slack/blockers` and
+`/workspace/meetings/{id}/brief` as unauthenticated 200s with empty payloads —
+so an anonymous caller, an expired session and a genuinely empty organization
+were INDISTINGUISHABLE on the wire, and a client whose token had died rendered
+"nothing to do today" instead of signing the user back in. It was deleted in
+TASK 6.4.4 rather than authenticated: none of the five had a backing
+implementation, so gating them would have made the fabricated payload an
+*authenticated* lie instead of an anonymous one. A 404 is the truth — the
+backend does not serve these — and the frontend's `fetchJsonOr` already treats
+404 as "not shipped" for four of them, while the fifth (the meeting brief) has
+an error state it renders instead.
+
+DO NOT reintroduce a stub router. A route that returns a plausible empty
+business payload without checking who is asking is an outage that looks like
+a quiet day.
+"""
 from __future__ import annotations
 
 from fastapi import APIRouter
@@ -7,7 +30,6 @@ from navis.adaptive.router import router as adaptive_router
 from navis.api.admin_router import router as admin_router
 from navis.api.brief_router import router as brief_router
 from navis.api.chat_router import router as chat_router
-from navis.api.compat_router import router as compat_router
 from navis.api.context_router import router as context_router
 from navis.api.memory_router import router as memory_router
 from navis.api.workspace_router import router as workspace_router
@@ -39,6 +61,5 @@ api_router.include_router(observation_webhooks_router)
 api_router.include_router(workspace_router)
 api_router.include_router(chat_router)
 api_router.include_router(memory_router)
-api_router.include_router(compat_router)
 api_router.include_router(admin_router)
 

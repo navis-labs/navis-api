@@ -35,6 +35,7 @@ from navis.intelligence import subscribers as _intelligence_subscribers  # noqa:
 from navis.execution import worker as _execution_worker  # noqa: F401  (registers tasks)
 from navis.signals import outbox as _signal_outbox  # noqa: F401  (registers the outbox relay task)
 from navis.signals import importance_backfill as _signal_importance_backfill  # noqa: F401  (scoring backfill task)
+from navis.signals import token_backfill as _signal_token_backfill  # noqa: F401  (one-shot token re-encryption task)
 from navis.memory import outbox as _memory_outbox  # noqa: F401  (registers the memory outbox relay task)
 from navis.identity import maintenance as _identity_maintenance  # noqa: F401  (registers purge tasks)
 from navis.observation import subscribers as _observation_subscribers  # noqa: F401  (closes the loop)

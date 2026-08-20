@@ -41,7 +41,11 @@ from uuid import UUID
 
 from sqlalchemy import select, update
 
-from navis.execution.integrations import IntegrationUnavailable, resolve_integration
+from navis.execution.integrations import (
+    IntegrationUnavailable,
+    register_accepted_providers,
+    resolve_integration,
+)
 from navis.execution.providers.base import ProviderError
 from navis.identity.models import Integration, IntegrationProvider
 from navis.platform.database import session_scope
@@ -81,6 +85,26 @@ class SenderContextError(ProviderError):
 
     def __init__(self, message: str) -> None:
         super().__init__(message, retryable=False)
+
+
+def _integration_id_from_payload(payload: dict[str, Any]) -> UUID | None:
+    """The pinned account for this execution, if it recorded one (T-11).
+
+    Absent or null means the row predates `execution_requests.integration_id`;
+    that is a legitimate value, NOT an error, so this returns None rather than
+    raising. A malformed value IS an error — it means a producer wrote something
+    that is not an id, and silently ignoring it would resolve some other account.
+    """
+    ctx = payload.get("__ctx__")
+    if not isinstance(ctx, dict):
+        return None
+    raw = ctx.get("integration_id")
+    if raw in (None, ""):
+        return None
+    try:
+        return UUID(str(raw))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise SenderContextError(f"invalid integration_id in __ctx__: {raw}") from exc
 
 
 def _org_id_from_payload(payload: dict[str, Any]) -> UUID:
@@ -146,6 +170,115 @@ def _google_event_id(execution_id: UUID) -> str:
 # Gmail credential system would be the worst possible outcome of this task.
 
 
+# ── Which Integration rows may serve which action provider (T-11) ──────────
+#
+# Declared HERE, next to the resolvers, because it is connector knowledge: ONE
+# Google consent writes a `gmail`, a `google_calendar` and a `drive` row that all
+# share the same token and the same `external_account`, so an action pinned to any
+# of them is pinned to the same real account. Slack shares nothing with Google, so
+# its set is closed.
+#
+# The generic layer stores these opaquely — see
+# `execution.integrations.register_accepted_providers` for why the strings must
+# not live there.
+_GOOGLE_FAMILY_ROWS = frozenset({"gmail", "google_calendar", "drive"})
+
+
+# ── And whether a pinned row can actually DO it (T-11) ─────────────────────
+#
+# Structural compatibility is not capability. `_GOOGLE_FAMILY_ROWS` says a gmail
+# row may serve a calendar action because one consent covers both; it does not
+# say the consent carried the calendar WRITE scope, or that the row still holds
+# tokens. The org-scoped resolvers below have always asked both questions —
+# `resolve_gmail_send_integration` filters on `gmail_send_granted` and on stored
+# tokens; `resolve_calendar_integration` raises `CalendarScopeInsufficient`.
+#
+# `_resolve_pinned` asked neither, so pinning an account SKIPPED the scope gate
+# that not pinning enforced. These three verifiers close that gap by asking the
+# same predicates, in the same module that already owns them. They raise the same
+# `IntegrationUnavailable(reconsent_required=True)` the unpinned path raises, so
+# the worker still classifies it PERMANENT and dead-letters once with a message
+# that names the remedy, instead of retrying an opaque provider 403 five times.
+#
+# Deliberately NOT re-implemented: each one calls the connector's existing scope
+# predicate. A second copy of "what counts as send access" is exactly how the two
+# paths would drift back apart.
+
+
+def _verify_gmail_pin(row: Integration) -> None:
+    """A pinned Gmail account must be able to SEND, and must hold tokens."""
+    from navis.signals.google.oauth import gmail_send_granted
+
+    if not gmail_send_granted(row.scopes):
+        raise IntegrationUnavailable(
+            "Navis can read the account this action was created for but is not "
+            "allowed to send from it. Reconnect Google Workspace to grant send "
+            "access.",
+            provider="gmail",
+            reconsent_required=True,
+        )
+    if not row.access_token or not row.refresh_token:
+        raise IntegrationUnavailable(
+            "the Gmail account this action was created for has no stored tokens; "
+            "reconnect required",
+            provider="gmail",
+            reconsent_required=True,
+        )
+
+
+def _verify_calendar_pin(row: Integration) -> None:
+    """A pinned Calendar account must carry a Calendar scope, and hold tokens.
+
+    READ is the floor rather than WRITE: `_ACCEPTED` lets a `reply`-style read
+    action and a mutation share this provider, and `resolve_calendar_integration`
+    likewise only demands write when the caller asks for it (`require_write`).
+    The senders that mutate still go through their own write-scope checks.
+    """
+    from navis.signals.google.oauth import calendar_read_granted, calendar_write_granted
+
+    if not calendar_read_granted(row.scopes) and not calendar_write_granted(row.scopes):
+        raise IntegrationUnavailable(
+            "the Google account this action was created for was connected without "
+            "a Calendar scope. Reconnect Google Workspace to grant calendar "
+            "access.",
+            provider="calendar",
+            reconsent_required=True,
+        )
+    if not row.access_token or not row.refresh_token:
+        raise IntegrationUnavailable(
+            "the Google Calendar account this action was created for has no stored "
+            "tokens; reconnect required",
+            provider="calendar",
+            reconsent_required=True,
+        )
+
+
+def _verify_slack_pin(row: Integration) -> None:
+    """A pinned Slack install must be able to POST, and must hold a bot token."""
+    from navis.signals.slack.oauth import slack_write_granted
+
+    if not slack_write_granted(row.scopes):
+        raise IntegrationUnavailable(
+            "Navis can read the Slack install this action was created for but is "
+            "not allowed to post to it. Reconnect Slack to grant the chat:write "
+            "permission.",
+            provider="slack",
+            reconsent_required=True,
+        )
+    if not row.access_token:
+        raise IntegrationUnavailable(
+            "the Slack install this action was created for has no stored bot "
+            "token; reconnect required",
+            provider="slack",
+            reconsent_required=True,
+        )
+
+
+register_accepted_providers("gmail", _GOOGLE_FAMILY_ROWS, verify=_verify_gmail_pin)
+register_accepted_providers("calendar", _GOOGLE_FAMILY_ROWS, verify=_verify_calendar_pin)
+register_accepted_providers("slack", frozenset({"slack"}), verify=_verify_slack_pin)
+
+
 async def resolve_gmail_credential(db, org_id: UUID) -> Integration:
     """Gmail SEND credential for one organization. Registered as provider `gmail`.
 
@@ -185,9 +318,9 @@ async def resolve_slack_credential(db, org_id: UUID) -> Integration:
     TokenManager, no expiry check and no self-healing sibling row. One active
     SLACK integration per workspace, selected by organization.
 
-    Org scope comes from the argument and nowhere else. Deterministic when a
-    workspace somehow holds two active rows: newest install wins, ties broken by
-    id, so the selection can never depend on planner order.
+    Org scope comes from the argument and nowhere else. An organization
+    connected to SEVERAL Slack workspaces is refused rather than ranked — see
+    below.
     """
     from navis.signals.slack.oauth import slack_write_granted
 
@@ -223,6 +356,32 @@ async def resolve_slack_credential(db, org_id: UUID) -> Integration:
             provider="slack",
             reconsent_required=True,
         )
+
+    # AMBIGUITY IS REFUSED, NOT RANKED (T-11) — the same rule Gmail and Calendar
+    # apply, and it was the odd one out.
+    #
+    # "Newest install wins" is deterministic, which is not the same as correct.
+    # `uq_org_provider_account` is unique per (org, provider, external_account),
+    # so one organization may legitimately connect two Slack workspaces — an
+    # internal one and a shared-channel customer one is the ordinary case. With
+    # recency ranking, a message meant for the internal workspace was posted to
+    # whichever was installed last: right tenant, wrong workspace, potentially in
+    # front of a customer. That is not recoverable by retry, and it is exactly
+    # the silent selection this rule exists to remove.
+    #
+    # Keyed on the WORKSPACE (`external_account`), not the row count: a single
+    # workspace holding two rows is unambiguous about where the message goes.
+    workspaces = {r.external_account for r in usable if r.external_account}
+    if len(workspaces) > 1:
+        raise IntegrationUnavailable(
+            "this organization has more than one connected Slack workspace "
+            f"({len(workspaces)} connected) and this action does not record which "
+            "one to post to; recreate the action from the message it answers",
+            provider="slack",
+        )
+    # Total order over the remaining rows (one workspace, possibly re-installed):
+    # newest first, `id` breaking a same-transaction tie so the choice can never
+    # depend on planner order.
     return sorted(
         usable,
         key=lambda r: (-(r.created_at.timestamp() if r.created_at else 0.0), str(r.id)),
@@ -253,7 +412,7 @@ async def slack_sender(payload: dict[str, Any]) -> str:
     # it now goes through the SAME loader as the Google senders so there is one
     # credential-loading path to audit rather than one per connector. Slack has
     # no refresh cycle, so there is no token to persist afterwards.
-    grant = await _load_grant(org_id, "slack")
+    grant = await _load_grant(org_id, "slack", integration_id=_integration_id_from_payload(payload))
     token = token_cipher.decrypt(grant.access_token) or ""
 
     # The Slack call runs with NO session open.
@@ -293,12 +452,21 @@ async def slack_sender(payload: dict[str, Any]) -> str:
 async def resolve_calendar_credential(db, org_id: UUID) -> Integration:
     """Google Calendar WRITE credential for one organization. Provider `calendar`."""
     from navis.signals.google.resolve import (
+        CalendarAccountAmbiguous,
         CalendarNotConnected,
         CalendarScopeInsufficient,
     )
 
     try:
         return await resolve_calendar_integration(db, org_id, require_write=True)
+    except CalendarAccountAmbiguous as exc:
+        # PERMANENT, not transient: retrying resolves nothing, because the action
+        # itself does not say which calendar it is for. `IntegrationUnavailable`
+        # is what the worker classifies as permanent, so this dead-letters once
+        # with a message a human can act on instead of burning the retry budget.
+        # `reconsent_required` stays False — the accounts are connected fine; it
+        # is the ACTION that is under-specified.
+        raise IntegrationUnavailable(str(exc), provider="calendar") from exc
     except CalendarNotConnected as exc:
         raise IntegrationUnavailable(
             "Google Calendar is not connected for this organization.",
@@ -397,16 +565,26 @@ class _Grant:
     token_expires_at: datetime | None
 
 
-async def _load_grant(org_id: UUID, provider: str) -> _Grant:
+async def _load_grant(
+    org_id: UUID, provider: str, *, integration_id: UUID | None = None
+) -> _Grant:
     """Resolve one org's credential and DETACH it. Session closed on return.
 
     The single credential-loading path for every executable connector, so the
     "no ORM object outlives the session" rule is enforced in one place rather
     than re-argued in each sender. Goes through `resolve_integration`, so
     organization scoping and the per-provider resolver registry are unchanged.
+
+    `integration_id` PINS THE ACCOUNT (T-11) — threaded from the execution row via
+    `__ctx__`, so an action created for Gmail B can never be sent from Gmail A.
+    None means the execution predates the column; `resolve_integration` then falls
+    back to the org-scoped resolver, which now refuses a multi-account org rather
+    than breaking the tie by recency.
     """
     async with session_scope() as db:
-        integration = await resolve_integration(db, org_id, provider)
+        integration = await resolve_integration(
+            db, org_id, provider, integration_id=integration_id
+        )
         # The calendar resolver may materialise a healing row; commit it while
         # the tokens on that row are still ciphertext. Nothing below mutates the
         # ORM object, so this commit can only ever persist the heal.
@@ -526,7 +704,7 @@ async def calendar_sender(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]
     #
     # Returns a DETACHED snapshot — the session is closed before the Google call
     # below, so no transaction is held across it and no ORM row can be flushed.
-    grant = await _load_grant(org_id, "calendar")
+    grant = await _load_grant(org_id, "calendar", integration_id=_integration_id_from_payload(payload))
     transport, token_manager = _google_transport(grant)
     try:
         client = CalendarClient(transport)
@@ -582,14 +760,20 @@ async def calendar_sender(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]
 # ── Calendar reschedule / cancel senders ───────────────────────────────────
 
 
-async def _open_calendar(org_id: UUID) -> tuple[CalendarClient, GoogleTransport, TokenManager, _Grant]:
+async def _open_calendar(
+    org_id: UUID, *, integration_id: UUID | None = None
+) -> tuple[CalendarClient, GoogleTransport, TokenManager, _Grant]:
     """Resolve the org's Calendar grant and build a client. NO SESSION HELD.
 
     Shared by the reschedule / cancel senders so the credential lifecycle lives
     in exactly one place per verb. Returns after the resolving session has
     closed, so the caller's Google call runs with no transaction open.
+
+    `integration_id` is the account the execution pinned (T-11); the callers read
+    it from `__ctx__` and pass it through, so a reschedule can only ever touch the
+    calendar the action was created against.
     """
-    grant = await _load_grant(org_id, "calendar")
+    grant = await _load_grant(org_id, "calendar", integration_id=integration_id)
     transport, token_manager = _google_transport(grant)
     return CalendarClient(transport), transport, token_manager, grant
 
@@ -610,7 +794,7 @@ async def calendar_reschedule_sender(payload: dict[str, Any]) -> str:
     event_id = str(payload.get("event_id") or "").strip()
     if not event_id:
         raise RuntimeError("reschedule_meeting payload missing 'event_id'")
-    client, transport, token_manager, grant = await _open_calendar(org_id)
+    client, transport, token_manager, grant = await _open_calendar(org_id, integration_id=_integration_id_from_payload(payload))
     try:
         event = await client.patch_event(
             event_id,
@@ -655,7 +839,7 @@ async def calendar_cancel_sender(payload: dict[str, Any]) -> str:
     event_id = str(payload.get("event_id") or "").strip()
     if not event_id:
         raise RuntimeError("cancel_meeting payload missing 'event_id'")
-    client, transport, token_manager, grant = await _open_calendar(org_id)
+    client, transport, token_manager, grant = await _open_calendar(org_id, integration_id=_integration_id_from_payload(payload))
     try:
         await client.delete_event(
             event_id,
@@ -789,7 +973,7 @@ async def gmail_sender(payload: dict[str, Any]) -> str:
     # The session closes HERE. Both Gmail round trips below — the duplicate
     # pre-check and the send — previously ran inside it with no intervening
     # commit, holding a connection idle-in-transaction for the whole exchange.
-    grant = await _load_grant(org_id, "gmail")
+    grant = await _load_grant(org_id, "gmail", integration_id=_integration_id_from_payload(payload))
     from_email = grant.external_account or ""
     if not from_email:
         # No From: address means no send is possible under this grant, ever.

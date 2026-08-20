@@ -32,4 +32,9 @@ def parse_calendar(body: dict[str, Any]) -> ObservationWebhookEvent | None:
         occurred_at=occurred,
         source_event_id=str(body.get("event_id_token") or f"calendar:{external_id}:{status}"),
         raw={"status": status, "attendee": body.get("attendee")},
+        # WHICH CALENDAR the event lives on — the connected Google account, which
+        # is what `integrations.external_account` holds for the Google family.
+        # NOT `attendee`: an attendee is a counterparty on someone else's meeting
+        # and naming one would let an outside address select a tenant.
+        external_account=(body.get("calendar_id") or body.get("emailAddress") or None),
     )

@@ -74,6 +74,12 @@ class ExecutionService:
         # keyword-only so every existing call site is unchanged; see the model
         # for why this is not folded into reasoning_signal_ids.
         source_signal_event_ids: list[str] | None = None,
+        # WHICH CONNECTED ACCOUNT this action must be performed with (T-11).
+        # Keyword-only and optional so every existing call site is unchanged; a
+        # producer that knows the account (a reply to a message captured on a
+        # specific integration) records it, and the worker then binds the
+        # credential to exactly that row instead of resolving by (org, provider).
+        integration_id: uuid.UUID | None = None,
         origin: ExecutionOrigin = ExecutionOrigin.CHAT,
     ) -> tuple[ExecutionRequest, bool]:
         """`origin` decides which surface REVIEWS this, not how it executes.
@@ -117,6 +123,7 @@ class ExecutionService:
             source_signal_event_ids=source_signal_event_ids or [],
             reasoning_version=reasoning_version,
             state_watermark=state_watermark,
+            integration_id=integration_id,
             action_type=action_type,
             status=ExecutionStatus.REQUESTED.value,
             idempotency_key=key,

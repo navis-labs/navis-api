@@ -240,6 +240,121 @@ async def test_time_budget_defers_remaining_rows_without_publishing_them():
     assert repo.published_ids == []  # nothing lost — all still pending
 
 
+# ---- The EXECUTION relay needs the same deadline, and needs it most ---------
+#
+# `signals/outbox.py` and `memory/outbox.py` both carry RELAY_TIME_BUDGET_SECONDS
+# and both describe themselves as mirroring `navis.execution.worker`'s relay. The
+# budget was added to the copies and never back-ported to the original, which is
+# the one relay it matters most on: delivery is synchronous and ACTION_EXECUTED
+# drives the most expensive subscriber chain in the system — Observation (own
+# session) -> OUTCOME_OBSERVED -> Learning (own session) -> LEARNING_UPDATED -> a
+# full Intelligence re-projection (own session).
+#
+# The bus bounds each handler at `settings.event_handler_timeout_seconds` (15s),
+# so `limit=500` had a code-derived worst case of 7500s against celery's 300s
+# soft / 360s hard limit — twenty slow rows are already enough to exceed it. A
+# hard kill rolls back the ONE transaction wrapping the pass, so nothing is
+# marked published and the next 15s tick re-claims exactly the same rows: a
+# backlog in that state can never drain.
+
+
+class FakeExecutionOutboxRepo:
+    """The execution outbox surface (`pending_events` / `mark_published`)."""
+
+    def __init__(self, rows):
+        self._rows = list(rows)
+        self.published_ids: list[uuid.UUID] = []
+
+    async def pending_events(self, *, limit: int = 500):
+        return self._rows[:limit]
+
+    async def mark_published(self, ids):
+        self.published_ids.extend(ids)
+
+
+def _execution_row():
+    row = FakeOutboxRow(EventType.ACTION_EXECUTED.value)
+    row.payload = {"event_id": str(row.id), "execution_id": str(uuid.uuid4())}
+    return row
+
+
+async def test_execution_relay_is_bounded_by_the_same_budget_as_its_siblings():
+    from navis.execution.worker import RELAY_TIME_BUDGET_SECONDS
+    from navis.memory.outbox import RELAY_TIME_BUDGET_SECONDS as MEMORY_BUDGET
+    from navis.signals.outbox import RELAY_TIME_BUDGET_SECONDS as SIGNAL_BUDGET
+
+    assert RELAY_TIME_BUDGET_SECONDS == SIGNAL_BUDGET == MEMORY_BUDGET
+
+    from navis.platform.config import settings
+    from navis.platform.queue import celery_app
+
+    # The bound that makes the deadline necessary rather than decorative.
+    worst_case = settings.event_handler_timeout_seconds * 500
+    assert worst_case > celery_app.conf.task_soft_time_limit
+    assert RELAY_TIME_BUDGET_SECONDS < celery_app.conf.task_soft_time_limit
+
+
+async def test_execution_relay_defers_remaining_rows_when_the_budget_is_spent():
+    from navis.execution.worker import relay_pass
+
+    delivered = []
+
+    async def consumer(event: DomainEvent) -> None:
+        delivered.append(event.payload["event_id"])
+
+    event_bus.subscribe(EventType.ACTION_EXECUTED, consumer)
+    rows = [_execution_row() for _ in range(5)]
+    repo = FakeExecutionOutboxRepo(rows)
+
+    published = await relay_pass(repo, time_budget=0.0)
+
+    assert published == 0
+    assert delivered == []
+    # Nothing published means nothing lost: every row is still claimable, which
+    # is what turns a hard-killed pass into a resumable one.
+    assert repo.published_ids == []
+
+
+async def test_execution_relay_commits_the_work_it_finished_before_the_deadline():
+    """Stopping early must not discard the rows already delivered — that is the
+    difference between draining a backlog slowly and never draining it."""
+    import asyncio
+
+    from navis.execution.worker import relay_pass
+
+    delivered = []
+
+    async def slow(event: DomainEvent) -> None:
+        await asyncio.sleep(0.02)
+        delivered.append(event.payload["event_id"])
+
+    event_bus.subscribe(EventType.ACTION_EXECUTED, slow)
+    rows = [_execution_row() for _ in range(20)]
+    repo = FakeExecutionOutboxRepo(rows)
+
+    published = await relay_pass(repo, time_budget=0.1)
+
+    assert 0 < published < len(rows), "expected a partial pass, got all-or-nothing"
+    assert repo.published_ids == [r.id for r in rows[:published]]
+    assert len(delivered) == published
+    # The remainder was never delivered AND never marked — the next pass gets it.
+    assert set(repo.published_ids).isdisjoint({r.id for r in rows[published:]})
+
+
+async def test_execution_relay_default_budget_leaves_normal_passes_unchanged():
+    from navis.execution.worker import relay_pass
+
+    async def consumer(event: DomainEvent) -> None:
+        return None
+
+    event_bus.subscribe(EventType.ACTION_EXECUTED, consumer)
+    rows = [_execution_row() for _ in range(5)]
+    repo = FakeExecutionOutboxRepo(rows)
+
+    assert await relay_pass(repo) == 5
+    assert repo.published_ids == [r.id for r in rows]
+
+
 # ---- Duplicate signal must not create duplicate memory ---------------------
 
 

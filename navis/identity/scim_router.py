@@ -17,7 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.authz import Principal, require_permission
 from navis.identity.enterprise_models import ScimGroup
-from navis.identity.members import MemberError, MemberService
+from navis.identity.members import (
+    MemberConflict,
+    MemberError,
+    MemberForbidden,
+    MemberService,
+)
 from navis.identity.models import Membership, Role, User
 from navis.identity.permissions import Permission
 from navis.identity.tokens import TokenRevocationService
@@ -117,6 +122,10 @@ async def provision_user(
             org_id=p.org_id, email=body.userName, role=Role.EMPLOYEE,
             actor_id=p.subject_id, actor_permissions=p.permissions,
         )
+    except MemberForbidden as exc:
+        # Subclasses MemberError, so it MUST be caught first — otherwise a privilege
+        # denial is reported as a provisioning conflict and an IdP retries it forever.
+        raise _scim_error(status.HTTP_403_FORBIDDEN, str(exc))
     except MemberError as exc:
         raise _scim_error(status.HTTP_409_CONFLICT, str(exc))
     user = await db.get(User, m.user_id)
@@ -134,7 +143,18 @@ async def deprovision_user(
     db: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        await MemberService(db).remove(org_id=p.org_id, user_id=user_id, actor_id=p.subject_id)
+        await MemberService(db).remove(
+            org_id=p.org_id, user_id=user_id, actor_id=p.subject_id,
+            actor_permissions=p.permissions,
+        )
+    except MemberForbidden as exc:
+        # Ordering matters: both of these subclass MemberError. Without them a
+        # refusal to remove a higher-privileged member, and the last-founder
+        # governance guard, both surfaced as 404 "not a member" — which reads as
+        # "already gone" to an IdP and hides a real authorization decision.
+        raise _scim_error(status.HTTP_403_FORBIDDEN, str(exc))
+    except MemberConflict as exc:
+        raise _scim_error(status.HTTP_409_CONFLICT, str(exc))
     except MemberError as exc:
         raise _scim_error(status.HTTP_404_NOT_FOUND, str(exc))
     # Revoke this user's access (forces re-login; they keep access only to orgs they

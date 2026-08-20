@@ -30,7 +30,7 @@ from navis.execution.telemetry import provider_telemetry, request_durations
 from navis.organization.contract import Capability
 from navis.platform.composition import ensure_subscribers
 from navis.platform.events import DomainEvent, EventType, event_bus
-from navis.platform.monitoring import get_logger
+from navis.platform.monitoring import get_logger, org_context
 
 logger = get_logger("execution.worker")
 
@@ -50,6 +50,12 @@ class _Lease:
     decision_id: uuid.UUID
     action_type: str
     payload: dict[str, Any]
+    # The connected account this action must be performed with (T-11). Copied
+    # from the PERSISTED row like every other lease field, so the account is as
+    # un-negotiable as the organization. None on rows written before the column
+    # existed; `resolve_integration` then falls back to the org-scoped resolver,
+    # which refuses a multi-account organization rather than picking by recency.
+    integration_id: uuid.UUID | None = None
 
 
 @asynccontextmanager
@@ -292,8 +298,32 @@ async def _execute_one(
             decision_id=req.decision_id,
             action_type=req.action_type,
             payload=dict(req.payload or {}),
+            integration_id=getattr(req, "integration_id", None),
         )
     # ── transaction committed. NO locks held from here. ───────────────────
+
+    # Tenant log context for phases B and C (T-21). One pass claims rows from
+    # ANY organization, so this is bound per lease rather than per pass — and from
+    # `req.organization_id`, the persisted row, which is the same source the
+    # authorization re-check above insists on. Everything from here (the provider
+    # call, the failure classification, the dead letter) is attributable.
+    with org_context(lease.org_id):
+        return await _run_leased(
+            lease, unit=unit, provider=provider, policy=policy,
+            max_attempts=max_attempts, telemetry=telemetry, reconciler=reconciler,
+        )
+
+
+async def _run_leased(
+    lease: _Lease, *, unit, provider, policy, max_attempts, telemetry, reconciler
+):
+    """Phases B and C for one already-leased request.
+
+    Split out of `_execute_one` so the tenant log context can wrap exactly the
+    work done on that lease's behalf, without indenting the whole body under a
+    `with` (which would have put the CLAIM inside a context bound from a row it
+    has not read yet).
+    """
 
     # ── PHASE B — EXTERNAL SIDE EFFECT (no transaction) ───────────────────
     # Thread execution context (org_id, execution_id) into the payload under a
@@ -307,6 +337,12 @@ async def _execute_one(
             "org_id": str(lease.org_id),
             "execution_id": str(lease.execution_id),
             "decision_id": str(lease.decision_id),
+            # T-11. Written LAST in the dict literal that also spreads the
+            # payload, so a payload key named "__ctx__" cannot supply its own
+            # account any more than it can supply its own organization.
+            "integration_id": (
+                str(lease.integration_id) if lease.integration_id else None
+            ),
         },
     }
     result = None
@@ -609,7 +645,32 @@ async def _maybe_dlq(dlq, req, provider, error, max_attempts) -> None:
         await dlq.record(req, provider=getattr(provider, "name", None), error=error)
 
 
-async def relay_pass(repo, *, limit: int = 500) -> int:
+# Wall-clock budget for one relay pass, well under celery_app's 300s soft /
+# 360s hard task limit. IDENTICAL in value and in purpose to the two sibling
+# relays (`signals/outbox.py`, `memory/outbox.py`), which both carry it and both
+# say they "mirror navis.execution.worker's outbox relay" — the budget was added
+# to the copies and never back-ported here.
+#
+# It matters MORE on this relay than on either sibling. Delivery is synchronous
+# and this is the most expensive subscriber chain in the system: one
+# ACTION_EXECUTED row runs Observation (its own session) -> OUTCOME_OBSERVED ->
+# Learning (its own session) -> LEARNING_UPDATED -> a full Intelligence
+# re-projection (its own session). The bus bounds each handler at
+# `settings.event_handler_timeout_seconds` (15s), so `limit=500` has a
+# code-derived worst case of 500 x 15s = 7500s — twenty-five times the soft
+# limit, which twenty slow rows are already enough to reach.
+#
+# What that costs without a deadline: the task is hard-killed mid-pass, the ONE
+# transaction wrapping the whole pass rolls back, no row is marked published, and
+# the next tick (15s later) re-claims exactly the same rows. A backlog in that
+# state can never drain. Stopping early commits the work already done and leaves
+# the remainder claimable.
+RELAY_TIME_BUDGET_SECONDS = 120.0
+
+
+async def relay_pass(
+    repo, *, limit: int = 500, time_budget: float = RELAY_TIME_BUDGET_SECONDS
+) -> int:
     """Publish persisted outbox events, then mark them published.
 
     `published_at` MEANS "every subscriber that was supposed to run for this
@@ -642,7 +703,13 @@ async def relay_pass(repo, *, limit: int = 500) -> int:
     events = await repo.pending_events(limit=limit)
     published_ids = []
     failed = 0
-    for e in events:
+    deadline = monotonic() + time_budget
+    stopped_early = 0
+    for index, e in enumerate(events):
+        if monotonic() >= deadline:
+            # Commit what's done; the unclaimed remainder is picked up next tick.
+            stopped_early = len(events) - index
+            break
         delivery = await event_bus.publish(
             DomainEvent(
                 type=EventType(e.event_type),
@@ -664,8 +731,16 @@ async def relay_pass(repo, *, limit: int = 500) -> int:
                 e.id, delivery.failed, delivery.handlers, e.event_type,
             )
     await repo.mark_published(published_ids)
-    if published_ids or failed:
-        logger.info("relay published=%d retained=%d", len(published_ids), failed)
+    if stopped_early:
+        logger.info(
+            "execution outbox relay hit its %.0fs budget; deferred=%d to next pass",
+            time_budget, stopped_early,
+        )
+    if published_ids or failed or stopped_early:
+        logger.info(
+            "relay published=%d retained=%d deferred=%d",
+            len(published_ids), failed, stopped_early,
+        )
     return len(published_ids)
 
 

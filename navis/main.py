@@ -78,6 +78,13 @@ def create_app() -> FastAPI:
         version=settings.app_version,
         docs_url="/docs" if settings.show_docs else None,
         redoc_url="/redoc" if settings.show_docs else None,
+        # `docs_url`/`redoc_url` only hide the HTML UIs. Without this, /openapi.json
+        # kept serving the COMPLETE schema — 81 paths with every parameter, body
+        # model and status code — so `SHOW_DOCS=False` (which production requires,
+        # see settings._enforce_production_safety) suppressed the viewer while
+        # leaving the machine-readable original public. The schema is the part worth
+        # having: it enumerates the whole attack surface without any crawling.
+        openapi_url="/openapi.json" if settings.show_docs else None,
         lifespan=lifespan,
     )
 

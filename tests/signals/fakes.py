@@ -156,6 +156,17 @@ class FakeDriveClient:
 
 
 def fake_integration(**overrides: Any) -> SimpleNamespace:
+    """A stand-in Integration whose tokens are stored ENCRYPTED, like production.
+
+    `TokenManager.get_token` decrypts what it is handed, so a fixture holding
+    bare plaintext was only ever readable through `TokenCipher`'s legacy
+    passthrough. Once `SIGNALS_REJECT_LEGACY_PLAINTEXT` is on (TASK 6.4.1) that
+    passthrough raises, so a plaintext fixture no longer represents any row this
+    system can store. Callers still pass and assert PLAINTEXT values; only the
+    at-rest representation changed.
+    """
+    from navis.signals.crypto import token_cipher
+
     base = dict(
         id=__import__("uuid").uuid4(),
         access_token="tok",
@@ -163,4 +174,8 @@ def fake_integration(**overrides: Any) -> SimpleNamespace:
         token_expires_at=None,
     )
     base.update(overrides)
+    for field in ("access_token", "refresh_token"):
+        value = base.get(field)
+        if value is not None and not token_cipher.is_encrypted(value):
+            base[field] = token_cipher.encrypt(value)
     return SimpleNamespace(**base)

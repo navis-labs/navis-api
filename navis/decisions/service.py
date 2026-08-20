@@ -85,8 +85,25 @@ class DecisionService:
         )
         brief_id = compute_brief_id(org_id, reasoning_version, state_watermark)
         payload = [d.to_dict() for d in decisions]
+        # WHICH GOVERNING POLICY PRODUCED THIS BRIEF.
+        #
+        # `brief_max_items` and `brief_min_confidence` change what a founder
+        # sees, and until now nothing recorded that they had been applied: a
+        # brief built under an approved Adaptive policy was byte-indistinguishable
+        # from one built under code defaults, so "why did Monday show four items
+        # and Tuesday nine?" had no answer in the data.
+        #
+        # Read off the resolved policy rather than added as a parameter —
+        # `runtime_policy.resolve_policy` already stamps it and every caller
+        # passes that dict through — so no signature changes and no new plumbing.
+        # `None` means "no active policy", which is the honest value for a brief
+        # that ran on defaults and stays distinguishable from version 0.
+        policy_version = policy.get("policy_version") if policy else None
 
         # Idempotent upsert: replaying the same Reasoning rewrites the same brief.
+        # `policy_version` is in the update set, not the key: the brief id is
+        # (org, reasoning_version, state_watermark) and a policy change must
+        # REPLACE that generation's brief rather than mint a parallel one.
         stmt = (
             pg_insert(DailyBrief)
             .values(
@@ -96,10 +113,16 @@ class DecisionService:
                 state_watermark=state_watermark,
                 as_of=as_of,
                 decisions=payload,
+                policy_version=policy_version,
             )
             .on_conflict_do_update(
                 index_elements=["id"],
-                set_={"decisions": payload, "as_of": as_of, "state_watermark": state_watermark},
+                set_={
+                    "decisions": payload,
+                    "as_of": as_of,
+                    "state_watermark": state_watermark,
+                    "policy_version": policy_version,
+                },
             )
         )
         await self.db.execute(stmt)

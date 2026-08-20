@@ -36,6 +36,7 @@ from navis.api.workspace_fallback import (
 from navis.execution.models import ActionType, ExecutionOrigin
 from navis.execution.service import ExecutionService
 from navis.identity.authz import Principal, get_principal
+from navis.identity.throttle import rate_limit
 from navis.ml.generation.narratives import explanation, recommendation, summary
 from navis.ml.rag.context_builder import ContextBuilder, estimate_tokens
 from navis.ml.rag.grounding import Grounding, GroundedContext
@@ -1492,7 +1493,14 @@ def _question_response(
 # ── Endpoint ────────────────────────────────────────────────────────────────
 
 
-@router.post("/chat", response_model=ChatResponse)
+@router.post(
+    "/chat",
+    response_model=ChatResponse,
+    # T-23: the most expensive request in the product — embeds a query, runs a
+    # full-scan vector search over the org's corpus, folds state and calls an LLM.
+    # Counted per authenticated organization so one tenant cannot starve the rest.
+    dependencies=[Depends(rate_limit("chat", "rate_limit_chat_per_window"))],
+)
 async def chat(
     body: ChatRequest,
     p: Principal = Depends(get_principal),

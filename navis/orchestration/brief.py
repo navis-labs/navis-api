@@ -31,9 +31,11 @@ from navis.intelligence.insights import (
 )
 from navis.memory.envelope import EntityType
 from navis.memory.lineage import classifications_by_entity
+from navis.orchestration.runtime_policy import scheduled_work_allowed
+from navis.organization.contract import Capability
 from navis.platform.database import session_scope
 from navis.platform.events import DomainEvent, EventType, event_bus
-from navis.platform.monitoring import get_logger
+from navis.platform.monitoring import get_logger, org_context
 from navis.platform.monitoring.metrics import metrics
 from navis.platform.queue import celery_app, run_async
 from navis.reasoning.store import persist_signals
@@ -287,41 +289,100 @@ async def run_brief_for_org(org_id: uuid.UUID) -> dict:
         is caught: the brief is the founder-visible artefact and the next run
         re-proposes from it.
     """
-    async with session_scope() as db:
-        brief = await build_brief(db, org_id)
-        result = {
-            "org_id": str(org_id),
-            "brief_id": str(brief.id),
-            "decisions": len(brief.decisions),
-        }
-        try:
-            result["proposed"] = await propose_actions(db, org_id)
-        except Exception:  # noqa: BLE001 — see docstring: never lose the brief
-            logger.exception("propose_actions failed for org=%s after building the brief", org_id)
-            result["proposed"] = 0
-        return result
+    # Tenant log context for the whole pass (T-21). `org_id` is the task's only
+    # argument, but it is not taken on trust for anything that MATTERS: the gate
+    # below resolves entitlements from persisted org state, and every read inside
+    # `build_brief` is filtered on this same id. Binding it here is what makes the
+    # brief pipeline's logs attributable — previously every line carried "-".
+    with org_context(org_id):
+        async with session_scope() as db:
+            # ── ENTITLEMENT GATE (T-14) ──────────────────────────────────────
+            # `POST /brief/generate` has always required Capability.DECISION.
+            # This task produces the SAME artefact on a timer and required
+            # nothing, so a suspended or free-tier organization kept getting
+            # briefs built — and kept getting REQUESTED execution rows proposed
+            # from them. Asked before any work because building a brief folds the
+            # org's whole state and calls the LLM: the point is not to discard
+            # the result, it is not to spend it.
+            if not await scheduled_work_allowed(
+                db, org_id, Capability.DECISION, task="build_brief_for_org"
+            ):
+                return {"org_id": str(org_id), "skipped": "not_entitled"}
+
+            brief = await build_brief(db, org_id)
+            result = {
+                "org_id": str(org_id),
+                "brief_id": str(brief.id),
+                "decisions": len(brief.decisions),
+            }
+            try:
+                result["proposed"] = await propose_actions(db, org_id)
+            except Exception:  # noqa: BLE001 — see docstring: never lose the brief
+                logger.exception(
+                    "propose_actions failed for org=%s after building the brief", org_id
+                )
+                result["proposed"] = 0
+            return result
 
 
 async def propose_actions(db: AsyncSession, org_id: uuid.UUID) -> int:
     """Decision -> Execution bridge: turn the latest brief's decisions into
-    REQUESTED ExecutionRequests (idempotent; human approval still required)."""
+    REQUESTED ExecutionRequests (idempotent; human approval still required).
+
+    THIS IS ALSO WHERE THE ACCOUNT IS RECORDED (T-11).
+
+    `execution_requests.integration_id` says which of the organization's
+    connected accounts an action must be performed AS. It was added by migration
+    0042 and read all the way down — `worker._Lease` copies it, `__ctx__` carries
+    it, `resolve_integration` pins on it — but NO producer ever wrote one, so the
+    column was uniformly NULL and every send fell back to resolving by
+    (organization, provider).
+
+    That fallback is fail-closed, and that is exactly why the gap mattered: the
+    org-scoped resolvers refuse a multi-account organization with "recreate the
+    action from the message it answers". With no producer recording an account,
+    recreating it produced another NULL — so the refusal had no remedy and every
+    proactive reply for such an organization was permanently unsendable.
+
+    A reply is the case the column was built for and the one that can answer it
+    honestly: the thread it answers was captured on exactly one account, and
+    `memory_records.source_integration_id` has recorded which since the first
+    migration. So the account is RE-DERIVED from persisted lineage here, never
+    accepted from a payload — the same rule the worker applies to the tenant.
+
+    A thread whose lineage is missing or ambiguous contributes no id and the row
+    stays NULL, which is the honest "not recorded" the model documents. Nothing
+    is guessed, and nothing that already worked changes: a single-account
+    organization resolves to the same credential either way.
+    """
     from navis.decisions.service import DecisionService
     from navis.execution.models import ExecutionOrigin
     from navis.execution.proposer import propose_from_decisions
     from navis.execution.service import ExecutionService
+    from navis.memory.lineage import integrations_for_threads
 
     brief = await DecisionService(db).latest_brief(org_id)
     if brief is None:
         return 0
     proposed = propose_from_decisions(brief.decisions or [], org_id)
+    # ONE lookup for the whole brief, before the loop — see the lineage helper.
+    by_thread = await integrations_for_threads(
+        db, org_id, [str(p.payload.get("thread_id") or "") for p in proposed]
+    )
     svc = ExecutionService(db)
     created = 0
     for p in proposed:
+        integration_id = by_thread.get(str(p.payload.get("thread_id") or ""))
         _req, was_created = await svc.request(
             p.org_id, p.decision_id, p.action_type, p.payload,
             reasoning_signal_ids=p.reasoning_signal_ids,
             reasoning_version=p.reasoning_version,
             state_watermark=p.state_watermark,
+            # The connected account this reply must be sent FROM, re-derived
+            # above from the thread's own memory lineage. None when the thread
+            # names no single account; the credential boundary then refuses a
+            # multi-account org rather than picking one.
+            integration_id=integration_id,
             # THE proactive producer: these come from reasoning over signals the
             # founder has not seen, so the Action Center owns reviewing them.
             origin=ExecutionOrigin.PROACTIVE,

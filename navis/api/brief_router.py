@@ -20,6 +20,7 @@ from navis.decisions.service import DecisionService
 from navis.identity.authz import Principal, require_permission
 from navis.identity.dependencies import CurrentContext, get_current_context
 from navis.identity.permissions import Permission
+from navis.identity.throttle import rate_limit
 from navis.execution.proposer import decision_obligation_key
 from navis.execution.repository import ExecutionRepository
 from navis.execution.summary import execution_summary
@@ -84,7 +85,11 @@ async def _with_executions(db: AsyncSession, brief: Any) -> dict[str, Any]:
     return _serialize(brief, enriched)
 
 
-@router.post("/generate")
+@router.post(
+    "/generate",
+    # T-23: a whole-pipeline recompute (state fold -> reasoning -> decision -> LLM).
+    dependencies=[Depends(rate_limit("pipeline", "rate_limit_pipeline_per_window"))],
+)
 async def generate(
     p: Principal = Depends(require_capability(Capability.DECISION)),
     db: AsyncSession = Depends(get_session),
@@ -106,7 +111,10 @@ async def today(
     return await _with_executions(db, brief)
 
 
-@router.post("/propose-actions")
+@router.post(
+    "/propose-actions",
+    dependencies=[Depends(rate_limit("pipeline", "rate_limit_pipeline_per_window"))],
+)
 async def propose(
     p: Principal = Depends(require_permission(Permission.EXECUTE_ACTIONS)),
     _: Principal = Depends(require_capability(Capability.EXECUTION)),

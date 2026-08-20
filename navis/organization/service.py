@@ -72,7 +72,14 @@ class OrganizationService:
                 OnboardingStage.CREATED.value: utcnow().isoformat(),
             }
             await self.repo.flush()
-        await self.billing.set_plan(org_id, plan, actor_id=actor_id)  # seeds entitlements
+        # PROVISIONING IS A BILLING AUTHORITY. This is the moment an organization's
+        # starting plan is decided, so it is allowed to grant — and must be, or a
+        # production org could never reach FREE from nothing. Every OTHER path into
+        # `set_plan` defaults to unauthorized and can only keep or reduce
+        # capabilities (see BillingService.PlanEscalationDenied).
+        await self.billing.set_plan(
+            org_id, plan, actor_id=actor_id, billing_authorized=True
+        )  # seeds entitlements
 
     # ---- the capability authority ----
     async def can_use(self, org_id: uuid.UUID, capability: Capability | str) -> bool:

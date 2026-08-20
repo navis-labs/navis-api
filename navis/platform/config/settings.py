@@ -180,6 +180,22 @@ class Settings(BaseSettings):
     slack_client_id: str | None = None
     slack_client_secret: str | None = None
     slack_redirect_uri: str | None = None
+
+    # ---- Gmail push (authenticated Cloud Pub/Sub) ----
+    # Defined HERE rather than read straight from os.environ so they load from .env
+    # like the rest of config AND can be validated at startup. A real exported env
+    # var still wins (pydantic-settings reads the environment first), so production
+    # secret managers are unaffected.
+    #
+    # `topic` is what `GmailConnector.create_watch` registers with Google; the other
+    # three are what `verify_pubsub_request` checks on every push. They are a SET:
+    # registering a topic without pinning the audience and the pushing identity would
+    # open an authenticated-looking endpoint that verifies almost nothing, so
+    # `_enforce_production_safety` refuses that combination.
+    google_pubsub_topic: str | None = None       # projects/<p>/topics/<t>
+    google_pubsub_audience: str | None = None    # the push endpoint URL Google signs for
+    google_pubsub_sa_email: str | None = None    # push service account (email claim)
+    google_pubsub_sub: str | None = None         # push service account (stable OIDC `sub`)
     # Where OAuth callbacks bounce the browser after finishing the
     # code exchange. This is a FRONTEND URL (not a Google redirect_uri —
     # that stays pointed at the backend callback so client_secret stays
@@ -243,6 +259,30 @@ class Settings(BaseSettings):
     # — extended on each new failure). Redis-backed; fails OPEN if Redis is unavailable.
     login_max_attempts: int = 5
     login_lockout_seconds: int = 15 * 60
+
+    # ---- Per-ORGANIZATION rate limits on expensive routes (T-23) ----
+    # Tenant isolation for shared compute: `/chat` alone embeds a query, runs a
+    # full-scan vector search over the org's corpus, folds state and calls an LLM,
+    # and had NO throttle of any kind — one organization could exhaust the DB pool,
+    # the Redis pool, the LLM quota and the API event loop for everyone else.
+    #
+    # Counted per (bucket, organization) in a fixed window, so the limit a tenant
+    # spends is its own. Deliberately NOT tiered by plan: the product contract does
+    # not define per-plan request quotas, and inventing them here would put a
+    # commercial policy in an availability control. These are capacity guards.
+    #
+    # Generous by default — a demo must not trip them — and every value is
+    # overridable per deployment.
+    rate_limit_enabled: bool = True
+    rate_limit_window_seconds: int = 60
+    # Conversational AI: retrieval + generation, the most expensive request.
+    rate_limit_chat_per_window: int = 30
+    # Whole-pipeline recomputes (brief build, action proposal, intelligence
+    # projection) — heavier than chat but driven by a button, not a conversation.
+    rate_limit_pipeline_per_window: int = 12
+    # Context assembly + connector-backed reads: cheaper, but still vector search
+    # and/or an outbound provider call per request.
+    rate_limit_read_per_window: int = 120
 
     # ---- Storage (S3) ----
     aws_region: str = "us-east-1"
@@ -353,6 +393,12 @@ class Settings(BaseSettings):
             # org is seeded with, which grants breadth through real entitlement rows
             # the gate then evaluates normally.
             "plan defaults / seeded entitlements (new orgs get ENTERPRISE, not FREE)",
+            # Likewise not an authorization relaxation: the inline pass runs the
+            # SAME claim/authorize/execute code the worker runs, just on the API
+            # event loop and outside the rate limiter and retry budget. Named here
+            # because a developer should know side effects can fire from the web
+            # process without a worker running.
+            "execution worker isolation (approved actions may run inline on the API loop)",
         ]
 
     @property
@@ -375,6 +421,75 @@ class Settings(BaseSettings):
             problems.append("DATABASE_URL points at localhost")
         if self.show_docs:
             problems.append("SHOW_DOCS should be False (do not expose /docs publicly)")
+        # A wildcard origin is never a deliberate production choice. Starlette
+        # returns `Access-Control-Allow-Origin: *` for it, which makes every
+        # unauthenticated response readable by any site on the internet, and with
+        # `allow_headers=["*"]` a preflight for `Authorization` also succeeds — so
+        # any origin may call the API on behalf of anyone holding a token. Verified
+        # empirically before adding this check.
+        if any(o == "*" for o in self.cors_origins_list):
+            problems.append(
+                "CORS_ORIGINS must not contain '*' — name the frontend origins explicitly"
+            )
+        if not self.cors_origins_list:
+            problems.append("CORS_ORIGINS must name at least one frontend origin")
+        # SIGNAL-CRYPTO-002. Production storage was verified free of legacy
+        # plaintext in TASK 6.4.1, and this switch is what keeps it that way: with
+        # it off, an untagged token is silently trusted again and encryption-at-rest
+        # can regress unnoticed (which is exactly how it regressed the first time).
+        #
+        # Deliberately coupled to ENVIRONMENT rather than defaulted to True: turning
+        # it on where tokens have NOT been migrated would break those integrations,
+        # so it must stay an explicit per-environment decision. Requiring it here
+        # means the operator who sets ENVIRONMENT=production is told, at that
+        # moment, that this is the other half of the same change.
+        if not self.signals_reject_legacy_plaintext:
+            problems.append(
+                "SIGNALS_REJECT_LEGACY_PLAINTEXT must be true in production "
+                "(run navis.signals.token_backfill.reencrypt_legacy_tokens first, "
+                "then confirm zero plaintext tokens)"
+            )
+        # EXECUTION_INLINE_FALLBACK. The setting's own docstring already states the
+        # contract — "In production, run a real Celery worker and set this to
+        # False" — and nothing enforced it, while the default is True. Left on, the
+        # approve endpoint schedules `asyncio.create_task(_execute())` and the
+        # provider call (a real Gmail send, a real Calendar write) runs on the API
+        # process's event loop, sharing it with every other tenant's requests.
+        #
+        # It is not only a latency concern. The inline pass bypasses the worker's
+        # operational envelope: the per-provider rate limiter, the retry budget,
+        # dead-lettering and stale-execution recovery all live on the Celery path.
+        # A tenant approving a batch would run unthrottled side effects inside the
+        # web process, and a process restart mid-flight loses the pass with no
+        # lease to recover from.
+        #
+        # A startup refusal rather than a silent override, for the same reason as
+        # every other check here: a production box that quietly behaved like
+        # development is exactly the failure this function exists to prevent.
+        if self.execution_inline_fallback:
+            problems.append(
+                "EXECUTION_INLINE_FALLBACK must be false in production "
+                "(run a Celery worker; the inline pass bypasses rate limiting, "
+                "retries and dead-lettering, and executes on the API event loop)"
+            )
+        # Gmail push is all-or-nothing. Registering a Pub/Sub topic makes Google POST
+        # to the public webhook, and that endpoint can only authenticate the push if it
+        # knows BOTH the audience Google signs for and which service account is allowed
+        # to send it. Half-configured is the dangerous state — it looks provisioned
+        # while pinning nothing — so it is a startup error rather than a runtime
+        # surprise. Configuring none of them is fine: the endpoint then refuses every
+        # request (503) and ingestion runs on the polling schedule.
+        if self.google_pubsub_topic:
+            if not self.google_pubsub_audience:
+                problems.append(
+                    "GOOGLE_PUBSUB_TOPIC is set but GOOGLE_PUBSUB_AUDIENCE is not — "
+                    "push tokens could not be audience-verified"
+                )
+            if not (self.google_pubsub_sa_email or self.google_pubsub_sub):
+                problems.append(
+                    "GOOGLE_PUBSUB_TOPIC is set but neither GOOGLE_PUBSUB_SA_EMAIL nor "
+                    "GOOGLE_PUBSUB_SUB is — the pushing service account would not be pinned"
+                )
         if problems:
             raise ValueError("Insecure production config: " + "; ".join(problems))
         return self
@@ -404,9 +519,32 @@ class Settings(BaseSettings):
         return "sslmode=require" in self.database_url or "neon.tech" in self.database_url
 
 
+class ConfigurationError(RuntimeError):
+    """Startup configuration is invalid. Carries the reasons, never the values."""
+
+
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    """Build the settings singleton, converting a validation failure into a message
+    that CANNOT carry configuration values.
+
+    pydantic's `ValidationError` renders `input_value=` alongside the reason — the
+    whole settings dict, truncated to a fixed head and tail. That truncation is a
+    length accident, not a redaction: which fields land inside the window depends on
+    field order, so a future field could put a key or password into a message that
+    is printed by the process supervisor, shipped to log aggregation and pasted into
+    tickets. Re-raising with only the reason strings removes the possibility rather
+    than relying on where the ellipsis falls.
+    """
+    from pydantic import ValidationError
+
+    try:
+        return Settings()
+    except ValidationError as exc:
+        reasons = "; ".join(
+            str(e.get("msg", "")).replace("Value error, ", "") for e in exc.errors()
+        )
+        raise ConfigurationError(f"invalid configuration: {reasons}") from None
 
 
 settings = get_settings()

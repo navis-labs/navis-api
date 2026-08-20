@@ -139,3 +139,63 @@ async def classifications_by_entity(
         if classification:
             out.setdefault(str(entity_id), set()).add(classification)
     return {k: frozenset(v) for k, v in out.items()}
+
+
+async def integrations_for_threads(
+    db: AsyncSession, org_id: uuid.UUID, thread_ids: Iterable[str]
+) -> dict[str, uuid.UUID]:
+    """thread_id -> the ONE connected account that captured it. Ambiguity omitted.
+
+    WHY THIS IS A LINEAGE QUESTION (T-11). `execution_requests.integration_id`
+    records which of an organization's connected accounts an action must be
+    performed AS, and the honest source for a reply is the account the thread
+    actually arrived on. `memory_records` already carries exactly that on every
+    fact — `source_integration_id`, mandatory provenance since the first
+    migration — so this re-DERIVES the account from persisted state rather than
+    accepting one from a caller. Same shape as the two lookups above: read-only,
+    org-scoped, and it never fabricates.
+
+    ONE QUERY for the whole brief, served by `ix_mem_entity`
+    (organization_id, entity_type, entity_id). A brief proposes at most
+    `brief_max_items` actions, and issuing a lookup per proposal would put that
+    many round trips on the scheduled path.
+
+    A THREAD WITH SEVERAL CAPTURING ACCOUNTS IS OMITTED, NOT RANKED. Two
+    connected mailboxes can both hold the same conversation (a shared thread, a
+    forwarded chain), and nothing about the thread says which identity a reply
+    should come from. Omitting leaves `integration_id` NULL, which the credential
+    boundary already treats as "not recorded" — and `resolve_integration` then
+    refuses a multi-account organization outright. Guessing here would be the
+    newest-row heuristic this whole boundary exists to remove.
+
+    Org isolation is enforced on `memory_records.organization_id`, and
+    `entity_id` is itself a UUIDv5 over the organization, so a thread id shared
+    between two tenants produces two different entity ids and cannot collide.
+    """
+    from navis.memory.envelope import EntityType
+    from navis.memory.ids import entity_id as compute_entity_id
+
+    wanted = [t for t in dict.fromkeys(thread_ids) if t]
+    if not wanted:
+        return {}
+    by_entity = {
+        compute_entity_id(org_id, EntityType.THREAD.value, str(t)): str(t) for t in wanted
+    }
+    rows = (
+        await db.execute(
+            select(MemoryRecord.entity_id, MemoryRecord.source_integration_id)
+            .where(
+                MemoryRecord.organization_id == org_id,
+                MemoryRecord.entity_type == EntityType.THREAD.value,
+                MemoryRecord.entity_id.in_(list(by_entity)),
+                MemoryRecord.source_integration_id.isnot(None),
+            )
+            .distinct()
+        )
+    ).all()
+    candidates: dict[str, set[uuid.UUID]] = {}
+    for entity, integration_id in rows:
+        thread_id = by_entity.get(entity)
+        if thread_id is not None and integration_id is not None:
+            candidates.setdefault(thread_id, set()).add(integration_id)
+    return {t: next(iter(ids)) for t, ids in candidates.items() if len(ids) == 1}

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from typing import Iterator
 
 from navis.platform.config import settings
 
@@ -35,6 +37,34 @@ def set_org_id(value: str | None) -> None:
 
 def get_org_id() -> str:
     return _org_id.get()
+
+
+@contextmanager
+def org_context(org_id) -> Iterator[None]:
+    """Bind `org_id` to the logging context for the duration of a block.
+
+    WHY THIS EXISTS. `set_org_id` was called in exactly ONE place — `get_principal`
+    — so every log line emitted by a Celery task, an event subscriber or an outbox
+    relay carried `org_id="-"`. Since sync, brief generation, execution,
+    observation, learning, intelligence and adaptive all run in workers, the
+    majority of tenant-affecting work in the system was unattributable in logs.
+    Individual call sites compensated with `logger.info("... org=%s", org_id)` in
+    the message body, which is not a field and cannot be filtered on.
+
+    RESTORES rather than clears on exit. Clearing would be wrong on the request
+    path, where an inner block must not wipe the org the middleware bound —
+    `ContextVar.reset(token)` puts back exactly what was there before, so nesting
+    and reuse of a worker thread both behave.
+
+    Takes anything stringable (UUID or str) so callers hand it the value they
+    already hold; None binds "-", which is the same "unknown tenant" marker the
+    default uses.
+    """
+    token = _org_id.set(str(org_id) if org_id else "-")
+    try:
+        yield
+    finally:
+        _org_id.reset(token)
 
 
 class _RequestIdFilter(logging.Filter):

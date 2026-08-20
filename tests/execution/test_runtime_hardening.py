@@ -183,7 +183,7 @@ def gmail_harness(monkeypatch):
     monkeypatch.setattr(_senders, "session_scope", lambda: _Session())
     monkeypatch.setattr(
         _senders, "resolve_integration",
-        lambda db, org_id, provider: _resolved(integration),
+        lambda db, org_id, provider, **_: _resolved(integration),
     )
     monkeypatch.setattr("navis.signals.google.oauth.refresh_access_token", _refresher)
     return SimpleNamespace(state=state, integration=integration)
@@ -197,7 +197,7 @@ async def _entitled(*orgs):
     org_repo = FakeOrgRepo()
     ent = EntitlementService(org_repo)
     for org in orgs:
-        await BillingService(org_repo, ent).set_plan(org, Plan.ENTERPRISE)
+        await BillingService(org_repo, ent).set_plan(org, Plan.ENTERPRISE, billing_authorized=True)
     return ent
 
 
@@ -399,7 +399,7 @@ async def test_a_rotated_token_is_persisted_encrypted_in_its_own_transaction(mon
     monkeypatch.setattr(_senders, "session_scope", lambda: _Session())
     monkeypatch.setattr(
         _senders, "resolve_integration",
-        lambda db, org_id, provider: _resolved(integration),
+        lambda db, org_id, provider, **_: _resolved(integration),
     )
     monkeypatch.setattr("navis.signals.google.oauth.refresh_access_token", _refresher)
 

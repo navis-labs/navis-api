@@ -335,7 +335,7 @@ async def test_member_invite_assign_remove():
     member = await db.get(Membership, m.id)
     assert member.role == Role.ADMIN
 
-    await svc.remove(org_id=ORG_A, user_id=m.user_id, actor_id=ACTOR)
+    await svc.remove(org_id=ORG_A, user_id=m.user_id, actor_id=ACTOR, actor_permissions=founder)
     assert await svc.list_members(ORG_A) == []
     # Removal bulk-revokes the user's tokens.
     user = await db.get(User, m.user_id)
@@ -481,7 +481,7 @@ async def test_cannot_remove_or_demote_last_founder():
     founder_uid = _uuid.uuid4()
     db.add(Membership(user_id=founder_uid, organization_id=ORG_A, role=Role.FOUNDER))
     with pytest.raises(MemberConflict):
-        await svc.remove(org_id=ORG_A, user_id=founder_uid, actor_id=ACTOR)
+        await svc.remove(org_id=ORG_A, user_id=founder_uid, actor_id=ACTOR, actor_permissions=ALL_PERMISSIONS)
     with pytest.raises(MemberConflict):
         await svc.assign_role(org_id=ORG_A, user_id=founder_uid, role=Role.EMPLOYEE, actor_id=ACTOR, actor_permissions=ALL_PERMISSIONS)
 

@@ -14,7 +14,6 @@ and ingests the returned events.
 """
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -173,7 +172,13 @@ class GmailConnector(WorkspaceConnector):
         return SyncResult(events=events, cursor={"history_id": next_history_id})
 
     async def create_watch(self, ctx: SignalContext, client: GmailClient) -> dict[str, Any]:
-        topic = os.environ.get("GOOGLE_PUBSUB_TOPIC")
+        # Read through `settings`, not `os.environ`. The production startup check
+        # keys off `settings.google_pubsub_topic` to demand the matching audience and
+        # service identity (settings._enforce_production_safety); a second, narrower
+        # source meant a topic supplied via .env satisfied the validator's trigger
+        # while this call never saw it — validation and behaviour disagreeing about
+        # whether push is configured at all.
+        topic = settings.google_pubsub_topic
         if not topic:
             logger.warning("gmail watch skipped org=%s: no Pub/Sub topic configured", ctx.org_id)
             return {}

@@ -30,7 +30,13 @@ def test_production_spellings_are_recognised(value):
     """Case and stray whitespace are deployment noise, not a different environment."""
     s = Settings(environment=value, _env_file=None, secret_key="x" * 40,  # type: ignore[call-arg]
                  debug=False, show_docs=False,
-                 database_url="postgresql://u:p@db.example.com/n")
+                 database_url="postgresql://u:p@db.example.com/n",
+                 # TASK 6.4.4: production now also requires the legacy-plaintext
+                 # sunset switch, so a "valid production config" includes it.
+                 # TASK 6.5.1 (T-20): ...and a real Celery worker, so the inline
+                 # execution fallback must be off.
+                 signals_reject_legacy_plaintext=True,
+                 execution_inline_fallback=False)
     assert s.environment is Environment.PRODUCTION
     assert s.is_production is True
 
@@ -61,7 +67,9 @@ def test_production_still_enforces_the_config_safety_net():
 def test_relaxed_controls_are_empty_in_production_and_listed_otherwise():
     prod = Settings(environment="production", _env_file=None, secret_key="x" * 40,  # type: ignore[call-arg]
                     debug=False, show_docs=False,
-                    database_url="postgresql://u:p@db.example.com/n")
+                    database_url="postgresql://u:p@db.example.com/n",
+                    signals_reject_legacy_plaintext=True,
+                    execution_inline_fallback=False)
     assert prod.relaxed_controls() == []
 
     dev = Settings(environment="development", _env_file=None)  # type: ignore[call-arg]

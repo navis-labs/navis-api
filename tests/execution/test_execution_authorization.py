@@ -82,7 +82,7 @@ async def _entitled_org(org_id=ORG_A, plan=Plan.ENTERPRISE):
     """A fully provisioned organization, through the real billing path."""
     org_repo = FakeOrgRepo()
     ent = EntitlementService(org_repo)
-    await BillingService(org_repo, ent).set_plan(org_id, plan)
+    await BillingService(org_repo, ent).set_plan(org_id, plan, billing_authorized=True)
     return org_repo, ent
 
 
@@ -265,12 +265,12 @@ async def test_a_plan_downgrade_after_approval_blocks_the_queued_action():
     org_repo = FakeOrgRepo()
     ent = EntitlementService(org_repo)
     billing = BillingService(org_repo, ent)
-    await billing.set_plan(ORG_A, Plan.TEAM)
+    await billing.set_plan(ORG_A, Plan.TEAM, billing_authorized=True)
     repo.entitlements = ent
     req = await _approved_send(repo)
     assert await ent.can_use(ORG_A, Capability.EXECUTION) is True
 
-    await billing.set_plan(ORG_A, Plan.FREE)
+    await billing.set_plan(ORG_A, Plan.FREE, billing_authorized=True)
 
     provider = _Tripwire()
     await execute_pass(repo, providers={"send_email": provider}, policy=FAST, max_attempts=3)
@@ -381,8 +381,8 @@ async def test_authorization_uses_the_persisted_org_not_the_payload():
     repo = FakeExecutionRepo()
     org_repo = FakeOrgRepo()
     ent = EntitlementService(org_repo)
-    await BillingService(org_repo, ent).set_plan(ORG_A, Plan.ENTERPRISE)
-    await BillingService(org_repo, ent).set_plan(ORG_B, Plan.ENTERPRISE)
+    await BillingService(org_repo, ent).set_plan(ORG_A, Plan.ENTERPRISE, billing_authorized=True)
+    await BillingService(org_repo, ent).set_plan(ORG_B, Plan.ENTERPRISE, billing_authorized=True)
     repo.entitlements = ent
 
     forged = {
@@ -467,8 +467,8 @@ async def test_revoking_one_org_does_not_affect_another():
     repo = FakeExecutionRepo()
     org_repo = FakeOrgRepo()
     ent = EntitlementService(org_repo)
-    await BillingService(org_repo, ent).set_plan(ORG_A, Plan.ENTERPRISE)
-    await BillingService(org_repo, ent).set_plan(ORG_B, Plan.ENTERPRISE)
+    await BillingService(org_repo, ent).set_plan(ORG_A, Plan.ENTERPRISE, billing_authorized=True)
+    await BillingService(org_repo, ent).set_plan(ORG_B, Plan.ENTERPRISE, billing_authorized=True)
     repo.entitlements = ent
 
     req_a = await _approved_send(repo, ORG_A)
@@ -489,8 +489,8 @@ async def test_an_orgs_kill_switch_does_not_kill_another_orgs_work():
     repo = FakeExecutionRepo()
     org_repo = FakeOrgRepo()
     ent = EntitlementService(org_repo)
-    await BillingService(org_repo, ent).set_plan(ORG_A, Plan.ENTERPRISE)
-    await BillingService(org_repo, ent).set_plan(ORG_B, Plan.ENTERPRISE)
+    await BillingService(org_repo, ent).set_plan(ORG_A, Plan.ENTERPRISE, billing_authorized=True)
+    await BillingService(org_repo, ent).set_plan(ORG_B, Plan.ENTERPRISE, billing_authorized=True)
     repo.entitlements = ent
     req_a = await _approved_send(repo, ORG_A)
     req_b = await _approved_send(repo, ORG_B)

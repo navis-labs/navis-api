@@ -12,9 +12,9 @@ network access to Google's certs.
 """
 from __future__ import annotations
 
-import os
 from typing import Any, Callable
 
+from navis.platform.config import settings
 from navis.platform.monitoring import get_logger
 from navis.platform.monitoring.metrics import metrics
 
@@ -62,13 +62,31 @@ _PUBSUB_CLOCK_SKEW_SECONDS = 10
 
 
 def _default_decoder(token: str, audience: str) -> dict[str, Any]:  # pragma: no cover - network
+    """Signature + exp + audience, via Google's own certificate discovery.
+
+    `verify_oauth2_token` fetches and caches Google's public certs, selects the key
+    by the token's `kid`, and rejects anything not signed by it — so an unsigned
+    token (`alg: none`) and an algorithm-downgrade attempt both fail here, and no
+    rotating key material is hard-coded.
+
+    The audience is passed UNCONDITIONALLY. It used to be `audience or None`, and
+    `None` tells this function to SKIP audience verification entirely — so an
+    unset `GOOGLE_PUBSUB_AUDIENCE` silently downgraded the check to "signed by
+    Google", which any Google-issued OIDC token satisfies. `verify_pubsub_request`
+    now refuses to call this without an audience, and this signature no longer
+    admits the empty string that produced that behaviour.
+    """
     from google.auth.transport import requests as g_requests
     from google.oauth2 import id_token
 
+    if not audience:
+        raise PubSubAuthError(
+            "refusing to verify without an audience", reason="not_configured"
+        )
     return id_token.verify_oauth2_token(
         token,
         g_requests.Request(),
-        audience or None,
+        audience,
         clock_skew_in_seconds=_PUBSUB_CLOCK_SKEW_SECONDS,
     )
 
@@ -84,11 +102,38 @@ def verify_pubsub_request(
     """Verify the bearer JWT and return its claims, or raise PubSubAuthError. Every outcome
     is metered (pubsub.auth.success / pubsub.auth.failure{reason}) so an attack — a burst of
     bad audience/signature/issuer — is visible instead of silent."""
-    audience = audience or os.environ.get("GOOGLE_PUBSUB_AUDIENCE")
-    sa_email = sa_email or os.environ.get("GOOGLE_PUBSUB_SA_EMAIL")
-    expected_sub = expected_sub or os.environ.get("GOOGLE_PUBSUB_SUB")
+    audience = audience or settings.google_pubsub_audience
+    sa_email = sa_email or settings.google_pubsub_sa_email
+    expected_sub = expected_sub or settings.google_pubsub_sub
 
     try:
+        # FAIL CLOSED ON MISSING CONFIGURATION.
+        #
+        # This is the defect TASK 6.4.2 exists to close. Verification used to be
+        # SKIPPED entirely when the audience was unset (the router asked
+        # `pubsub_auth_configured()` first), which left a public endpoint that
+        # enqueues Google sync work accepting anonymous POSTs. An unconfigured
+        # verifier must refuse, never wave the request through — and the check
+        # lives HERE as well as at the route so no future caller can reintroduce
+        # the skip by forgetting to ask.
+        #
+        # Both halves are required. The audience proves the token was minted for
+        # THIS endpoint; the identity proves it was minted for the service account
+        # we authorized. Without the identity, any Google-issued token carrying our
+        # audience would pass — including one an attacker obtained for their own
+        # push subscription pointed at our URL.
+        if not audience:
+            raise PubSubAuthError(
+                "Pub/Sub push authentication is not configured "
+                "(GOOGLE_PUBSUB_AUDIENCE)",
+                reason="not_configured",
+            )
+        if not (sa_email or expected_sub):
+            raise PubSubAuthError(
+                "Pub/Sub push authentication is not configured "
+                "(GOOGLE_PUBSUB_SA_EMAIL or GOOGLE_PUBSUB_SUB)",
+                reason="not_configured",
+            )
         if not authorization_header or not authorization_header.lower().startswith("bearer "):
             raise PubSubAuthError("missing bearer token", reason="missing_bearer")
         token = authorization_header.split(" ", 1)[1].strip()
@@ -110,4 +155,16 @@ def verify_pubsub_request(
 
 
 def pubsub_auth_configured() -> bool:
-    return bool(os.environ.get("GOOGLE_PUBSUB_AUDIENCE"))
+    """Is authenticated push FULLY provisioned?
+
+    Both halves, deliberately: the audience alone is not a configuration, it is a
+    partial one, and a partial configuration used to read as "configured" and
+    disable the service-account check. The route uses this to answer 503 (not yet
+    provisioned) rather than 401 (you are not Google) — a distinction an operator
+    needs, and one that never widens what is accepted: `verify_pubsub_request`
+    re-checks the same condition itself.
+    """
+    return bool(
+        settings.google_pubsub_audience
+        and (settings.google_pubsub_sa_email or settings.google_pubsub_sub)
+    )

@@ -38,13 +38,21 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 import pytest
+import pytest_asyncio
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("NAVIS_TEST_DATABASE_URL"),
-    reason="set NAVIS_TEST_DATABASE_URL (disposable Postgres) to run workflow tests",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not os.environ.get("NAVIS_TEST_DATABASE_URL"),
+        reason="set NAVIS_TEST_DATABASE_URL (disposable Postgres) to run workflow tests",
+    ),
+    # ONE event loop for the module, because the engine below is module-scoped
+    # and asyncpg connections bind to the loop that created them. Same pattern as
+    # `test_cross_tenant_isolation_postgres.py`.
+    pytest.mark.asyncio(loop_scope="module"),
+]
 
 ORG = uuid.UUID("aaaaaaaa-0000-4000-8000-000000000001")
 NOW = datetime(2026, 8, 19, 9, 0, tzinfo=timezone.utc)
@@ -58,24 +66,172 @@ REFRESH_SECRET = "1//04WORKFLOW_REFRESH_TOKEN"
 # ── Infrastructure ─────────────────────────────────────────────────────
 
 
-@pytest.fixture()
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def engine():
+    """ONE engine and ONE `create_all` for the whole module. NEVER `drop_all`.
+
+    WHY THE SCHEMA IS NOW PERSISTENT (TASK 6.6.1.2).
+    ------------------------------------------------
+    This fixture used to run `drop_all` + `create_all` PER TEST, and that is what
+    stopped every test in this module from reaching an assertion against Neon.
+
+    Recreating the schema assigns every PostgreSQL ENUM a NEW `pg_type` oid while
+    connections already in the pool keep the old oids in their asyncpg type-codec
+    cache. The next parameterised query over an enum column then fails in one of
+    two ways, both reproduced with NO application code:
+
+        asyncpg.InternalServerError: cache lookup failed for type 566818
+          [SQL: ... WHERE integrations.provider IN ($1::integrationprovider, ...)]
+
+        asyncpg.InternalClientError: could not resolve query result and/or
+          argument types in 6 attempts
+
+    `statement_cache_size=0` DOES NOT FIX IT, and the comment that used to sit
+    here claiming otherwise was wrong. Measured: a standalone script with no
+    application code, recreating the schema and then reusing the endpoint,
+    reproduces `cache lookup failed for type NNNN` with the statement cache
+    DISABLED *and* ENABLED. The failure is server-side — Neon's PgBouncer
+    multiplexes onto backends that outlive the client connection and still hold
+    plan/catalog state referencing the dropped enum oids — so no client-side cache
+    setting can prevent it. (`statement_cache_size=0` is still correct to keep for
+    a pooled endpoint; it just addresses a different problem.)
+
+    The `InternalClientError` variant has a second, client-side contribution:
+    with the cache disabled asyncpg uses ANONYMOUS prepared statements
+    (`connection.py`: `stmt_name = ''`), and its re-introspection loop then cannot
+    converge — it notes the introspection query "has blown away the anonymous
+    statement we've prepared", computes
+    `need_reprepare = not intro_stmt.name and not statement.name` (always True in
+    that configuration) and never acts on it, so `_init_types()` keeps reporting
+    missing codecs until `tries > 5` raises.
+
+    Either way the TRIGGER is the same and it is the only thing worth removing:
+    dropping and recreating the schema underneath a pooled endpoint. With the
+    schema built once and never dropped, no enum oid ever changes and neither
+    symptom is reachable. That is the same persistent-schema pattern
+    `test_cross_tenant_isolation_postgres.py`,
+    `test_membership_concurrency_postgres.py` and
+    `test_token_backfill_postgres.py` already use, all three of which run green
+    against Neon; each test cleans only its OWN rows (see `_purge_workflow_rows`).
+
+    Dropping the schema also silently destroyed the sibling modules' persistent
+    schema whenever this module ran first against the same disposable database.
+    """
     from sqlalchemy.ext.asyncio import create_async_engine
 
     import navis.registry  # noqa: F401 — registers every model AND the subscribers
     from navis.platform.database import Base
 
     url = os.environ["NAVIS_TEST_DATABASE_URL"]
-    assert "neon.tech" not in url, "refusing to run workflow tests against Neon"
-    eng = create_async_engine(url)
+    # NAME allowlist, not a host denylist. The allowlist still matters even though
+    # nothing is dropped any more: this module WRITES real rows, and it must only
+    # ever do that to a disposable database.
+    #
+    # The original guard here was `"neon.tech" not in url`, which got it backwards
+    # in both directions: it refused a throwaway database that happens to live on a
+    # managed host, while happily writing to a local `navis` or `postgres` that may
+    # be someone's working copy. See
+    # `test_observation_contract._assert_disposable_database`.
+    name = urlsplit(url).path.lstrip("/")
+    assert name.startswith("navis_test"), (
+        f"refusing to run against database {name!r}: point "
+        "NAVIS_TEST_DATABASE_URL at a disposable database named navis_test*"
+    )
+    # `statement_cache_size=0` mirrors what production uses on a pooled endpoint
+    # (`settings.db_is_pooled` -> "PgBouncer transaction pooling: no server-side
+    # prepared statements"). Kept for parity; it is NOT what fixes the enum-oid
+    # failure — see this fixture's docstring for the measurement.
+    eng = create_async_engine(
+        url, connect_args={"statement_cache_size": 0, "prepared_statement_cache_size": 0}
+    )
+    # CREATE ONLY. Never `drop_all` — see the docstring.
     async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
     yield eng
     await eng.dispose()
 
 
-@pytest.fixture()
+# Every organization id this module creates. `_purge_workflow_rows` deletes only
+# these, which is what replaces `drop_all` now that the schema is persistent.
+ORG_OTHER = uuid.UUID("bbbbbbbb-0000-4000-8000-000000000002")
+_MODULE_ORGS = (ORG, ORG_OTHER)
+_MODULE_USER_EMAILS = (FOUNDER, "other@example.com")
+
+
+async def _purge_workflow_rows(Session) -> None:
+    """Delete ONLY the rows this module creates, for both of its organizations.
+
+    Called before AND after every test. Before, because a run that dies mid-test
+    leaves rows behind and the next run collides on `organizations_pkey` — the
+    schema is built once and never dropped, so the fixture has to be idempotent
+    on entry rather than relying on a clean database.
+
+    ORM `delete()` with `in_()` rather than raw `text(... = ANY(:ids))`: asyncpg
+    cannot infer the element type of a bare Python list of UUIDs and its
+    introspection retry loop gives up, while the typed ORM construct carries the
+    column type. (Same note as `test_cross_tenant_isolation_postgres._purge_tenants`.)
+    """
+    from sqlalchemy import delete
+
+    from navis.adaptive.models import PolicySnapshot
+    from navis.decisions.models import DailyBrief
+    from navis.execution.models import (
+        ExecutionDeadLetter,
+        ExecutionOutbox,
+        ExecutionRequest,
+    )
+    from navis.identity.enterprise_models import AuditLog
+    from navis.identity.models import Integration, Membership, Organization, User
+    from navis.intelligence.models import IntelligenceInsight
+    from navis.learning.models import LearningEvent
+    from navis.memory.models import MemoryOutbox, MemoryRecord
+    from navis.observation.models import Outcome
+    from navis.organization.models import (
+        OrganizationEntitlement,
+        OrganizationFeatureFlag,
+        OrganizationLifecycle,
+        OrganizationMetrics,
+        OrganizationOnboarding,
+        OrganizationProfile,
+    )
+    from navis.signals.models import SignalEventRecord, SignalOutbox
+    from navis.state.v2.snapshots import StateSnapshot
+
+    # Children before parents: memory_records FKs signal_events, execution rows FK
+    # integrations, and everything FKs organizations.
+    ordered = (
+        ExecutionDeadLetter, ExecutionOutbox, ExecutionRequest,
+        Outcome, LearningEvent, IntelligenceInsight, PolicySnapshot,
+        DailyBrief, StateSnapshot, MemoryOutbox, MemoryRecord,
+        SignalOutbox, SignalEventRecord, Integration, Membership, AuditLog,
+        OrganizationEntitlement, OrganizationFeatureFlag, OrganizationLifecycle,
+        OrganizationMetrics, OrganizationOnboarding, OrganizationProfile,
+    )
+    async with Session() as s:
+        for model in ordered:
+            column = getattr(model, "organization_id", None)
+            if column is None:
+                continue
+            await s.execute(delete(model).where(column.in_(list(_MODULE_ORGS))))
+        # Drafts hang off the execution rows, which are gone by now.
+        try:
+            from navis.execution.drafts.models import ActionDraft
+
+            await s.execute(
+                delete(ActionDraft).where(
+                    ActionDraft.organization_id.in_(list(_MODULE_ORGS))
+                )
+            )
+        except (ImportError, AttributeError):  # pragma: no cover - optional table
+            pass
+        await s.execute(delete(User).where(User.email.in_(list(_MODULE_USER_EMAILS))))
+        await s.execute(
+            delete(Organization).where(Organization.id.in_(list(_MODULE_ORGS)))
+        )
+        await s.commit()
+
+
+@pytest_asyncio.fixture(loop_scope="module")
 async def Session(engine, monkeypatch):
     """A sessionmaker on the DISPOSABLE engine, installed everywhere the
     production path would otherwise reach for the global one."""
@@ -93,12 +249,38 @@ async def Session(engine, monkeypatch):
                 await s.rollback()
                 raise
 
-    # Each of these modules imported `session_scope` by value at import time, so
-    # patching the source module alone would miss them. Every one of them opens a
-    # session on the production engine in production.
+    # ── THE STRUCTURAL GUARD, not a hand-maintained list ──────────────────
+    #
+    # FOURTEEN modules do `from navis.platform.database import session_scope` at
+    # import time, binding the function BY VALUE; this fixture named three of
+    # them. The gap is not theoretical: publishing BRIEF_READY runs
+    # `org_provisioning.on_first_brief`, and relaying ACTION_EXECUTED runs the
+    # Learning and Intelligence subscribers — none of which were patched here, so
+    # each opened a session against the URL in `.env`, which is PRODUCTION. That
+    # actually happened on 2026-08-20 and was stopped only by a foreign key.
+    #
+    # `AsyncSessionLocal` is the choke point that closes all fourteen at once.
+    # `session_scope` is a contextmanager-wrapped function whose underlying
+    # `__globals__` IS `navis.platform.database.session.__dict__`, so it resolves
+    # `AsyncSessionLocal` from that module AT CALL TIME — patching the symbol
+    # there reaches every by-value importer, including ones added later. It is
+    # also the only place in `navis/**` that references it.
+    monkeypatch.setattr(
+        "navis.platform.database.session.AsyncSessionLocal", maker, raising=True
+    )
+
+    # The explicit patches stay: they install `_scope`, which COMMITS on exit,
+    # which several of these call sites rely on.
     for target in (
         "navis.execution.providers._senders.session_scope",
         "navis.observation.subscribers.session_scope",
+        "navis.learning.subscribers.session_scope",
+        "navis.intelligence.subscribers.session_scope",
+        "navis.orchestration.org_provisioning.session_scope",
+        "navis.orchestration.brief.session_scope",
+        "navis.ml.embeddings.subscribers.session_scope",
+        "navis.memory.service.session_scope",
+        "navis.identity_resolution.service.session_scope",
         "navis.platform.database.session_scope",
     ):
         monkeypatch.setattr(target, _scope, raising=False)
@@ -123,7 +305,45 @@ async def Session(engine, monkeypatch):
     return maker
 
 
-@pytest.fixture()
+@pytest.fixture(autouse=True)
+def forbid_production_database():
+    """FAIL LOUDLY if anything in this module opens the production engine.
+
+    The patches above are the fix; this is the alarm that proves they held. A
+    missed `session_scope` used to degrade SILENTLY into a production connection
+    — the failure mode is invisible precisely because it succeeds. Any checkout
+    of the real engine now raises instead, naming the problem.
+
+    Autouse and independent of `Session`, so it is armed even for a test that
+    never asks for a session, and it cannot be forgotten by a future test.
+    """
+    from sqlalchemy import event as sa_event
+
+    from navis.platform.database import session as db_session
+
+    breaches: list[str] = []
+
+    def _refuse(*_args, **_kwargs):
+        breaches.append("production engine checkout")
+        raise AssertionError(
+            "a code path opened a connection on the PRODUCTION engine during this "
+            "test. Some module imported `session_scope` BY VALUE at import time, "
+            "so patching it elsewhere did not reach it — patch that module's own "
+            "`session_scope`, or rely on the AsyncSessionLocal patch in `Session`."
+        )
+
+    pool = db_session.engine.sync_engine.pool
+    sa_event.listen(pool, "connect", _refuse)
+    sa_event.listen(pool, "checkout", _refuse)
+    try:
+        yield
+    finally:
+        sa_event.remove(pool, "connect", _refuse)
+        sa_event.remove(pool, "checkout", _refuse)
+    assert not breaches, breaches
+
+
+@pytest_asyncio.fixture(loop_scope="module")
 async def org(Session):
     """A provisioned organization with a real Gmail + Calendar grant.
 
@@ -143,6 +363,11 @@ async def org(Session):
     from navis.signals.crypto import token_cipher
     from navis.signals.google.oauth import GOOGLE_SCOPES
 
+    # The schema is persistent now, so cleaning is this fixture's job rather than
+    # `drop_all`'s. On ENTRY as well as exit: a run that died mid-test would
+    # otherwise collide on `organizations_pkey` forever.
+    await _purge_workflow_rows(Session)
+
     async with Session() as s:
         s.add(Organization(id=ORG, name="Navis Labs", slug=f"navis-{uuid.uuid4().hex[:6]}"))
         user = User(email=FOUNDER, full_name="Abhishek Meena")
@@ -159,7 +384,11 @@ async def org(Session):
                 scopes=" ".join(GOOGLE_SCOPES), is_active=True, sync_state={},
             ))
         await s.commit()
-        return user.id
+        user_id = user.id
+
+    yield user_id
+
+    await _purge_workflow_rows(Session)
 
 
 @pytest.fixture()
@@ -265,14 +494,35 @@ async def _ingest_signals(Session, signals, user_id):
     Goes through the real `SignalIngestionService`, so these rows are
     byte-identical to synced ones — same dedupe key, same sealed payload, same
     staged outbox pointer.
+
+    THEN RUNS THE REAL MEMORY EXTRACTION over each one, because
+    `memory_records.source_integration_id` is what T-11 re-derives the sending
+    account from (`memory.lineage.integrations_for_threads`). In production the
+    signal-outbox relay publishes SIGNAL_INGESTED and
+    `memory.service` consumes it; this calls the same
+    `MemoryIngestionService.ingest_signal` directly, so the lineage the producer
+    reads is genuinely written rather than assumed.
+
+    Returns the Integration the signals were captured on — the exact row the
+    execution request must later be pinned to.
     """
-    from navis.identity.models import Integration
+    from navis.identity.models import Integration, IntegrationProvider
+    from navis.memory.service import MemoryIngestionService
     from navis.signals.base import SignalContext, SignalEvent
     from navis.signals.service import SignalIngestionService
     from sqlalchemy import select
 
     async with Session() as s:
-        integration = (await s.scalars(select(Integration).limit(1))).one()
+        integration = (
+            await s.scalars(
+                select(Integration).where(
+                    Integration.organization_id == ORG,
+                    Integration.provider == IntegrationProvider.GMAIL,
+                )
+            )
+        ).one()
+        integration_id = integration.id
+        event_ids = []
         for sig in signals:
             event = SignalEvent.create(
                 SignalContext(
@@ -287,7 +537,15 @@ async def _ingest_signals(Session, signals, user_id):
                 metadata=dict(sig.metadata),
             )
             await SignalIngestionService(s).ingest(event)
+            event_ids.append(event.event_id)
         await s.commit()
+
+    async with Session() as s:
+        for event_id in event_ids:
+            await MemoryIngestionService(s).ingest_signal(event_id)
+        await s.commit()
+
+    return integration_id
 
 
 def _reason_over(signals):
@@ -411,7 +669,9 @@ async def test_customer_follow_up_reaches_gmail_and_observation(Session, org, go
     user_id = org
 
     # ── Signals: really captured, so the draft has a thread to ground in ─
-    await _ingest_signals(Session, _UNANSWERED, user_id)
+    # Returns the Integration the thread arrived on — the account T-11 says this
+    # reply must be sent AS.
+    capturing_integration_id = await _ingest_signals(Session, _UNANSWERED, user_id)
 
     # ── Decision ──────────────────────────────────────────────────────
     brief = await _persist_brief(Session, _UNANSWERED)
@@ -441,6 +701,36 @@ async def test_customer_follow_up_reaches_gmail_and_observation(Session, org, go
     assert row.decision_id is not None
     assert row.obligation_key and row.obligation_key.startswith("reply|")
     execution_id = row.id
+
+    # ── T-11: WHICH ACCOUNT this reply will be sent AS ────────────────
+    #
+    # `organization_id` says whose action this is; it does not say which of that
+    # org's connected accounts to act as. The producer re-derives the account
+    # from the thread's own memory lineage — never from a payload — so the row
+    # must be pinned to the exact Integration the thread ARRIVED on, and nothing
+    # weaker (no newest-row, no first-row, no "the org's gmail account").
+    async with Session() as s:
+        from navis.identity.models import Integration as _Integration
+        from navis.memory.lineage import integrations_for_threads
+
+        derived = await integrations_for_threads(s, ORG, ["thread-release"])
+        pinned = await s.get(_Integration, row.integration_id)
+
+    assert row.integration_id is not None, (
+        "the proactive producer recorded no account; a multi-account org would "
+        "then have this reply refused with no way to recreate it"
+    )
+    assert row.integration_id == capturing_integration_id, (
+        "the reply is pinned to an account the thread never arrived on"
+    )
+    assert derived == {"thread-release": capturing_integration_id}, (
+        "the lineage lookup and the persisted pin disagree"
+    )
+    # The pinned row really belongs to this tenant, and really is a Gmail grant.
+    assert pinned is not None
+    assert pinned.organization_id == row.organization_id == ORG
+    assert pinned.provider.value == "gmail"
+    assert pinned.external_account == FOUNDER
 
     # ── A human reviews the draft, then approves ──────────────────────
     async with Session() as s:
@@ -900,7 +1190,9 @@ async def test_one_organizations_workflow_never_touches_another(Session, org, go
     from navis.organization.service import OrganizationService
 
     state_requests, _ = google
-    other = uuid.UUID("bbbbbbbb-0000-4000-8000-000000000002")
+    # Module-level so `_purge_workflow_rows` cleans it too — the schema is
+    # persistent now, so a second org left behind would collide on the next run.
+    other = ORG_OTHER
     async with Session() as s:
         s.add(Organization(id=other, name="Other", slug=f"other-{uuid.uuid4().hex[:6]}"))
         s.add(User(email="other@example.com"))

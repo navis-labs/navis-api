@@ -63,14 +63,26 @@ class CalendarScopeInsufficient(RuntimeError):
     """Google IS connected, but the grant lacks the scope this call needs."""
 
 
+class CalendarAccountAmbiguous(RuntimeError):
+    """Several Google accounts carry a Calendar grant and nothing says which one.
+
+    The Calendar twin of `GmailSendAccountAmbiguous`, and for the same reason:
+    the organization is connected and entitled, the CALLER is under-specified.
+    Recreating the action from the event it concerns records an `integration_id`
+    and resolves it.
+    """
+
+
 async def resolve_calendar_integration(
     db: AsyncSession, org_id: uuid.UUID, *, require_write: bool = False
 ) -> Integration:
     """Return the org's Calendar-capable Integration, healing the row if needed.
 
-    Raises `CalendarNotConnected` when no active Google grant exists at all, and
+    Raises `CalendarNotConnected` when no active Google grant exists at all,
     `CalendarScopeInsufficient` when one exists but is missing the Calendar
-    read scope (or the write scope, when `require_write`).
+    read scope (or the write scope, when `require_write`), and
+    `CalendarAccountAmbiguous` when SEVERAL distinct Google accounts could
+    answer (see below).
 
     Never commits. The caller owns the transaction — the backfill INSERT is
     flushed so the row is visible to this session, and is committed (or rolled
@@ -90,6 +102,29 @@ async def resolve_calendar_integration(
     if not rows:
         raise CalendarNotConnected(
             "no active Google integration for this organization"
+        )
+
+    # AMBIGUITY IS REFUSED, NOT RANKED (T-11), exactly as
+    # `resolve_gmail_send_integration` refuses it.
+    #
+    # `rows` is ordered by recency and `next(...)` below takes the first match,
+    # so an organization with two connected Google accounts — founder@ and ops@,
+    # the shape `uq_org_provider_account` explicitly permits — silently got the
+    # one connected most recently. For a READ that is a wrong answer; for a
+    # write (`require_write=True` is the meeting-scheduling path) it books the
+    # event on the wrong person's calendar, sends invitations from the wrong
+    # identity, and no retry corrects it.
+    #
+    # Accounts, not rows: one Google consent writes a gmail row AND a calendar
+    # row AND a drive row for the SAME account, all sharing a token. Several
+    # rows for one `external_account` is that normal case and is unambiguous
+    # about identity. Several external accounts is not.
+    accounts = {r.external_account for r in rows if r.external_account}
+    if len(accounts) > 1:
+        raise CalendarAccountAmbiguous(
+            "this organization has more than one connected Google account "
+            f"({len(accounts)} connected) and this request does not record which "
+            "calendar to use; recreate it from the event it concerns"
         )
 
     dedicated = next(
@@ -141,6 +176,15 @@ class GmailNotConnected(RuntimeError):
 
 class GmailSendScopeInsufficient(RuntimeError):
     """Google IS connected, but no active grant carries a send capability."""
+
+
+class GmailSendAccountAmbiguous(RuntimeError):
+    """Several accounts could send and nothing says which one this action is for.
+
+    Distinct from the two above because the remedy is different: the org is
+    connected and entitled, the ACTION is under-specified. Recreating it from the
+    message it answers records an `integration_id` and resolves the ambiguity.
+    """
 
 
 def _send_rank(row: Integration) -> tuple:
@@ -214,6 +258,27 @@ async def resolve_gmail_send_integration(
         raise GmailSendScopeInsufficient(
             "the send-capable Gmail integration has no stored tokens; "
             "reconnect required"
+        )
+
+    # AMBIGUITY IS REFUSED, NOT RANKED (T-11).
+    #
+    # This function's own docstring records the bug that made capability the
+    # primary sort: on a workspace with two connected Google accounts, ordering
+    # by recency "reliably picks the WRONG one". Capability-first fixed the case
+    # where only one account CAN send. It does nothing for the case where two
+    # can — there, recency is still choosing an identity, and sending a reply
+    # from the wrong mailbox is a real, visible failure that no retry corrects.
+    #
+    # An execution that recorded `integration_id` never reaches this line
+    # (`resolve_integration` pins the account directly). Reaching it with several
+    # usable accounts means the action genuinely does not say which identity to
+    # act as, and the honest answer is to say so.
+    accounts = {r.external_account for r in usable}
+    if len(accounts) > 1:
+        raise GmailSendAccountAmbiguous(
+            "this organization has more than one send-capable Gmail account "
+            f"({len(accounts)} connected) and this action does not record which "
+            "one to send from; recreate the action from the message it answers"
         )
     return sorted(usable, key=_send_rank)[0]
 

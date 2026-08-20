@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -34,7 +35,19 @@ async def engine():
     import navis.registry  # noqa: F401  register all models
     from navis.platform.database import Base
 
-    eng = create_async_engine(os.environ["NAVIS_TEST_DATABASE_URL"])
+    url = os.environ["NAVIS_TEST_DATABASE_URL"]
+    # This fixture calls `drop_all` on teardown and had NO guard on its target,
+    # so an exported variable pointing at the live database would have deleted
+    # it. Same rule as `test_observation_contract.py`: the DATABASE NAME must say
+    # it is disposable, which is a property of the database rather than of the
+    # host it happens to sit on.
+    _name = urlsplit(url).path.lstrip("/")
+    assert _name.startswith("navis_test"), (
+        f"refusing to drop_all on database {_name!r}: point "
+        "NAVIS_TEST_DATABASE_URL at a disposable database named navis_test*"
+    )
+
+    eng = create_async_engine(url)
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield eng

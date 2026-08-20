@@ -131,6 +131,34 @@ class ExecutionRequest(Timestamped, Base):
     reasoning_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     state_watermark: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # WHICH CONNECTED ACCOUNT this action must be performed with (T-11).
+    #
+    # `organization_id` says WHOSE action this is; it does not say which of that
+    # organization's accounts to act as. An org may legitimately connect Gmail A
+    # and Gmail B, and without this column the worker resolved the credential from
+    # (org, provider) alone — `resolve_gmail_send_integration` filters by send
+    # capability and then breaks ties by RECENCY. So a reply to a message that
+    # arrived at B could be sent from A: right tenant, wrong identity, wrong
+    # thread, and no error anywhere. `signal_events` has carried `integration_id`
+    # since the beginning for exactly this reason; the write path never did.
+    #
+    # NULLABLE, and that is not laziness. Existing rows predate the column and
+    # their account cannot be recovered — inventing one would fabricate lineage.
+    # A NULL therefore means "not recorded", and the worker treats it as such: it
+    # falls back to the org-scoped resolver ONLY when the organization has exactly
+    # one candidate account for that provider (where the answer is unambiguous and
+    # identical to today's behaviour), and refuses otherwise. Backwards compatible
+    # precisely where that is provable, fail-closed where it is not.
+    #
+    # ON DELETE SET NULL mirrors `signal_events.integration_id`: disconnecting an
+    # integration must not delete the audit trail of what was done with it.
+    integration_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("integrations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     action_type: Mapped[str] = mapped_column(String(40), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     # Which surface owns reviewing this. See ExecutionOrigin.

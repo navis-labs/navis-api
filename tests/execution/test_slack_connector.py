@@ -110,7 +110,10 @@ class _StubDB:
         return _R()
 
 
-def _install(*, scopes=WRITE, token="sealed-bot-token", active=True, created=1.0):
+def _install(
+    *, scopes=WRITE, token="sealed-bot-token", active=True, created=1.0,
+    workspace="T123",
+):
     from datetime import datetime, timezone
     from types import SimpleNamespace
 
@@ -129,7 +132,11 @@ def _install(*, scopes=WRITE, token="sealed-bot-token", active=True, created=1.0
         refresh_token=None,
         token_expires_at=None,
         is_active=active,
-        external_account="T123",
+        # The Slack TEAM id. Two installs sharing one team id are the same
+        # workspace re-installed; two different ids are two different
+        # workspaces, which is what `resolve_slack_credential` now refuses to
+        # choose between.
+        external_account=workspace,
         created_at=datetime.fromtimestamp(created, tz=timezone.utc),
     )
 
@@ -155,13 +162,76 @@ async def test_no_slack_install_is_a_distinct_error_from_a_read_only_one():
 
 async def test_a_write_capable_install_beats_a_newer_read_only_one():
     """The Gmail ordering bug, avoided by construction: capability first,
-    recency only as a tiebreak among grants that can actually post."""
+    recency only as a tiebreak among grants that can actually post.
+
+    Both rows are the SAME workspace (one `external_account`) — a re-install, not
+    a second Slack — so there is no ambiguity about WHERE the message goes, only
+    about which row carries the usable token.
+    """
     from navis.execution.providers._senders import resolve_slack_credential
 
     newer_readonly = _install(scopes=READ_ONLY, created=99.0)
     older_writable = _install(scopes=WRITE, token="the-right-token", created=1.0)
     row = await resolve_slack_credential(_StubDB([newer_readonly, older_writable]), ORG_A)
     assert row.access_token == "the-right-token"
+
+
+# ── TASK 6.5.1 — two workspaces are refused, not ranked ────────────────
+
+
+async def test_two_connected_workspaces_are_refused_not_ranked():
+    """THE FIX. This resolver used to document "newest install wins, ties broken
+    by id" as a virtue — deterministic, which is not the same as correct.
+
+    `uq_org_provider_account` is unique per (org, provider, external_account), so
+    one organization may legitimately connect an internal workspace AND a shared
+    customer workspace. Ranking by recency posted every message to whichever was
+    installed last: right tenant, wrong workspace, possibly in front of a
+    customer, and no retry corrects it. Gmail and Calendar already refuse this;
+    Slack was the odd one out.
+    """
+    from navis.execution.providers._senders import resolve_slack_credential
+
+    internal = _install(workspace="T-INTERNAL", token="internal-token", created=1.0)
+    customer = _install(workspace="T-CUSTOMER", token="customer-token", created=99.0)
+    with pytest.raises(IntegrationUnavailable) as exc:
+        await resolve_slack_credential(_StubDB([internal, customer]), ORG_A)
+    assert exc.value.provider == "slack"
+    assert "more than one connected Slack workspace" in str(exc.value)
+    # The accounts are connected fine — the ACTION is under-specified — so the
+    # UI must not tell the user to reconnect Slack.
+    assert exc.value.reconsent_required is False
+
+
+async def test_the_slack_refusal_names_the_remedy():
+    from navis.execution.providers._senders import resolve_slack_credential
+
+    with pytest.raises(IntegrationUnavailable, match="recreate the action"):
+        await resolve_slack_credential(
+            _StubDB([_install(workspace="T-A"), _install(workspace="T-B")]), ORG_A
+        )
+
+
+async def test_a_second_workspace_that_cannot_post_creates_no_ambiguity():
+    """Capability is filtered BEFORE the ambiguity check, so a read-only second
+    workspace does not block a send from the only one that can actually post.
+    Refusing there would be a regression dressed up as safety."""
+    from navis.execution.providers._senders import resolve_slack_credential
+
+    poster = _install(workspace="T-POSTER", token="the-right-token")
+    lurker = _install(workspace="T-LURKER", scopes=READ_ONLY, created=99.0)
+    row = await resolve_slack_credential(_StubDB([poster, lurker]), ORG_A)
+    assert row.access_token == "the-right-token"
+
+
+async def test_a_single_workspace_still_resolves():
+    """The control — refuse ambiguity, not everything."""
+    from navis.execution.providers._senders import resolve_slack_credential
+
+    row = await resolve_slack_credential(
+        _StubDB([_install(workspace="T-ONLY", token="only-token")]), ORG_A
+    )
+    assert row.access_token == "only-token"
 
 
 # ── the full path, with only the Slack HTTP boundary substituted ───────
@@ -171,7 +241,7 @@ async def _entitled(*orgs, plan=Plan.ENTERPRISE):
     org_repo = FakeOrgRepo()
     ent = EntitlementService(org_repo)
     for org in orgs:
-        await BillingService(org_repo, ent).set_plan(org, plan)
+        await BillingService(org_repo, ent).set_plan(org, plan, billing_authorized=True)
     return org_repo, ent
 
 
@@ -220,7 +290,7 @@ def slack_transport(monkeypatch):
     monkeypatch.setattr("navis.signals.slack.client.httpx.AsyncClient", _HTTP)
     monkeypatch.setattr(
         _senders, "resolve_integration",
-        lambda db, org_id, provider: _resolved(_install(scopes=WRITE)),
+        lambda db, org_id, provider, **_: _resolved(_install(scopes=WRITE)),
     )
     monkeypatch.setattr(_senders.token_cipher, "decrypt", lambda t: "xoxb-real-token")
 

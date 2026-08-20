@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import enum
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -44,21 +44,62 @@ def compute_approval_id(proposal_id: uuid.UUID, approver_id: uuid.UUID, decision
 
 # ---- read model (folded from Intelligence + Learning only) ----
 
+# `AggRow` USED TO BE HERE. It existed only to carry `learning_aggregates` rows
+# into the three `AdaptiveView` fields below, which nothing ever read; both are
+# gone. Note this was a SECOND, independent copy of the same shape — Intelligence
+# has its own `AggRow` in `intelligence/insights.py`, which is alive and stays.
+
+
+# `PatternRow` USED TO BE HERE, alongside an `AdaptiveView.patterns` field fed by
+# a direct `select(LearningPattern)`. Nothing read the field, and the query was
+# Adaptive's last read of a Learning TABLE. Learned evidence now has exactly one
+# way into Adaptive — `navis.learning.metrics.learning_snapshot` — which is what
+# makes "Adaptive consumes the Learning contract" an enforceable statement rather
+# than a convention.
+
+
 @dataclass(frozen=True, slots=True)
-class AggRow:
-    key: str
+class OutcomeEvidence:
+    """One outcome-type counter, as Adaptive is allowed to see it.
+
+    Flattened from `LearningSnapshot` by the repository — primitives only, no ORM
+    row and no Learning type, so this module stays pure and Adaptive never learns
+    Learning's storage shape.
+
+    `outcome_type` is the only TYPE-STABLE key Learning exposes: signal and
+    decision aggregates key on opaque uuids, which is exactly why `proposals.py`
+    has never been able to tune a per-signal threshold. A named outcome type is
+    something a rule can reason about without guessing.
+    """
+
+    outcome_type: str
+    surface: str                 # delivery | judgement | world
     successes: int
     failures: int
     neutrals: int
     total: int
+    supporting_learning_event_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
-class PatternRow:
-    signal_id: str
-    kind: str
-    success_rate: float
-    samples: int
+class LearningEvidence:
+    """What one organization has learned, as evidence for a policy candidate.
+
+    Org-scoped by construction: it carries its own `org_id` and is built from a
+    single `learning_snapshot(db, org_id)` call, so two organizations' evidence
+    cannot be combined in one value without that being visible.
+    """
+
+    org_id: uuid.UUID
+    learning_version: int
+    as_of: datetime | None
+    outcomes: tuple[OutcomeEvidence, ...] = ()
+
+    def by_type(self, outcome_type: str) -> OutcomeEvidence | None:
+        for o in self.outcomes:
+            if o.outcome_type == outcome_type:
+                return o
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,10 +121,10 @@ class AdaptiveView:
     as_of: datetime | None           # logical time (max insight created_at), never wall clock
     active_policy: dict[str, Any]    # current governing values (defaults if none active)
     insights: list[InsightRow]
-    signal_aggs: list[AggRow] = field(default_factory=list)
-    decision_aggs: list[AggRow] = field(default_factory=list)
-    outcome_aggs: list[AggRow] = field(default_factory=list)
-    patterns: list[PatternRow] = field(default_factory=list)
+    # Learned evidence, straight from Learning's read contract. Optional so every
+    # existing construction site (and the test fakes) stays valid and behaves
+    # exactly as before: no evidence => the Learning-derived rules produce nothing.
+    learning: LearningEvidence | None = None
 
 
 # ---- the proposal Adaptive emits (never activates) ----
