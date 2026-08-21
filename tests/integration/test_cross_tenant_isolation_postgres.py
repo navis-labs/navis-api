@@ -893,3 +893,134 @@ async def test_an_uncaptured_thread_contributes_no_account(two_tenants):
         assert await integrations_for_threads(s, TENANT_A, ["never-captured"]) == {}
         assert await integrations_for_threads(s, TENANT_A, []) == {}
         assert await integrations_for_threads(s, TENANT_A, [""]) == {}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# IDENTITY RESOLUTION — real service, real Postgres  (TASK 6.7)
+# ══════════════════════════════════════════════════════════════════════
+
+
+async def _seed_identity_signal(Session, *, org_id, user_id, integration_id,
+                                source, event_type, payload, tag):
+    """One real `signal_events` row for the REAL IdentityResolutionService to read."""
+    from navis.signals.models import SignalEventRecord
+
+    signal_id = uuid.uuid4()
+    async with Session() as s:
+        s.add(SignalEventRecord(
+            id=signal_id, organization_id=org_id, user_id=user_id,
+            integration_id=integration_id, source=source, event_type=event_type,
+            external_id=f"{tag}-{uuid.uuid4().hex[:8]}", external_version="1",
+            occurred_at=NOW, payload=payload,
+        ))
+        await s.commit()
+    return signal_id
+
+
+async def test_identity_resolution_folds_providers_and_never_crosses_a_tenant(two_tenants):
+    """The identity graph on real Postgres, through the REAL service.
+
+    Six properties in one test because each Neon round trip is expensive and
+    they share one fixture:
+
+      1. the same mailbox seen via Gmail AND via Calendar is ONE person
+      2. two different mailboxes sharing a display name stay TWO people
+      3. the same address in two tenants produces two ISOLATED aliases
+      4. tenant A's search never returns tenant B's alias row
+      5. canonical resolution seeded with ANOTHER tenant's alias id returns
+         only that seed — it cannot traverse into the other tenant's graph
+      6. replaying the identical signal writes no second alias (deterministic PK)
+
+    Nothing is mocked: `IdentityResolutionService.ingest_signal` reads the real
+    `signal_events` row, the real extractors run, and the real `search_persons`
+    and `canonical_alias_ids` answer from real rows.
+    """
+    from sqlalchemy import select as _select
+
+    from navis.identity_resolution.models import IdentityAlias
+    from navis.identity_resolution.resolver import canonical_alias_ids
+    from navis.identity_resolution.search import search_persons
+    from navis.identity_resolution.service import IdentityResolutionService
+
+    Session, users = two_tenants
+    account_a = await _gmail_integration_id(Session, TENANT_A)
+    account_b = await _gmail_integration_id(Session, TENANT_B)
+    shared = f"rahul-{uuid.uuid4().hex[:6]}@partner.com"
+    other = f"rahul-{uuid.uuid4().hex[:6]}@other.com"
+
+    async def ingest(signal_id):
+        async with Session() as s:
+            return await IdentityResolutionService(s).ingest_signal(signal_id)
+
+    # ── Tenant A: the same person, observed through two providers ──────
+    gmail_sig = await _seed_identity_signal(
+        Session, org_id=TENANT_A, user_id=users[TENANT_A], integration_id=account_a,
+        source="gmail", event_type="email.received",
+        payload={"from": f"Rahul S <{shared}>"}, tag="A-gmail",
+    )
+    cal_sig = await _seed_identity_signal(
+        Session, org_id=TENANT_A, user_id=users[TENANT_A], integration_id=account_a,
+        source="calendar", event_type="calendar.event.updated",
+        payload={"attendees": [{"email": shared, "displayName": "Rahul S"}]},
+        tag="A-cal",
+    )
+    assert (await ingest(gmail_sig))[0] == 1, "gmail signal produced no alias"
+    # THE CALENDAR HALF. `calendar.event.updated` is the shape production
+    # actually produces — every one of the nine calendar signals live on
+    # 2026-08-21 was an update, and none had ever reached this layer.
+    assert (await ingest(cal_sig))[0] == 1, (
+        "a calendar signal produced no alias; identity resolution is not "
+        "consuming calendar pointers"
+    )
+
+    # 6. Replay is idempotent — deterministic PK, ON CONFLICT.
+    assert (await ingest(gmail_sig))[0] == 0, "replay wrote a duplicate alias"
+
+    # A second, genuinely different person who signs mail the same way.
+    other_sig = await _seed_identity_signal(
+        Session, org_id=TENANT_A, user_id=users[TENANT_A], integration_id=account_a,
+        source="gmail", event_type="email.received",
+        payload={"from": f"Rahul S <{other}>"}, tag="A-other",
+    )
+    await ingest(other_sig)
+
+    # ── Tenant B: the SAME address, its own tenant ─────────────────────
+    b_sig = await _seed_identity_signal(
+        Session, org_id=TENANT_B, user_id=users[TENANT_B], integration_id=account_b,
+        source="gmail", event_type="email.received",
+        payload={"from": f"Rahul S <{shared}>"}, tag="B-gmail",
+    )
+    assert (await ingest(b_sig))[0] == 1
+
+    # 3. Same value, two tenants, two DISTINCT alias rows.
+    async with Session() as s:
+        rows = (await s.scalars(
+            _select(IdentityAlias).where(IdentityAlias.value == shared)
+        )).all()
+    by_org = {r.organization_id: r for r in rows}
+    assert set(by_org) == {TENANT_A, TENANT_B}
+    assert by_org[TENANT_A].id != by_org[TENANT_B].id, (
+        "one alias row served two tenants — the org is missing from the uuid5 key"
+    )
+
+    # 1 + 2 + 4. Tenant A's view of "rahul".
+    async with Session() as s:
+        result = await search_persons(s, TENANT_A, "rahul")
+    assert result.ambiguous, "two distinct mailboxes must remain two people"
+    assert len(result.matches) == 2
+    folded = {m.primary_email: m for m in result.matches}
+    assert set(folded) == {shared, other}
+    # The shared address folded its Gmail AND Calendar aliases into ONE person.
+    assert len(folded[shared].alias_ids) == 2, (
+        f"gmail+calendar aliases for one person did not fold: {folded[shared].to_dict()}"
+    )
+    # 4. Tenant B's row never appears in tenant A's answer.
+    every_alias_id = {aid for m in result.matches for aid in m.alias_ids}
+    assert str(by_org[TENANT_B].id) not in every_alias_id
+
+    # 5. Canonical resolution cannot walk out of its tenant.
+    async with Session() as s:
+        leaked = await canonical_alias_ids(s, TENANT_A, by_org[TENANT_B].id)
+    assert leaked == {by_org[TENANT_B].id}, (
+        "canonical resolution traversed another tenant's identity graph"
+    )

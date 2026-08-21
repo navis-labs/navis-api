@@ -380,7 +380,29 @@ async def org(Session):
                 external_account=FOUNDER,
                 access_token=token_cipher.encrypt(ACCESS_SECRET),
                 refresh_token=token_cipher.encrypt(REFRESH_SECRET),
-                token_expires_at=NOW + timedelta(hours=1),
+                # WALL CLOCK, NOT `NOW` — the one field that must diverge.
+                #
+                # `NOW` is the REASONING clock: signal timestamps and `as_of` hang
+                # off it so the decision is deterministic. `token_expires_at` is
+                # never read by reasoning. It is read by
+                # `TokenManager._is_expired`, which compares it against
+                # `datetime.now(timezone.utc)` — so `NOW + 1h` made this grant
+                # valid until 2026-08-19 10:00 UTC and silently dead after that.
+                #
+                # What a dead grant looks like from here: `get_token` takes the
+                # refresh branch, `refresh_access_token` opens
+                # `async with httpx.AsyncClient(...)`, and the `google` fixture's
+                # network double implements `request`/`aclose` but NOT the async
+                # context manager protocol. The send then dies at the CREDENTIAL
+                # boundary, before Gmail is reached, as
+                #   '_HTTP' object does not support the asynchronous context
+                #   manager protocol
+                # which reads like a product bug and is a fixture time-bomb.
+                #
+                # A LIVE grant is the premise of this workflow — the test asserts
+                # the STORED token is what reaches Google — so it has to be live
+                # whenever the suite runs, not only on the day it was written.
+                token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
                 scopes=" ".join(GOOGLE_SCOPES), is_active=True, sync_state={},
             ))
         await s.commit()
@@ -747,10 +769,15 @@ async def test_customer_follow_up_reaches_gmail_and_observation(Session, org, go
 
     # ── Execution ─────────────────────────────────────────────────────
     result = await _drain(Session, production_providers())
-    assert result["executed"] == 1, result
-
     async with Session() as s:
         done = await s.get(ExecutionRequest, execution_id)
+    # The count alone says "something failed" and nothing about what. A pass that
+    # drains the wrong number of rows is almost always explained by `last_error`,
+    # so the assertion carries it rather than making the next run a bisect.
+    assert result["executed"] == 1, (
+        f"{result} status={done.status} attempts={done.attempts} "
+        f"last_error={done.last_error!r}"
+    )
     assert done.status == ExecutionStatus.EXECUTED.value, done.last_error
     assert done.provider_reference == {"provider": "gmail", "external_id": "gmail-live-1"}
     assert "dry_run" not in done.provider_reference

@@ -52,6 +52,7 @@ class FactLineage:
 
 async def lineage_by_memory_id(
     db: AsyncSession,
+    org_id: uuid.UUID,
     memory_ids: Iterable[uuid.UUID],
     *,
     version: int = IMPORTANCE_VERSION,
@@ -60,6 +61,18 @@ async def lineage_by_memory_id(
 
     Uses an OUTER join on importance so a fact is still returned — and therefore
     still de-duplicable — when its signal has not been scored yet.
+
+    ORG-SCOPED LIKE ITS TWO SIBLINGS. This filtered on `memory_id` alone, which
+    made tenant isolation a property of the CALLER rather than of the query: the
+    only caller (`ml.retrieval.retriever`) takes its ids from an org-scoped
+    vector search, so nothing crossed a tenant — but a memory_id is a plain
+    column value here, and "the caller happens to have filtered" is not the
+    standard the rest of this module holds itself to (see
+    `classifications_by_entity`: "Org isolation is enforced on
+    memory_records.organization_id. That is sufficient rather than incidental").
+    A memory_id IS a uuid5 over the organization, so this filter can never
+    exclude a row a correct caller wanted; it only removes the possibility that a
+    future caller supplies ids from somewhere else.
     """
     ids = list(memory_ids)
     if not ids:
@@ -77,7 +90,10 @@ async def lineage_by_memory_id(
                 (SignalImportance.signal_event_id == MemoryRecord.source_signal_event_id)
                 & (SignalImportance.version == version),
             )
-            .where(MemoryRecord.memory_id.in_(ids))
+            .where(
+                MemoryRecord.organization_id == org_id,
+                MemoryRecord.memory_id.in_(ids),
+            )
         )
     ).all()
     return {

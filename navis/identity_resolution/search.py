@@ -186,6 +186,28 @@ async def search_persons(
         class_by_seed[min(class_ids)] = class_ids
         seen_seeds.update(class_ids)
 
+    # SECOND FOLD — same (kind, value) is the same person, across providers.
+    #
+    # `alias_id` is uuid5 over (org, PROVIDER, kind, value), so one address seen
+    # in Gmail and again on a Calendar invite is TWO alias rows with two ids. No
+    # extractor emits a co-observation pair between them (`_gmail_aliases` and
+    # `_calendar_aliases` both return no pairs), so the BFS above — which walks
+    # link edges only — leaves them in two classes and this function reported ONE
+    # person as `ambiguous=True`, listing the same email twice. The scheduling
+    # agent then asks "which Rahul?" and offers Rahul and Rahul.
+    #
+    # `/identity/persons/lookup` never had the bug because it seeds from every
+    # provider's computed id for the requested (kind, value) and unions their
+    # classes — i.e. it already folds on value. This makes the two read paths
+    # answer "who is this person" the same way.
+    #
+    # NOT a new merge rule: `AliasKind` states that an `email` from Gmail and an
+    # `email` from HubSpot are the same person when the value matches, "which is
+    # EXACTLY the point of this layer". This is exact equality on a normalized
+    # identifier of the SAME kind — never a name, domain, or fuzzy match — so it
+    # cannot merge two people who merely look alike.
+    class_by_seed = _fold_by_alias_value(class_by_seed, id_to_alias)
+
     matches: list[PersonMatch] = []
     for canonical_id, class_ids in class_by_seed.items():
         class_aliases: list[IdentityAlias] = [
@@ -204,6 +226,57 @@ async def search_persons(
         )
     )
     return PersonSearchResult(query=normalized, matches=tuple(matches[:_MAX_MATCHES]))
+
+
+def _fold_by_alias_value(
+    classes: dict[uuid.UUID, set[uuid.UUID]],
+    id_to_alias: dict[uuid.UUID, IdentityAlias],
+) -> dict[uuid.UUID, set[uuid.UUID]]:
+    """Merge link-derived classes that share a (kind, value) alias.
+
+    Union-find over the class keys, in memory — every alias row involved has
+    already been fetched by the caller, so this costs no additional query.
+
+    The merged class keeps the SMALLEST alias uuid as its canonical id, which is
+    the same convention `/identity/persons/lookup` uses, so the two surfaces
+    report the same `canonical_id` for the same person.
+    """
+    parent: dict[uuid.UUID, uuid.UUID] = {k: k for k in classes}
+
+    def find(x: uuid.UUID) -> uuid.UUID:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]  # path-halving
+            x = parent[x]
+        return x
+
+    def union(a: uuid.UUID, b: uuid.UUID) -> None:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        # Smaller root wins so the outcome does not depend on iteration order.
+        lo, hi = (ra, rb) if ra < rb else (rb, ra)
+        parent[hi] = lo
+
+    owner: dict[tuple[str, str], uuid.UUID] = {}
+    for key, members in classes.items():
+        for aid in members:
+            alias = id_to_alias.get(aid)
+            if alias is None:
+                # A class member we never fetched — it cannot contribute a value
+                # to fold on, and dropping it here does not lose it: it stays in
+                # `members` and rides into the merged set below.
+                continue
+            signature = (alias.kind, alias.value)
+            previous = owner.get(signature)
+            if previous is None:
+                owner[signature] = key
+            else:
+                union(previous, key)
+
+    merged: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for key, members in classes.items():
+        merged.setdefault(find(key), set()).update(members)
+    return {min(members): members for members in merged.values()}
 
 
 def _build_match(

@@ -1,6 +1,15 @@
-# Navis API Contract — Layer 1 (Identity + Organization)
+# Navis API Contract — Identity, Organization, and the Product Surfaces
 
 Stable HTTP surface for frontend integration. Everything is org-scoped after login.
+
+Sections 1–7 cover Identity and Organization. Sections 8–14 cover the product
+surfaces the founder actually looks at — Brief, Decisions, Actions/Execution,
+Intelligence, Context/Chat, Signals, Integrations, Workspace and Memory — plus
+the freshness, provenance and domain-error contracts that span them.
+
+Every route below was enumerated from the live FastAPI route table, and every
+permission/entitlement was read out of the route's real dependency graph. If a
+path is not in this document, the backend does not serve it.
 
 **Base URL:**
 - Local dev: `http://127.0.0.1:8000`
@@ -690,3 +699,350 @@ Even if the logout request fails, **always clear local storage** — server-side
 | 5xx | Server bug — report a ticket with the `X-Request-ID` response header |
 
 Every response includes an `X-Request-ID` header. Include it in bug reports — server logs are indexed by it.
+
+---
+
+# 8. How to read sections 8–14
+
+Three different gates apply, and they fail with three different status codes.
+Confusing them is the most common integration bug:
+
+| Gate | Question | Failure | Fix |
+|---|---|---|---|
+| **Authentication** | Who is calling? | `401` | re-login / refresh |
+| **Permission** | May this *caller* do it? | `403` | a different role, or a grant |
+| **Entitlement** | May this *organization* use it? | `402` | change plan / enable capability |
+
+`402` is not a payment page. It means the capability is off for this org — a
+plan tier, an explicit revocation, or a kill switch. Read
+`GET /organization/entitlements` to render the state before the user clicks.
+
+**A blank column means the gate is not applied.** Several read surfaces are
+authenticated-only by design: any member of the org may read them.
+
+---
+
+# 9. Brief & Decisions
+
+The Brief is the founder's morning surface. It is **not** rebuilt per request:
+`GET /brief/today` returns the newest persisted brief and only runs the pipeline
+when the org has never had one.
+
+| Method | Path | Permission | Entitlement | Rate bucket |
+|---|---|---|---|---|
+| GET | `/brief/today` | — | `decision` | — |
+| POST | `/brief/generate` | — | `decision` | `pipeline` |
+| POST | `/brief/propose-actions` | `execute_actions` | `execution` | `pipeline` |
+| POST | `/brief/{brief_id}/open` | — | `decision` | — |
+| POST | `/brief/decisions/{decision_ref}/dismiss` | — | `decision` | — |
+| GET | `/decision-memory` | — | `decision` | — |
+
+**`GET /brief/today` response**
+
+```json
+{
+  "id": "uuid",
+  "org_id": "uuid",
+  "as_of": "2026-08-21T09:00:00+00:00",
+  "reasoning_version": 4,
+  "state_watermark": "w-1234",
+  "decisions": [
+    {
+      "decision_id": "uuid",
+      "category": "waiting_reply",
+      "title": "...",
+      "evidence": { "thread_id": "...", "person_email": "...", "rfc_message_id": "..." },
+      "execution": null
+    }
+  ]
+}
+```
+
+`decisions[].execution` is the **only** way to tell "nobody has replied yet"
+from "the reply went out an hour ago". `GET /actions` returns `REQUESTED` rows
+only, so a completed execution is invisible there. It is `null` for the common
+case (a finding to read, not a reply to send), otherwise an execution summary
+carrying at least `status` and `provider_reference`.
+
+Resolution is by **stable obligation key**, never by `decision_id` — the same
+unanswered email carries a different `decision_id` in every brief.
+
+**`POST /brief/generate` vs `GET /brief/today`.** `generate` is a whole-pipeline
+recompute (state fold → reasoning → decision → LLM) and is rate-limited on the
+`pipeline` bucket. Do not call it on page load; call `today`.
+
+**Dismissal** is idempotent per `(org, decision_ref, user)`, so replay converges.
+`reason` is one of `explicit` | `stale` | `duplicate`.
+
+**Errors:** `402` no `decision` entitlement · `404` brief not in your org ·
+`429` pipeline bucket exhausted (honour `Retry-After`).
+
+**Pagination:** none. A brief carries its full decision list.
+
+---
+
+# 10. Actions & Execution
+
+Every product action — a Gmail send, a Calendar booking, a Slack post — goes
+through this pipeline. There is **no** frontend→provider shortcut, and adding one
+would bypass approval, rate limiting, retries, dead-lettering and Observation.
+
+```
+POST /actions  ──▶ REQUESTED ──▶ approve ──▶ APPROVED ──▶ worker ──▶ EXECUTED
+                                                             └──▶ Observation ──▶ Learning
+```
+
+| Method | Path | Permission | Entitlement |
+|---|---|---|---|
+| GET | `/actions` | — | — |
+| POST | `/actions` | `execute_actions` | `execution` |
+| GET | `/actions/{execution_id}` | `execute_actions` | — |
+| POST | `/actions/{execution_id}/approve` | `execute_actions` | `execution` |
+| POST | `/actions/{execution_id}/reject` | `execute_actions` | `execution` |
+| POST | `/actions/{execution_id}/cancel` | `execute_actions` | `execution` |
+| POST | `/actions/{execution_id}/retry` | `execute_actions` | `execution` |
+| GET | `/actions/{execution_id}/draft` | `execute_actions` | `execution` |
+| PUT | `/actions/{execution_id}/draft` | `execute_actions` | `execution` |
+| POST | `/actions/{execution_id}/draft/regenerate` | `execute_actions` | `execution` |
+
+**`GET /actions` returns PROACTIVE rows only.** Chat-originated proposals are
+reviewed in the conversation that created them — the founder is already looking
+at the card. Chat holds the `execution_id` it created and polls
+`GET /actions/{id}` directly. Do not expect chat actions in this list.
+
+**Approve is a gate, not a button.** In order: the org's *connector* capability
+for that action type (`402` if revoked — `gmail` being off is separate from
+`execution` being on), then the credential pre-flight (`409` with a reconnect
+message), then the draft merge for draftable actions (`409` if unwritten or
+stale). Only then does the row transition.
+
+**Double-approve is a no-op, not a conflict** — approving something already
+APPROVED/EXECUTING/EXECUTED returns success without a second side effect.
+
+**Which account an action is sent AS** is fixed when the row is created
+(`integration_id`, T-11) and re-derived from the thread's own memory lineage —
+never from anything the client sends. A payload key named `__ctx__` cannot
+supply its own account or its own organization; the worker overwrites both from
+the persisted row. When no single account is derivable the row carries `null`
+and the credential boundary **refuses** a multi-account org rather than guessing.
+
+**Errors:** `402` capability revoked · `403` missing `execute_actions` ·
+`404` not in your org (identical response whether it doesn't exist or belongs to
+another tenant — by design, no existence oracle) · `409` unknown action type,
+missing/stale draft, or credential pre-flight failure.
+
+---
+
+# 11. Intelligence
+
+| Method | Path | Permission | Entitlement | Rate bucket |
+|---|---|---|---|---|
+| GET | `/intelligence/insights` | — | `intelligence` | — |
+| POST | `/intelligence/project` | — | `intelligence` | `pipeline` |
+
+Insights are read from the Intelligence layer. They are **not** reconstructed
+from raw signals at request time — an intelligence surface that re-derived its
+own answer would drift from what Decision acted on.
+
+**Errors:** `402` no `intelligence` entitlement · `429` pipeline bucket.
+
+---
+
+# 12. Context & Chat
+
+| Method | Path | Permission | Entitlement | Rate bucket |
+|---|---|---|---|---|
+| GET | `/context` | — | `decision` | `read` |
+| POST | `/chat` | — | `memory` | `chat` |
+
+Chat can *propose* actions. When it does it creates a real `ExecutionRequest`
+through the same `ExecutionService` the Action Center uses, with a deterministic
+`decision_id` derived from the stable "who + when" of the action — so asking
+twice converges on ONE row instead of queueing two. Chat never calls a provider.
+
+**Errors:** `402` when the `memory` capability is off for the organization,
+`429` chat bucket (per organization; one tenant cannot consume another's quota).
+
+`memory` is granted by every plan including FREE, so a `402` here does not mean
+"upgrade" — it means the organization is **suspended or churned**, or `memory`
+was explicitly revoked / kill-switched. Every other product surface returns
+`402` for the same tenant at the same time, so treat it as an account-level
+state, not a chat-specific failure.
+
+---
+
+# 13. Signals, Integrations & Workspace
+
+| Method | Path | Permission | Entitlement |
+|---|---|---|---|
+| GET | `/signals/gmail/recent` | — | `gmail` |
+| GET | `/signals/gmail/important` | — | `gmail` |
+| GET | `/signals/calendar/upcoming` | — | `calendar` |
+| GET | `/signals/drive/recent` | — | `drive` |
+| GET | `/integrations` | — | — |
+| GET | `/integrations/google/connect` | — | `gmail` |
+| GET | `/integrations/google/callback` | *public — signed OAuth `state`* | — |
+| POST | `/integrations/google/sync` | — | `gmail` |
+| DELETE | `/integrations/google/disconnect` | — | — |
+| DELETE | `/integrations/slack/disconnect` | — | — |
+| POST | `/integrations/seed` | — | `gmail` |
+| POST | `/workspace/calendar/available-slots` | `execute_actions` | `execution` |
+
+**`GET /integrations` never returns tokens.** The response is an explicit
+allow-list per integration:
+
+```json
+{ "integrations": [{
+  "integration_id": "uuid", "provider": "gmail", "external_account": "founder@…",
+  "is_active": true, "connected_at": "…", "updated_at": "…",
+  "token_expires_at": "…", "scopes": "space separated",
+  "calendar_write_scope": false, "last_synced_at": "…",
+  "ingested_today": 0, "ingested_last_hour": 0, "ingested_total": 0,
+  "dead_letter_count": 0
+}]}
+```
+
+`sync_state` is filtered to `last_synced_at` only — the rest can carry opaque
+cursor tokens and stays server-side. Use `calendar_write_scope` to decide
+whether to offer scheduling or a reconsent prompt; do not parse `scopes`.
+
+**`POST /integrations/seed` is `404` in production.** It is a dev-only signal
+injector. A caller-supplied `integration_id` is validated against the caller's
+org before use.
+
+**`/workspace/calendar/available-slots`** returns pickable open slots from the
+org's real calendar. It resolves the credential through the single credential
+authority, which **refuses an organization holding two connected Google
+accounts** rather than ranking them by recency — so an ambiguous org gets a
+`409` naming the problem instead of silently reading the wrong founder's
+free/busy. Slots it returns are slots `schedule_meeting` will accept.
+
+**Errors:** `402` connector capability off · `409` not connected, missing
+Calendar scope (reconnect), or ambiguous account · `401` Google rejected the
+token (reconnect) · `502` calendar upstream error.
+
+---
+
+# 14. Memory, People & Adaptive
+
+| Method | Path | Permission | Entitlement |
+|---|---|---|---|
+| GET | `/memory/people` | — | `decision` |
+| GET | `/identity/persons/search` | — | — |
+| GET | `/identity/persons/lookup` | — | — |
+| GET | `/identity/persons/{alias_id}` | — | — |
+| GET | `/adaptive/policy` | — | — |
+| GET | `/adaptive/proposals` | — | — |
+| POST | `/adaptive/propose` | — | `adaptive` |
+| POST | `/adaptive/proposals/{id}/approve` | — | — |
+| POST | `/adaptive/proposals/{id}/reject` | — | — |
+| POST | `/adaptive/rollback/{policy_id}` | — | — |
+| POST | `/adaptive/kill-switch` | — | — |
+
+Knowledge surfaces legitimately read Memory directly — that *is* their
+authoritative layer. `/identity/persons/*` returns an equivalence class of
+provider identities; queries shorter than 2 characters return empty rather than
+pretending a 1-char probe is a person lookup.
+
+---
+
+# 15. Freshness — how to tell loading from empty from stale
+
+The backend does not ship a separate freshness API. Use the lineage fields that
+already ride on each payload:
+
+| Surface | Freshness field | "Empty" looks like |
+|---|---|---|
+| Brief | `as_of`, `state_watermark`, `reasoning_version` | `decisions: []` with a real `as_of` |
+| Actions | `created_at`, `status`, `attempts` | `[]` |
+| Integrations | `last_synced_at`, `ingested_today` | `last_synced_at: null` |
+| Intelligence | insight timestamps | `[]` |
+
+**`as_of` is State's logical time, not wall clock.** Two briefs can share an
+`as_of` and differ in `reasoning_version`; the higher version is the corrected
+projection of the same snapshot. Render the newest `(as_of, reasoning_version)`.
+
+A `200` with an empty list means *the organization genuinely has nothing*. It
+never means "unauthenticated" — every non-`/auth`, non-webhook route is gated,
+so a dead session is `401`, not a quiet blank page. This is why the five
+fabricated-empty compatibility routes were deleted (§4.3).
+
+---
+
+# 16. Provenance — answering "why is Navis showing me this?"
+
+Every intelligence artefact carries the lineage to walk back to its source:
+
+```
+brief.decisions[].decision_id          which decision
+  ├─ brief.reasoning_version           which reasoning produced it
+  ├─ brief.state_watermark             which state snapshot it read
+  ├─ decisions[].evidence.thread_id    which conversation
+  ├─ decisions[].evidence.rfc_message_id   which message
+  └─ decisions[].execution
+       ├─ execution.decision_id        links the action back to the decision
+       └─ execution.provider_reference { provider, external_id }  what actually happened
+```
+
+`ExecutionRequest` additionally carries `reasoning_signal_ids` and
+`source_signal_event_ids` (raw `signal_events.id` values), and `integration_id`
+— the exact connected account the action was performed as. Outcomes recorded by
+Observation carry `execution_id`, `decision_id`, `organization_id` and the same
+`provider_reference`, so the loop closes.
+
+**Known gap:** executions created before migration `0042` have
+`integration_id: null`. That is "not recorded", not "any account will do" — it
+is deliberately not back-filled, because deriving it now would fabricate lineage
+on an audit record.
+
+---
+
+# 17. Domain error contract
+
+Prefer the **status code** plus the `detail` string. Do not pattern-match on
+prose beyond the documented cases below — `detail` is written for humans.
+
+| Code | Meaning on the product surfaces |
+|---|---|
+| 400 | Ambiguous credentials (both `X-API-Key` and a bearer token), or a business refusal |
+| 401 | No/expired/revoked token; or an upstream provider rejected our credential |
+| 402 | The **organization** lacks the capability (plan, revocation, kill switch) |
+| 403 | Authenticated, but the **caller** lacks the permission |
+| 404 | Not found **in your organization** — identical whether it never existed or belongs to another tenant |
+| 409 | Connector not connected / missing scope / **ambiguous account**; missing or stale draft; unknown action type |
+| 422 | Schema validation |
+| 429 | Rate limit — per organization, per bucket (`pipeline`, `chat`, `read`). Honour `Retry-After` |
+| 502 | Provider upstream error (retryable) |
+
+**The reconnect family.** `409` from an action or a calendar read generally means
+a credential problem, and the `detail` names the remedy. The three distinct
+causes are worth different UI:
+
+- *not connected* — offer Connect.
+- *connected but missing a scope* — offer Reconnect (this is `reconsent_required`
+  server-side; the message says "Reconnect … to grant …").
+- *more than one connected account* — Navis refuses to guess. Ask the user to
+  disconnect the account they don't want to act as. **Never retry this**; it is
+  permanent until a human changes the connected accounts.
+
+Credential material never appears in an error. Messages name the provider and
+the action to take, never a token, header or encrypted blob.
+
+---
+
+# 18. What the frontend must not do
+
+1. **Do not maintain a permission table.** Read `permissions` from
+   `GET /auth/me` (§1.6). It publishes the same resolved set `require_permission`
+   enforces with. Frontend gating is UX; the backend is authoritative.
+2. **Do not send an organization id.** There is no route that accepts one from a
+   path, query, body or header. The active organization comes from the
+   authenticated membership row, and a token naming an org the user has no seat
+   in is rejected `403` before any handler runs.
+3. **Do not call a provider directly.** Gmail/Slack/Calendar writes exist only
+   behind `POST /actions` + approve.
+4. **Do not select an integration for the user.** `integration_id` is derived
+   server-side from lineage. A client-supplied one is never authority.
+5. **Do not call `POST /brief/generate` on page load.** Use `GET /brief/today`.
+6. **Do not treat `200 []` as an error state**, or `404` on the §4.3 paths as an
+   outage — those routes are intentionally not served.

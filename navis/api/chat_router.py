@@ -35,8 +35,10 @@ from navis.api.workspace_fallback import (
 )
 from navis.execution.models import ActionType, ExecutionOrigin
 from navis.execution.service import ExecutionService
-from navis.identity.authz import Principal, get_principal
+from navis.identity.authz import Principal
 from navis.identity.throttle import rate_limit
+from navis.organization.contract import Capability
+from navis.organization.guards import require_capability
 from navis.ml.generation.narratives import explanation, recommendation, summary
 from navis.ml.rag.context_builder import ContextBuilder, estimate_tokens
 from navis.ml.rag.grounding import Grounding, GroundedContext
@@ -1503,7 +1505,35 @@ def _question_response(
 )
 async def chat(
     body: ChatRequest,
-    p: Principal = Depends(get_principal),
+    # CAPABILITY-GATED ON MEMORY, like every other product surface.
+    #
+    # This was `Depends(get_principal)` — authentication only — and it made
+    # `/chat` the single expensive endpoint in the product with no entitlement
+    # gate. Every sibling has one: the signal reads on GMAIL/CALENDAR/DRIVE,
+    # `/decision-memory` and `/memory/people` on DECISION, `/brief/*` and
+    # `/context` on DECISION, `/intelligence/*` on INTELLIGENCE, `/actions/*`
+    # on EXECUTION.
+    #
+    # That gate is also the ONLY place organization LIFECYCLE is enforced —
+    # `authz.principal_cache_evict_org` says so outright ("the capability gate
+    # reads lifecycle from the database on every request"), and
+    # `entitlements._decide` refuses anything that is not TRIAL or ACTIVE
+    # before it looks at plan or kill switch. So a SUSPENDED or CHURNED
+    # organization kept full access to the request this router's own comment
+    # calls "the most expensive request in the product": embed the query,
+    # full-scan the org's vectors, fold state, call the LLM. Suspension stopped
+    # the brief, the signal feeds and the action queue, and left the one
+    # surface that actually spends money running.
+    #
+    # MEMORY is the capability chat consumes — it answers out of the org's
+    # Memory — and it is granted by EVERY plan including FREE
+    # (`PLAN_CAPABILITIES`), so no entitled organization changes behaviour:
+    # this denies suspended/churned tenants, an explicit revocation, and the
+    # `memory` kill switch. Nothing else.
+    #
+    # `require_capability` depends on `get_principal` and FastAPI caches a
+    # dependency per request, so the principal is still resolved exactly once.
+    p: Principal = Depends(require_capability(Capability.MEMORY)),
     db: AsyncSession = Depends(get_session),
 ) -> ChatResponse:
     """Ask Navis — grounded LLM chat over the org's Memory.

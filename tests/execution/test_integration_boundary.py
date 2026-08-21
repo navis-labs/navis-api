@@ -729,3 +729,58 @@ async def test_the_producer_records_nothing_when_the_thread_is_ambiguous():
         await brief_module.propose_actions(None, uuid.uuid4())
 
     assert captured["integration_id"] is None
+
+
+# ── The API read surfaces resolve credentials through the SAME authority ──
+
+
+async def test_the_calendar_availability_surface_refuses_an_ambiguous_org():
+    """`/workspace/calendar/available-slots` must not rank connected accounts.
+
+    It used to run its own query — provider=GOOGLE_CALENDAR, is_active, ORDER BY
+    created_at DESC, `scalar()` — so an org holding founder@ and ops@ (a shape
+    `uq_org_provider_account` permits) silently got whichever was connected last.
+    That is the recency tie-break T-11 removed from the execution path, and it
+    decided WHOSE free/busy the founder picks a slot from.
+
+    The canonical resolver refuses the ambiguity instead. Asserting on the 409
+    rather than on the query shape means a future rewrite of the helper cannot
+    quietly reintroduce ranking and still pass.
+    """
+    from fastapi import HTTPException
+
+    from navis.api import workspace_router
+
+    async def _ambiguous(_db, _org, _provider, **_kw):
+        raise IntegrationUnavailable(
+            "this organization has more than one connected Google account",
+            provider="calendar",
+        )
+
+    # The helper imports `resolve_integration` INSIDE the function, so the name
+    # resolves against this module at call time — patching it here is what the
+    # helper will actually see.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("navis.execution.integrations.resolve_integration", _ambiguous)
+        with pytest.raises(HTTPException) as exc:
+            await workspace_router._resolve_google_calendar(None, ORG_A)
+
+    assert exc.value.status_code == 409
+    assert "more than one" in str(exc.value.detail)
+
+
+async def test_the_calendar_availability_surface_returns_the_resolved_account():
+    """Delegation, not a second lookup: whatever the authority returns is used."""
+    from navis.api import workspace_router
+
+    sentinel = object()
+
+    async def _resolved(_db, org_id, provider, **_kw):
+        assert org_id == ORG_A and provider == "calendar"
+        return sentinel
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("navis.execution.integrations.resolve_integration", _resolved)
+        got = await workspace_router._resolve_google_calendar(None, ORG_A)
+
+    assert got is sentinel

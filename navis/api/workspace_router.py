@@ -19,11 +19,10 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.authz import Principal, require_permission
-from navis.identity.models import Integration, IntegrationProvider
+from navis.identity.models import Integration
 from navis.identity.permissions import Permission
 from navis.organization.contract import Capability
 from navis.organization.guards import require_capability
@@ -78,26 +77,43 @@ class AvailableSlotsResponse(BaseModel):
 async def _resolve_google_calendar(
     db: AsyncSession, org_id: Any
 ) -> Integration:
-    integration = await db.scalar(
-        select(Integration)
-        .where(
-            Integration.organization_id == org_id,
-            Integration.provider == IntegrationProvider.GOOGLE_CALENDAR,
-            Integration.is_active.is_(True),
-        )
-        .order_by(Integration.created_at.desc())
-    )
-    if integration is None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "Google Calendar is not connected for this organization",
-        )
-    if integration.access_token is None or integration.refresh_token is None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "Google Calendar integration has no stored tokens; reconnect required",
-        )
-    return integration
+    """The org's Calendar credential, through the ONE credential authority.
+
+    THIS USED TO BE A SECOND, WEAKER RESOLVER, AND IT RANKED BY RECENCY:
+
+        select(Integration).where(org, provider=GOOGLE_CALENDAR, is_active)
+                           .order_by(created_at.desc())   ->  db.scalar()
+
+    `uq_org_provider_account` explicitly permits one organization to connect
+    founder@ and ops@, so `scalar()` over a recency order silently answered with
+    whichever account was connected LAST. That is the exact tie-break T-11 removed
+    from the execution path — `resolve_calendar_integration` refuses the ambiguity
+    (`CalendarAccountAmbiguous`) rather than ranking it, precisely because for a
+    read it is a wrong answer and for a write it books the wrong person's calendar.
+
+    Availability is a read, so it never booked anything — but it decided WHOSE free
+    time the founder picks a slot from, and the slots then went to an execution path
+    that refuses the same ambiguity. The drawer could therefore offer slots off
+    account B that no `schedule_meeting` would ever accept.
+
+    `resolve_integration` also asks the two questions the local query did not: the
+    grant must carry a Calendar SCOPE (a `calendar.readonly`-only or scope-less
+    grant is refused with `reconsent_required`), and the row may be HEALED if the
+    Google family row is missing. Deliberately not re-implemented here — a second
+    copy of "what counts as calendar access" is how the two paths drift apart.
+
+    409 matches the established mapping for this exception everywhere else it
+    reaches HTTP (`execution.actions.credential_preflight` ->
+    `ActionPreconditionFailed` -> 409 in the approve handler). The connector wrote
+    the message and it is safe to surface: it names the provider and the remedy,
+    never credential material.
+    """
+    from navis.execution.integrations import IntegrationUnavailable, resolve_integration
+
+    try:
+        return await resolve_integration(db, org_id, "calendar")
+    except IntegrationUnavailable as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
 # `_decrypt_integration_tokens` lived here and WROTE PLAINTEXT TOKENS TO THE

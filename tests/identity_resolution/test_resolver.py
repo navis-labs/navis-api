@@ -163,3 +163,53 @@ def test_unknown_source_is_safe_noop():
 def test_alias_compute_id_matches_helper():
     a = Alias(provider=AliasProvider.GMAIL, kind=AliasKind.EMAIL, value="alice@acme.com")
     assert a.compute_id(ORG_A) == alias_id(ORG_A, "gmail", "email", "alice@acme.com")
+
+
+# ── Subscriber wiring (TASK 6.7) ───────────────────────────────────────
+
+
+def test_identity_resolution_sees_every_calendar_pointer_memory_sees():
+    """Identity Resolution must consume the SAME calendar events as Memory.
+
+    `IdentityResolutionService`'s module docstring says it is "wired ... on the
+    same pointer events Memory consumes". It was not: Memory subscribed to
+    CALENDAR_EVENT_CREATED, _UPDATED and _CANCELLED; Identity Resolution
+    subscribed to CREATED only.
+
+    That is not a corner case. `CalendarConnector._event_type` returns CREATED
+    only when `raw["created"] == raw["updated"]` — an event never touched since
+    it was made — so an edited or re-synced event is UPDATED. Measured against
+    production on 2026-08-21: all NINE calendar signals were
+    `calendar.event.updated`, every one carried a populated `attendees` array,
+    and `identity_aliases` held 48 rows of which ZERO were from calendar. A
+    person you only ever meet — never email — could not enter the identity graph.
+
+    Asserted as a SUBSET of Memory's calendar subscriptions rather than as a
+    literal list, so adding a calendar event type to Memory alone fails here
+    instead of silently reopening the gap.
+    """
+    import navis.identity_resolution.service  # noqa: F401 — registers subscribers
+    import navis.memory.service  # noqa: F401
+    from navis.identity_resolution.service import (
+        _on_signal_pointer as identity_handler,
+    )
+    from navis.memory.service import _on_signal_pointer as memory_handler
+    from navis.platform.events import EventType, event_bus
+
+    def subscribed(handler) -> set[EventType]:
+        return {
+            evt
+            for evt, handlers in event_bus._handlers.items()
+            if any(h is handler for h in handlers)
+        }
+
+    identity_events = subscribed(identity_handler)
+    memory_events = subscribed(memory_handler)
+
+    calendar_events = {e for e in memory_events if "CALENDAR" in e.name}
+    assert calendar_events, "memory subscribes to no calendar event — check the import"
+    missing = calendar_events - identity_events
+    assert not missing, (
+        f"identity resolution does not consume {sorted(e.name for e in missing)}; "
+        "calendar attendees on those events never reach the identity graph"
+    )

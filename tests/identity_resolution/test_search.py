@@ -291,3 +291,76 @@ async def test_search_scoped_by_org(db: _FakeSession):
     )
     result = await search_persons(db, ORG, "rahul")
     assert result.matches == ()
+
+
+# ── Cross-provider folding (TASK 6.7) ──────────────────────────────────
+
+
+async def test_one_person_seen_in_two_providers_is_not_reported_as_ambiguous():
+    """The same address via Gmail and via Calendar is ONE person.
+
+    `alias_id` is uuid5 over (org, PROVIDER, kind, value), so one mailbox
+    observed on an email and again on a calendar invite is two alias rows with
+    two ids — and NEITHER extractor emits a co-observation pair between them, so
+    the link log has no edge to walk. Folding on link edges alone therefore
+    produced two matches for one human, `ambiguous=True`, and the scheduling
+    agent asked "which Rahul?" while offering Rahul and Rahul.
+
+    `/identity/persons/lookup` never had the bug — it seeds from every provider's
+    computed id and unions the classes. This asserts search agrees with it.
+    """
+    db = _FakeSession()
+    gmail = db.add_alias(provider="gmail", email="rahul@partner.com", display_name="Rahul S")
+    cal = db.add_alias(provider="calendar", email="rahul@partner.com", display_name="Rahul S")
+
+    result = await search_persons(db, ORG, "rahul")
+
+    assert not result.ambiguous, (
+        f"one person reported as {len(result.matches)} matches: "
+        f"{[m.to_dict() for m in result.matches]}"
+    )
+    single = result.single
+    assert single is not None
+    assert set(single.alias_ids) == {str(gmail.id), str(cal.id)}
+    assert single.emails == ("rahul@partner.com",)
+    # Canonical id convention matches /persons/lookup: smallest alias uuid.
+    assert single.canonical_id == min(str(gmail.id), str(cal.id))
+
+
+async def test_two_different_people_are_still_two_matches():
+    """The value fold is EXACT equality on one kind — never a name match.
+
+    The guard on the fix above: two humans who merely share a display name must
+    stay separate, or the fix would have traded a nuisance for a false merge —
+    the one failure mode this layer refuses to have.
+    """
+    db = _FakeSession()
+    db.add_alias(provider="gmail", email="rahul.sharma@partner.com", display_name="Rahul S")
+    db.add_alias(provider="gmail", email="rahul.verma@other.com", display_name="Rahul S")
+
+    result = await search_persons(db, ORG, "rahul")
+
+    assert result.ambiguous, "two distinct mailboxes must not fold into one person"
+    assert len(result.matches) == 2
+    assert {m.primary_email for m in result.matches} == {
+        "rahul.sharma@partner.com", "rahul.verma@other.com",
+    }
+
+
+async def test_value_fold_still_respects_the_tenant_boundary():
+    """Same address in two organizations stays two people, one per tenant."""
+    other_org = uuid.UUID("99999999-9999-9999-9999-999999999999")
+    db = _FakeSession()
+    mine = db.add_alias(provider="gmail", email="shared@partner.com", display_name="Shared")
+    db.add_alias(
+        provider="calendar", email="shared@partner.com",
+        display_name="Shared", org_id=other_org,
+    )
+
+    result = await search_persons(db, ORG, "shared")
+
+    assert not result.ambiguous
+    single = result.single
+    assert single is not None
+    # Only THIS org's alias folded in; the other tenant's row is invisible.
+    assert single.alias_ids == (str(mine.id),)

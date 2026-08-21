@@ -243,6 +243,29 @@ class Decision:
     # ReasoningSignal's own, shared by reference and already persisted, and
     # injecting decision-scoped provenance into it would mutate a stored signal.
     supporting_insight_ids: tuple[str, ...] = ()
+    # THE ORIGINATING SIGNAL'S OWN confidence and severity, passed through
+    # unchanged. Both are the 0..1 floats the emitting engine assigned (see
+    # reasoning/v2/contract.py); `weight` is their product and is what the
+    # ranker sorts on.
+    #
+    # They are carried because dropping them left `priority_rank` as the only
+    # thing a client could order or judge by, and rank is an ORDINAL — the
+    # position a decision landed in after sorting. Frontends filled the gap by
+    # mapping rank back into a percentage and calling it "confidence", which is
+    # the same number wearing a disguise. The real values existed all along on
+    # the signal this decision was built from; they simply stopped here.
+    #
+    # NOT a calibrated probability. An engine sets confidence by how directly it
+    # OBSERVED the thing (a quoted promise with a quoted deadline scores 0.85;
+    # an inference from silence scores lower), and severity by how much it
+    # matters. Present them as the engine's own values, never as a percentage
+    # likelihood.
+    #
+    # Optional, and defaulted, so every existing construction of this dataclass
+    # keeps working and a decision built without a signal reports null rather
+    # than a fabricated 0.0.
+    confidence: float | None = None
+    severity: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -261,4 +284,18 @@ class Decision:
             # Always present, never conditional: a reader must be able to tell
             # "no insight informed this" from "this build predates provenance".
             "supporting_insight_ids": list(self.supporting_insight_ids),
+            # Same rule, same reason: always present, null when this decision
+            # has no originating signal to take them from. A client must be able
+            # to distinguish "the engine stated no confidence" from "this build
+            # does not report it" — the second is what forces a client to invent
+            # one from `priority_rank`.
+            #
+            # Rounded to match ReasoningSignal.to_dict(), so the same underlying
+            # value is byte-identical wherever it is read.
+            "confidence": (
+                round(self.confidence, 4) if self.confidence is not None else None
+            ),
+            "severity": (
+                round(self.severity, 4) if self.severity is not None else None
+            ),
         }

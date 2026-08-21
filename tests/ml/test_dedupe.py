@@ -153,7 +153,7 @@ async def test_retriever_collapses_before_taking_top_k():
     async def fake_search(db, org_id, qvec, *, model, version, k, since, until):
         return dupes + singles
 
-    async def fake_lineage(db, ids):
+    async def fake_lineage(db, _org_id, ids):
         return lineage
 
     # Retrieval also asks Memory which of these facts are about a CANCELLED
@@ -197,7 +197,7 @@ async def test_retriever_treats_unscored_importance_as_neutral_not_zero():
     async def fake_search(db, org_id, qvec, *, model, version, k, since, until):
         return [h]
 
-    async def fake_lineage(db, ids):
+    async def fake_lineage(db, _org_id, ids):
         return {h.memory_id: FactLineage(uuid.uuid4(), None)}
 
     real_rerank = mod.rerank
@@ -248,7 +248,7 @@ async def _run_retriever(monkeypatch, hits, lineage, cancelled_entities, calls):
     async def fake_search(db, org_id, qvec, *, model, version, k, since, until):
         return list(hits)
 
-    async def fake_lineage(db, ids):
+    async def fake_lineage(db, _org_id, ids):
         return lineage
 
     async def fake_cancelled(db, org_id, entity_ids):

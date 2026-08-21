@@ -1101,3 +1101,39 @@ def test_compose_keeps_everything_when_it_fits():
     composed = R._compose_within_budget(base, extra)
 
     assert [f.kind for f in composed.facts] == ["gmail", "state"]
+
+
+# ── Entitlement gate (TASK 6.8) ─────────────────────────────────────────────
+#
+# `/chat` is the most expensive request in the product and was the only one
+# with no capability dependency — authentication only. The capability gate is
+# also the sole enforcer of organization LIFECYCLE (see
+# `authz.principal_cache_evict_org` and `entitlements._decide`), so a SUSPENDED
+# or CHURNED tenant kept full LLM chat after every other surface had stopped.
+# These two tests lock the gate and the capability it names; a refactor that
+# drops either silently restores the bypass.
+
+def test_chat_is_capability_gated_on_memory():
+    import inspect
+
+    from navis.organization.contract import Capability
+
+    dep = inspect.signature(R.chat).parameters["p"].default
+    closed = [c.cell_contents for c in (dep.dependency.__closure__ or ())]
+    assert any(c is Capability.MEMORY for c in closed), (
+        "/chat must be gated on Capability.MEMORY — without a capability "
+        "dependency a suspended organization keeps unlimited LLM access"
+    )
+
+
+def test_memory_capability_is_granted_by_every_plan():
+    """The gate above must not cost an entitled organization anything.
+
+    MEMORY is in FREE, so adding the dependency denies only suspended/churned
+    tenants, an explicit revocation and the `memory` kill switch. If a future
+    plan drops MEMORY, chat goes dark for that tier and this test says so.
+    """
+    from navis.organization.contract import PLAN_CAPABILITIES, Capability
+
+    for plan, caps in PLAN_CAPABILITIES.items():
+        assert Capability.MEMORY in caps, f"{plan} would lose /chat"

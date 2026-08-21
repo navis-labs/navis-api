@@ -208,6 +208,13 @@ class WhatMattersTodayEngine:
                     supporting_insight_ids=tuple(
                         sorted(f.insight_id for f in facts)
                     ),
+                    # The signal's own values, passed through unchanged. NOT the
+                    # ranking score: `_score` additionally folds in the category
+                    # bias and the intelligence nudge, which are this engine's
+                    # opinion about ordering, not the detecting engine's
+                    # statement about the finding.
+                    confidence=s.confidence,
+                    severity=s.severity,
                 )
             )
         return decisions

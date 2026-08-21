@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 import pytest
 
 from navis.decisions.base import (
+    Decision,
     DecisionCategory,
     category_for,
     is_decision_worthy,
@@ -865,3 +866,73 @@ def test_footprint_only_ever_corroborates_risk_category_signals():
         "Intelligence's risk vocabulary drifted from Decision's RISK category; "
         "footprint can now reach a decision with no specific insight to bound it"
     )
+
+
+# ── Signal confidence/severity reach the client ───────────────────────
+#
+# `Decision` used to drop both, leaving `priority_rank` as the only orderable
+# field on the wire. Rank is an ORDINAL — the position a decision landed in
+# after sorting — so a client that wanted to show how sure Navis was had
+# nothing to read, and the frontend filled the gap by mapping rank back into a
+# percentage and labelling it "confidence". The real values were on the
+# ReasoningSignal the decision was built from the whole time.
+
+
+def test_decision_carries_the_signals_confidence_and_severity():
+    [d] = decide([
+        signal(SignalType.WAITING_ON_USER_REPLY, confidence=0.85, severity=0.6),
+    ])
+    assert d.confidence == 0.85
+    assert d.severity == 0.6
+
+
+def test_serialized_decision_exposes_confidence_and_severity():
+    [d] = decide([
+        signal(SignalType.WAITING_ON_USER_REPLY, confidence=0.85, severity=0.6),
+    ])
+    body = d.to_dict()
+    assert body["confidence"] == 0.85
+    assert body["severity"] == 0.6
+
+
+def test_confidence_is_the_signals_not_the_ranking_score():
+    """The ranker adds a category bias; the reported confidence must not."""
+    [d] = decide([
+        signal(SignalType.WAITING_ON_USER_REPLY, confidence=0.7, severity=0.5),
+    ])
+    # weight = 0.7 * 0.5 = 0.35, and the score adds _CATEGORY_BIAS on top. If
+    # either of those leaked into these fields they would not equal the inputs.
+    assert (d.confidence, d.severity) == (0.7, 0.5)
+
+
+def test_fields_are_always_present_so_absent_is_distinguishable_from_zero():
+    """Null means "no originating signal", not "this build omits it"."""
+    body = Decision(
+        decision_id=uuid.uuid4(),
+        org_id=ORG,
+        title="t",
+        summary="s",
+        why="w",
+        evidence={},
+        priority_rank=1,
+        category=DecisionCategory.RISK,
+        reasoning_signal_ids=[],
+        reasoning_version=2,
+        state_watermark=WATERMARK,
+        created_at=AS_OF,
+    ).to_dict()
+    assert "confidence" in body and body["confidence"] is None
+    assert "severity" in body and body["severity"] is None
+
+
+def test_existing_serialized_fields_are_unchanged():
+    """Additive only — nothing a current client reads may move."""
+    [d] = decide([signal(SignalType.WAITING_ON_USER_REPLY)])
+    body = d.to_dict()
+    for key in (
+        "decision_id", "org_id", "title", "summary", "why", "evidence",
+        "priority_rank", "category", "reasoning_signal_ids",
+        "reasoning_version", "state_watermark", "created_at",
+        "supporting_insight_ids",
+    ):
+        assert key in body, key

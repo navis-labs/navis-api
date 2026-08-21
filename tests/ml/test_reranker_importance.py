@@ -165,7 +165,7 @@ async def test_retriever_asks_for_a_wide_enough_candidate_pool():
         seen["k"] = k
         return []
 
-    async def fake_lineage(db, ids):
+    async def fake_lineage(db, _org_id, ids):
         return {}
 
     original_search = retriever_mod.search

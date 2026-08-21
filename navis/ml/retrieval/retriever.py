@@ -91,7 +91,9 @@ class MemoryRetriever:
         # the ML layer may not import Signals (tests/ml/test_ml_layer.py), and
         # Memory owns this lineage. Combined into a single query because the
         # lookup is round-trip bound (~635ms) regardless of how many ids it takes.
-        lineage = await lineage_by_memory_id(self.db, [h.memory_id for h in hits])
+        lineage = await lineage_by_memory_id(
+            self.db, org_id, [h.memory_id for h in hits]
+        )
         # Absent => unscored => neutral. Never coerce a missing score to zero.
         importance = {
             memory_id: fact.importance
