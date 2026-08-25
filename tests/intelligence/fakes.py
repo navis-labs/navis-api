@@ -8,6 +8,8 @@ from typing import Any
 
 from navis.intelligence.insights import (
     AggRow,
+    ContextEntityRow,
+    ContextLink,
     LearningView,
     OrganizationalRealityView,
     PatternRow,
@@ -44,6 +46,7 @@ def make_reality(
     entity_counts: dict[str, int] | None = None,
     signals: tuple[RealitySignalRow, ...] | None = None,
     reasoning_version: int = 4,
+    context: tuple[ContextEntityRow, ...] = (),
 ) -> OrganizationalRealityView:
     return OrganizationalRealityView(
         org_id=org_id,
@@ -52,7 +55,22 @@ def make_reality(
         reasoning_version=reasoning_version,
         entity_counts=entity_counts if entity_counts is not None else {"person": 3},
         signals=signals if signals is not None else (reality_signal(),),
+        context=context,
     )
+
+
+def context_row(**over) -> ContextEntityRow:
+    """One entity CONTEXT selected, with the citations it carries."""
+    fields: dict[str, Any] = {
+        "entity_type": "commitment",
+        "entity_id": "ent-1",
+        "rank": 0,
+        "reason": "open, oldest activity",
+        "memory_ids": ("mem-1", "mem-2"),
+        "signal_event_ids": ("sig-evt-1",),
+    }
+    fields.update(over)
+    return ContextEntityRow(**fields)
 
 
 def rich_reality(org_id: uuid.UUID = ORG_A, **over) -> OrganizationalRealityView:
@@ -243,3 +261,58 @@ def snapshot(rows) -> set[tuple]:
         )
         for r in rows
     }
+
+
+def context_link(**over) -> ContextLink:
+    """One persisted edge on a context entity."""
+    fields: dict[str, Any] = {
+        "role": "commitments",
+        "entity_type": "commitment",
+        "entity_id": "com-1",
+    }
+    fields.update(over)
+    return ContextLink(**fields)
+
+
+def connected_counterparty_context(
+    *, rel_id: str = "rel-1", com_id: str = "com-1",
+    person_id: str = "per-1", meeting_ids: tuple[str, ...] = ("mtg-1", "mtg-2"),
+) -> tuple[ContextEntityRow, ...]:
+    """THE AJITESH SHAPE — one counterparty, the edges State really persists.
+
+    Mirrors the production graph the audit found on org 071ae55b verbatim:
+
+        commitment   --owner---------> person
+        person       --relationships-> relationship
+        relationship --commitments---> commitment
+        relationship --meetings------> meeting, meeting
+    """
+    return (
+        context_row(
+            entity_type="commitment", entity_id=com_id, rank=0,
+            reason="open, oldest activity",
+            links=(context_link(role="owner", entity_type="person", entity_id=person_id),),
+        ),
+        context_row(
+            entity_type="relationship", entity_id=rel_id, rank=1,
+            reason="stalest interaction",
+            memory_ids=("mem-rel-1",), signal_event_ids=("sig-evt-rel-1",),
+            links=(
+                context_link(role="commitments", entity_type="commitment", entity_id=com_id),
+                *(
+                    context_link(role="meetings", entity_type="meeting", entity_id=m)
+                    for m in meeting_ids
+                ),
+            ),
+        ),
+        context_row(
+            entity_type="person", entity_id=person_id, rank=2,
+            reason="most recently seen",
+            memory_ids=("mem-per-1",), signal_event_ids=(),
+            links=(
+                context_link(
+                    role="relationships", entity_type="relationship", entity_id=rel_id
+                ),
+            ),
+        ),
+    )

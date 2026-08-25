@@ -15,16 +15,17 @@ from pydantic import BaseModel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from navis.decisions.explanation import explain
 from navis.decisions.models import DailyBrief, DecisionDismissal
 from navis.decisions.service import DecisionService
 from navis.identity.authz import Principal, require_permission
 from navis.identity.dependencies import CurrentContext, get_current_context
 from navis.identity.permissions import Permission
 from navis.identity.throttle import rate_limit
-from navis.execution.proposer import decision_obligation_key
+from navis.execution.proposer import decision_action
 from navis.execution.repository import ExecutionRepository
 from navis.execution.summary import execution_summary
-from navis.orchestration.brief import build_brief, propose_actions
+from navis.orchestration.brief import brief_for_today, build_brief, propose_actions
 from navis.organization.contract import Capability
 from navis.organization.guards import require_capability
 from navis.platform.database import get_session
@@ -37,18 +38,36 @@ _DISMISSAL_NAMESPACE = uuid.UUID("7e2b1c4a-9d5f-5e11-b8c2-4a9f6c3d2b18")
 router = APIRouter(prefix="/brief", tags=["decisions"])
 
 
-def _serialize(brief: Any, decisions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _serialize(
+    brief: Any,
+    decisions: list[dict[str, Any]] | None = None,
+    obligations: dict[str, Any] | None = None,
+    freshness: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "id": str(brief.id),
         "org_id": str(brief.organization_id),
         "as_of": brief.as_of.isoformat() if brief.as_of else None,
         "reasoning_version": brief.reasoning_version,
         "state_watermark": brief.state_watermark,
+        # WHETHER THIS BRIEF STILL DESCRIBES THE CURRENT ORGANIZATION — see
+        # `orchestration.brief._freshness`. Null on the routes that do not make
+        # the comparison (`/generate` has just built the brief from the state it
+        # folded), which stays distinguishable from `current: null` meaning "the
+        # comparison was attempted and could not be made".
+        "freshness": freshness,
         "decisions": brief.decisions if decisions is None else decisions,
+        # HOW MANY OBLIGATIONS THIS BRIEF IS A WINDOW ONTO — see
+        # `DecisionService.obligations`. Always present so a client never has to
+        # decide whether a missing key means zero; `available: false` is what
+        # says the counts carry no information.
+        "obligations": obligations,
     }
 
 
-async def _with_executions(db: AsyncSession, brief: Any) -> dict[str, Any]:
+async def _with_executions(
+    db: AsyncSession, brief: Any, freshness: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """The brief, with each decision told what has already been done about it.
 
     Without this the dashboard cannot tell "nobody has replied yet" from "the
@@ -66,23 +85,72 @@ async def _with_executions(db: AsyncSession, brief: Any) -> dict[str, Any]:
     `latest_brief` changes. Decisions gain `execution`, which is null whenever
     no execution exists — the common case, since most decisions are findings to
     read rather than replies to send.
+
+    They also gain `action`: WHETHER THIS DECISION CAN BE ACTED ON AT ALL, and
+    through which existing action type. The proposer's answer to that question
+    was already being computed here and thrown away — `_map` runs for every
+    decision to derive the obligation key — while a client had no way to ask it,
+    so an Execute affordance could only be offered on every card or none. Most
+    decisions are findings: `risk`, `opportunity` and `delegation` have no
+    draftable action, and a `waiting_reply` whose thread carries no
+    `rfc_message_id` has no addressable obligation either. Both report
+    `action: null`, which is the difference between "nothing has been done yet"
+    (`execution: null`) and "there is nothing to do here".
+
+    Nothing new decides this. The action type is `execution.models.ActionType`,
+    the mapping is `execution.proposer._map`, and the identity is
+    `execution.obligation.reply_obligation_key` — the same three the write path
+    uses, so a card cannot offer an action the proposer would refuse to create.
     """
+    svc = DecisionService(db)
+    obligations = await svc.obligations(brief)
     decisions = list(brief.decisions or [])
     if not decisions:
-        return _serialize(brief)
+        return _serialize(brief, obligations=obligations, freshness=freshness)
 
-    # Same `_map` the proposer uses, so the read path and the write path cannot
-    # disagree about which obligation a decision represents.
-    keys = [decision_obligation_key(d) for d in decisions]
+    # WHETHER EACH DECISION'S REASONING IS REPRODUCIBLE AT ITS OWN SNAPSHOT.
+    #
+    # One query for the whole brief. A decision publishes the values the engines
+    # produced during its pass, while its `reasoning_signal_ids` pointer resolves
+    # to a stored conclusion — and until observations existed, that pointer led to
+    # the conclusion's FIRST detection, so live decision 4373a0b3 reports 11.85
+    # days / 0.8951 against a cited signal recording 7.16 / 0.7386.
+    #
+    # Reported, never repaired: an unverifiable decision is still served, still
+    # ranked, still actionable — it simply stops claiming provenance it cannot
+    # produce. Substituting a neighbouring observation would recreate the defect
+    # one layer up. See `DecisionService.provenance`.
+    provenance = await svc.provenance(brief)
+
+    # ONE derivation, shared with the proposer: `decision_action` runs the same
+    # `_map` the write path runs, so the read path and the write path cannot
+    # disagree about which obligation a decision represents — or about whether
+    # it has one at all.
+    actions = [decision_action(d) for d in decisions]
     found = await ExecutionRepository(db).get_by_obligation_keys(
-        brief.organization_id, [k for k in keys if k]
+        brief.organization_id, [a.obligation_key for a in actions if a]
     )
 
-    enriched = [
-        {**d, "execution": execution_summary(found.get(k)) if k else None}
-        for d, k in zip(decisions, keys)
-    ]
-    return _serialize(brief, enriched)
+    enriched = []
+    for d, a in zip(decisions, actions):
+        row = {
+            **d,
+            "execution": (
+                execution_summary(found.get(a.obligation_key)) if a else None
+            ),
+            "action": a.to_dict() if a else None,
+            # Always present, never conditional — same rule the decision fields
+            # follow: a client must be able to tell "this reasoning could not be
+            # verified" from "this build does not report verification".
+            "provenance": provenance.get(str(d.get("decision_id"))),
+        }
+        # The founder-facing projection, built LAST so it can read `action` and
+        # answer "can Navis do it?" from the same value the card renders a
+        # button from. Pure and additive — every stored field above is
+        # untouched and stays available to the trace view.
+        row["explanation"] = explain(row)
+        enriched.append(row)
+    return _serialize(brief, enriched, obligations=obligations, freshness=freshness)
 
 
 @router.post(
@@ -104,11 +172,17 @@ async def today(
     p: Principal = Depends(require_capability(Capability.DECISION)),
     db: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    """What the founder opens in the morning. Builds one if none exists yet."""
-    brief = await DecisionService(db).latest_brief(p.org_id)
-    if brief is None:
-        brief = await build_brief(db, p.org_id)
-    return await _with_executions(db, brief)
+    """What the founder opens in the morning.
+
+    Builds one if none exists yet, and REBUILDS one that no longer describes the
+    organization: a brief is keyed on the state watermark it was ranked at, so a
+    watermark that has moved is a cache key that has changed. See
+    `orchestration.brief.brief_for_today` — the comparison is one indexed read,
+    the rebuild reuses the existing pipeline, and the result reports which
+    happened rather than leaving the founder to guess.
+    """
+    brief, freshness = await brief_for_today(db, p.org_id)
+    return await _with_executions(db, brief, freshness)
 
 
 @router.post(

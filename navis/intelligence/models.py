@@ -44,8 +44,21 @@ class InsightType(str, enum.Enum):
     OPPORTUNITY = "opportunity_intelligence"
     RELATIONSHIP = "relationship_intelligence"
     COMMITMENT = "commitment_intelligence"
+    # What the organization currently OWES a named counterparty — an unanswered
+    # person, a judgment somebody asked for. Its OWN family rather than a member
+    # of RISK, deliberately: `_RISK_SIGNAL_TYPES` is byte-identical to the set
+    # Decision maps to `DecisionCategory.RISK`, so the two layers mean the same
+    # thing by "risk" and `organizational_status`'s open-risk count matches the
+    # brief's. A debt with a name on it is not a decaying relationship.
+    OBLIGATION = "obligation_intelligence"
     STATUS = "organizational_status"
     TREND = "trend_intelligence"
+    # ONE COUNTERPARTY, and every conclusion Reasoning reached about them,
+    # connected through the edges State persisted. The only insight family that
+    # is not a GROUP BY over signal type: every other reality type answers "how
+    # many of this kind of thing?", and this one answers "what is going on with
+    # this person?". See `insights.situation_intelligence`.
+    SITUATION = "situation_intelligence"
 
 
 def compute_insight_id(

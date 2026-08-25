@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime
+from typing import Any, Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,6 +39,10 @@ logger = get_logger("ml.rag.context")
 _WORD = re.compile(r"\S+")
 
 LEARNING_KIND = "learning"
+# `Grounding.kind` for a persisted organizational insight. Already a member of
+# `_CONCLUSION_KINDS` below — the composition band existed before anything
+# produced facts for it.
+INTELLIGENCE_KIND = "intelligence"
 
 # How each outcome surface is NAMED to the model. The three are phrased apart on
 # purpose: a delivery failure and a customer's silence are different facts about
@@ -83,7 +89,33 @@ _STATE_KINDS = frozenset({"state", "learning"})
 _LEADING_STATE_FACTS = 6
 
 
-def _compose(candidates: list[Grounding], question: str) -> list[Grounding]:
+# How many org-wide CONCLUSIONS may precede the evidence on an entity question.
+#
+# Same failure the State band was bounded for, measured again with Intelligence
+# in the mix. On the live organization, all eight entity-centric probe questions
+# produced an identical 53-fact bundle whose first SEVEN facts were org-wide
+# insights — "3 hub companies", "Tracking 113 organizational entities" — none of
+# which named the person asked about. The model anchored on the organization and
+# answered about the organization.
+#
+# Conclusions still lead, because a conclusion is what a founder asked for. But
+# on an entity question the ones that do not mention the entity are no longer
+# allowed to fill the opening: three of them, then the entity's own facts, then
+# the rest. Unbounded remains correct for an org-wide question, where every
+# conclusion IS the subject — so this only binds when `subject_terms` is given.
+_LEADING_OFF_SUBJECT_CONCLUSIONS = 3
+
+
+def _on_subject(text: str, terms: tuple[str, ...]) -> bool:
+    low = (text or "").lower()
+    return any(t in low for t in terms)
+
+
+def _compose(
+    candidates: list[Grounding],
+    question: str,
+    subject_terms: tuple[str, ...] = (),
+) -> list[Grounding]:
     """Order the context: conclusions, the State that explains them, evidence.
 
     Three bands rather than a flat sort by kind:
@@ -138,11 +170,38 @@ def _compose(candidates: list[Grounding], question: str) -> list[Grounding]:
     # order, so every retrieved fact is admitted BEFORE the first tail entity is
     # considered. The tail spends only what the evidence left over, and is the
     # first thing dropped when the budget does bind.
+    if not subject_terms:
+        return [
+            *conclusions,
+            *ranked_state[:_LEADING_STATE_FACTS],
+            *evidence,
+            *ranked_state[_LEADING_STATE_FACTS:],
+        ]
+
+    # ENTITY QUESTION. Facts that name the subject come first within every band,
+    # and the org-wide conclusions that do not are capped so they cannot own the
+    # opening. Order within each group is preserved, so the ranking each band
+    # already had is unchanged — this only decides which group goes first.
+    on_c = [g for g in conclusions if _on_subject(g.text, subject_terms)]
+    off_c = [g for g in conclusions if not _on_subject(g.text, subject_terms)]
+    on_e = [g for g in evidence if _on_subject(g.text, subject_terms)]
+    off_e = [g for g in evidence if not _on_subject(g.text, subject_terms)]
+    on_s = [g for g in ranked_state if _on_subject(g.text, subject_terms)]
+    off_s = [g for g in ranked_state if not _on_subject(g.text, subject_terms)]
+
     return [
-        *conclusions,
-        *ranked_state[:_LEADING_STATE_FACTS],
-        *evidence,
-        *ranked_state[_LEADING_STATE_FACTS:],
+        # What the organization concluded ABOUT THIS PERSON — the direct answer
+        # when one exists, and empty without inventing anything when it does not.
+        *on_c,
+        *off_c[:_LEADING_OFF_SUBJECT_CONCLUSIONS],
+        # The subject's own evidence and state, ahead of everything generic.
+        *on_e,
+        *on_s,
+        *off_s[:_LEADING_STATE_FACTS],
+        *off_e,
+        # Still present, still citable, first to go when the budget binds.
+        *off_c[_LEADING_OFF_SUBJECT_CONCLUSIONS:],
+        *off_s[_LEADING_STATE_FACTS:],
     ]
 
 
@@ -236,6 +295,125 @@ async def learning_groundings(db: AsyncSession, org_id: uuid.UUID) -> list[Groun
     return learning_facts(await learning_snapshot(db, org_id))
 
 
+# How many insights may enter one context. Same reason as `_MAX_SIGNAL_FACTS`:
+# the token budget would bound this anyway, but the cap bounds the WORK so an org
+# with a long projection history does not render hundreds of strings to discard
+# most of them. Insights are already deduped to one row per logical insight by
+# `get_insights`, so this trims a ranked list, never a pile of near-duplicates.
+_MAX_INSIGHT_FACTS = 8
+
+
+def intelligence_facts(rows: Sequence[Any]) -> list[Grounding]:
+    """What the organization has CONCLUDED about itself, as cited facts.
+
+    PURE — a function of the rows alone. No clock, no model, no database, no
+    randomness, so the same projection always renders the same facts in the same
+    order. Same contract as `learning_facts`, and for the same reason: a
+    conclusion the model is shown has to be reproducible.
+
+    WHY THIS EXISTS. Intelligence is the layer that already answers "what is true
+    of this organization" — it is projected on every brief
+    (`orchestration/brief.py::_project_intelligence`) and served at
+    `GET /intelligence/insights`. Chat could not see any of it, so the one
+    surface a founder asks organizational questions through was asking the LLM to
+    re-derive, from raw memory, conclusions the organization had already reached
+    and persisted. This hands it the conclusions instead.
+
+    NOTHING IS INFERRED HERE. `title` and `summary` are what the engine wrote;
+    `sample_size` is a count it recorded. This layer renders, it does not select
+    (that is `get_insights`) and it does not judge.
+
+    `confidence` IS DELIBERATELY NOT RENDERED. It is a real stored float, but a
+    number in a prompt is a number the model will restate — and a restated
+    confidence reads to a founder as a measurement of the answer rather than of
+    the insight. The `insight_id` travels on the citation instead, so a client
+    that wants the number reads it from `GET /intelligence/insights`, where it
+    carries its own context. Rank is never converted into one either: the order
+    below is a sort, and a sort is not a score.
+
+    Ordered by (insight_type, key) — the same total order `get_insights` already
+    returns — so the pick is deterministic rather than "whatever the scan found".
+    """
+    facts: list[Grounding] = []
+    for row in sorted(rows, key=lambda r: (r.insight_type or "", r.key or ""))[
+        :_MAX_INSIGHT_FACTS
+    ]:
+        summary = (row.summary or "").strip()
+        title = (row.title or "").strip()
+        if not summary and not title:
+            continue  # an insight with nothing to say contributes nothing
+        body = f"{title}: {summary}" if title and summary else (title or summary)
+        # The sample size is a COUNT the engine recorded, not a derived score, so
+        # it is safe to state — and it is what lets a reader tell a conclusion
+        # drawn from 40 outcomes from one drawn from 2.
+        if row.sample_size:
+            body += f" (drawn from {row.sample_size} observations)"
+        facts.append(
+            Grounding(
+                kind=INTELLIGENCE_KIND,
+                source=f"insight:{row.insight_id}",
+                text=body,
+                # Logical time (max occurred_at of the learning consumed), NOT a
+                # wall clock — see the model. Absent on rows that recorded none.
+                occurred_at=row.created_at,
+                # The drill-down an insight already carries. Every entry is a real
+                # recorded id; an insight that folded no signals contributes none
+                # rather than an invented one.
+                lineage=(
+                    *(
+                        (f"state_watermark:{row.state_watermark}",)
+                        if row.state_watermark
+                        else ()
+                    ),
+                    *(
+                        (f"learning_version:{row.learning_version}",)
+                        if row.learning_version is not None
+                        else ()
+                    ),
+                    *(
+                        f"reasoning_signal:{s}"
+                        for s in (row.evidence or {}).get(
+                            "supporting_reasoning_signal_ids"
+                        )
+                        or ()
+                    ),
+                    *(
+                        f"learning_event:{e}"
+                        for e in (row.supporting_learning_event_ids or ())
+                    ),
+                ),
+            )
+        )
+    return facts
+
+
+async def intelligence_groundings(
+    db: AsyncSession, org_id: uuid.UUID
+) -> list[Grounding]:
+    """Read this org's CURRENT insights through Intelligence's own repository.
+
+    The ONLY entry point from ML into Intelligence, and it goes through
+    `IntelligenceRepository.get_insights` rather than a query of its own —
+    that boundary owns which projection is current and which rows are
+    superseded, and a second query here would be a third read semantics for one
+    append-only table (`orchestration/brief.py::_current_intelligence` makes the
+    same argument for the same reason).
+
+    ML is ALLOWED to import Intelligence: the layer invariant in
+    tests/ml/test_ml_layer.py forbids `reasoning`, `decisions`, `execution`,
+    `signals`, `observation` and `adaptive`, and states outright that "ML may
+    READ memory/state/learning/intelligence". So this is a direct read, exactly
+    like Learning — unlike State and Reasoning, which are forbidden here and
+    therefore arrive pre-flattened from the composition root via `extra`.
+
+    Org-scoped by the repository in every statement it runs, so isolation is a
+    property of the contract rather than of this caller remembering to filter.
+    """
+    from navis.intelligence.repository import IntelligenceRepository
+
+    return intelligence_facts(await IntelligenceRepository(db).get_insights(org_id))
+
+
 class ContextBuilder:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -252,9 +430,39 @@ class ContextBuilder:
         until: datetime | None = None,
         now: datetime | None = None,
         include_learning: bool = True,
+        include_intelligence: bool = True,
+        retrieval_query: str | None = None,
+        # Lower-cased alias strings naming who this question is about, when the
+        # caller resolved one. Composition only — it never changes what is
+        # fetched, only the order facts are read in. See `_compose`.
+        subject_terms: tuple[str, ...] = (),
+        # Optional SECOND HOP, given what retrieval actually found.
+        #
+        # Called once, after retrieval, with the memory facts it produced; returns
+        # extra groundings to admit alongside them. It exists so a caller can act
+        # on the retrieved set — "similarity found nothing about the person this
+        # question names, fetch their records by id" — without this module
+        # learning what a person is. ML may not import identity resolution, and
+        # the decision needs it, so the decision lives in the caller and only its
+        # RESULT crosses the boundary.
+        #
+        # One hop, never a loop: the callback is awaited exactly once and its
+        # output is not re-examined. That is what keeps the cost bounded and the
+        # path deterministic.
+        expand: "Callable[[list[Grounding]], Awaitable[list[Grounding]]] | None" = None,
     ) -> GroundedContext:
+        # WHAT WE SEARCH FOR vs WHAT WE SHOW THE MODEL. `question` is the
+        # founder's own words and is what `GroundedContext.question` renders and
+        # what `_compose` ranks State against. `retrieval_query` is what the
+        # vector search embeds, and it defaults to the same thing.
+        #
+        # They differ when the caller has resolved the question's subject to a
+        # real identity: memory records hold a person's ADDRESS far more often
+        # than their display name, so embedding "Why does X matter?" searched a
+        # corpus that barely contains the string "X". The caller appends the
+        # canonical aliases; nothing here invents any.
         hits = await MemoryRetriever(self.db).search(
-            org_id, question, k=k, since=since, until=until
+            org_id, retrieval_query or question, k=k, since=since, until=until
         )
         candidates: list[Grounding] = [
             Grounding(
@@ -265,6 +473,14 @@ class ContextBuilder:
             )
             for h in hits
         ]
+        # The one optional second hop, decided from what retrieval actually
+        # returned. Wrapped: an expansion that fails costs the answer some depth,
+        # never the turn — the same contract Learning and Intelligence keep below.
+        if expand is not None:
+            try:
+                candidates += await expand(list(candidates))
+            except Exception:  # noqa: BLE001 — expansion never fails the turn
+                logger.exception("context expansion failed org=%s", org_id)
         # What the org has LEARNED from its own outcomes. Read AFTER retrieval and
         # wrapped, deliberately on both counts: retrieval is the answer, learning
         # is enrichment, and enrichment is never worth failing the turn for. A
@@ -282,13 +498,30 @@ class ContextBuilder:
             except Exception:  # noqa: BLE001 — enrichment never fails the turn
                 logger.exception("learning groundings unavailable org=%s", org_id)
 
+        # What the org has CONCLUDED about itself. Read on the same terms as
+        # Learning — after retrieval, wrapped, never fatal — because it is
+        # enrichment of the same class: a conclusion the organization already
+        # reached and persisted, not the answer to this particular question.
+        #
+        # These land in the CONCLUSION band (`_compose`), ahead of State and
+        # evidence, because that is what a founder asking an organizational
+        # question is actually asking for: the conclusion first, the facts it was
+        # drawn from after.
+        insights: list[Grounding] = []
+        if include_intelligence:
+            try:
+                insights = await intelligence_groundings(self.db, org_id)
+            except Exception:  # noqa: BLE001 — enrichment never fails the turn
+                logger.exception("intelligence groundings unavailable org=%s", org_id)
+
         candidates += learned
+        candidates += insights
         candidates += list(extra or [])
         # Order by WHAT THE FACT IS, not by which layer supplied it: conclusions
         # lead, a bounded question-ranked slice of State explains them, then the
         # evidence they were derived from. See `_compose` for why the State slice
         # is bounded. Nothing is dropped and no provenance changes.
-        candidates = _compose(candidates, question)
+        candidates = _compose(candidates, question, subject_terms)
 
         # Cost what is actually SENT, not just the fact text. The prompt carries
         # a header plus, per fact, an index, a date and a `(kind:source)`

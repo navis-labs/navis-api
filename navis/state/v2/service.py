@@ -4,8 +4,22 @@ Downstream (Reasoning, Decision, Execution, Learning, Intelligence) read
 OrganizationalState from here and never query Memory directly.
 
   rebuild_org        — full deterministic rebuild, STREAMED from memory_records
-  incremental_update — fold only memory_records after the snapshot watermark
+  incremental_update — fold only memory_records observed after the snapshot cursor
   get_state          — return the cached projection (rebuild if absent/invalid)
+
+THE TWO CLOCKS. `event_timestamp` says when a business fact HAPPENED and drives the
+fold order; `observed_at` (= `memory_records.created_at`) says when Navis LEARNED it
+and drives the resume cursor and `as_of`. They are not interchangeable: the Calendar
+connector deliberately stamps a signal with the meeting's START, so event time runs
+ahead of wall clock and is unusable as a cursor. See `state/v2/models.py`.
+
+TWO GUARDS, both fail into `rebuild_org` rather than into a wrong answer:
+  * COMPLETENESS — `reader.count()` vs `state.record_count`. A row that landed
+    below an already-advanced cursor is invisible to the cursor and unmissable to
+    the count. This is what stops records being silently skipped.
+  * ORDERING — the delta's earliest record vs `state.fold_frontier`. The reducer is
+    latest-non-null-wins in event order, so folding a record that happened before
+    something already folded would clobber a newer fact. Detected, never absorbed.
 
 Production posture (all hardening below preserves replay determinism — it only
 changes WHEN we rebuild and HOW we read, never WHAT the projection computes):
@@ -30,7 +44,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +56,7 @@ from navis.state.v2.models import (
     PROJECTION_VERSION,
     STATE_SCHEMA_VERSION,
     OrganizationalState,
+    order_key,
 )
 from navis.state.v2.repository import MemoryReader, SnapshotRepository
 
@@ -50,6 +65,13 @@ logger  = get_logger("state.v2")
 # Advisory-lock space for State — disjoint from signals/memory/execution (blake2b
 # personalization), so a State per-org lock never collides with another domain's lock.
 _LOCK_NAMESPACE = b"navis.state"
+
+# How many newly-observed records an incremental fold will hold in memory before
+# giving up and rebuilding. The delta MUST be materialized (it arrives in
+# observation order and has to be sorted into event order before folding), so it
+# needs a ceiling. Past it a full rebuild is the better answer anyway: it streams
+# at O(entities) memory and does the same amount of folding work.
+_MAX_INCREMENTAL_DELTA = 5000
 
 # ── In-process cache of deserialized OrganizationalState ────────────────────
 # Keyed by (org_id, projection_version, watermark_memory_id) so that a
@@ -60,13 +82,14 @@ _LOCK_NAMESPACE = b"navis.state"
 # returns in <100ms once the deserialized state is in-process.
 #
 # Correctness (this cache never returns a stale projection):
-#   * Any new memory record past the current watermark advances
-#     state.watermark.last_memory_id, which changes the cache key. The old
-#     entry becomes unreachable and eventually LRU-evicts.
-#   * Every call still verifies via MemoryReader.has_records_after() that
-#     nothing new has landed since the cached watermark — a cheap EXISTS
-#     query. When new records exist, the fast path falls through to the
-#     original fold-from-snapshot flow.
+#   * Any new memory record advances state.watermark.last_memory_id, which
+#     changes the cache key. The old entry becomes unreachable and eventually
+#     LRU-evicts.
+#   * Every call still verifies via MemoryReader.count() that the org holds
+#     exactly as many records as the cached projection folded. That replaced a
+#     `has_records_after` EXISTS probe, which could only see records ABOVE the
+#     cursor and therefore certified a projection with stranded rows below it as
+#     authoritative. A count sees both, in the same round-trip.
 #   * Snapshot disposal (corruption / schema drift) evicts the org from the
 #     cache too, so the next call rebuilds from Memory.
 #   * `projection_version` is part of the key: a bump automatically misses
@@ -162,13 +185,22 @@ class StateService:
     # --- public API ----------------------------------------------------------
 
     async def rebuild_org(
-        self, org_id: uuid.UUID, *, as_of: datetime | None = None
+        self, org_id: uuid.UUID, *, as_of: datetime | None = None, force: bool = False
     ) -> OrganizationalState:
         # Single-flight per org (best-effort, non-blocking): a concurrent full rebuild is
         # wasted O(org) work. A loser serves the freshest usable snapshot if one exists,
         # else rebuilds anyway (correctness > dedup). as_of rebuilds bypass the fallback —
         # they must reflect the requested point, not whatever snapshot happens to exist.
-        if as_of is None and not await self._acquire_org_lock(org_id):
+        #
+        # `force` bypasses it too, and that is not an optimization — it is required
+        # for correctness. Every incremental bail-out (`_rebuild_because`) rebuilds
+        # PRECISELY BECAUSE the stored snapshot was found incomplete or out of
+        # order. Handing that same row back on lock contention would answer "this
+        # projection is missing records" with the projection missing records, which
+        # is the silent staleness this whole change exists to remove. Losing the
+        # lock costs a duplicated fold; serving the rejected snapshot costs the
+        # correctness we just proved was absent.
+        if as_of is None and not force and not await self._acquire_org_lock(org_id):
             metrics.incr("state.rebuild.contended")
             existing = self._deserialize(
                 await self.snapshots.latest(org_id, projection_version=PROJECTION_VERSION)
@@ -177,31 +209,35 @@ class StateService:
                 logger.info("state rebuild contended org=%s -> served snapshot", org_id)
                 return existing
 
-        state, facts = await self._fold_stream(org_id, as_of=as_of)
-        assert state is not None  # base=None always yields a (possibly empty) projection
+        state, facts = await self._fold_full(org_id, as_of=as_of)
         await self.snapshots.save(state)
         _cache_put(state)
         metrics.incr("state.rebuild")
-        logger.info("state rebuilt org=%s facts=%d %s", org_id, facts, state.counts())
+        self._log_horizon("rebuilt", state, facts)
         return state
 
     async def incremental_update(self, org_id: uuid.UUID) -> OrganizationalState:
+        """Fold everything observed since the snapshot cursor, or rebuild.
+
+        There is no third outcome. Every path below either produces a projection
+        that provably folded all `total` records in correct event order, or calls
+        `rebuild_org`. Nothing is ever skipped and nothing stale is ever served.
+        """
+        # One round-trip that answers both "is there anything new?" and "is
+        # anything missing?". Cheaper than the fold it guards and strictly more
+        # informative than the EXISTS probe it replaced.
+        total = await self.reader.count(org_id)
+
         # Warm-cache fast path — the /context hot path. If we already have the
-        # deserialized snapshot in-process AND nothing new has landed past its
-        # watermark, we can skip both the JSONB payload fetch and the Python
+        # deserialized snapshot in-process AND it accounts for every record the
+        # org holds, we skip both the JSONB payload fetch and the Python
         # deserialize (the two dominant costs, together ~10s on a warm org).
-        #
-        # Correctness gate: an EXISTS check against `memory_records` past the
-        # cached watermark. If any row landed, we fall through to the original
-        # fold-from-snapshot flow and re-derive state deterministically.
         wm = await self.snapshots.watermark_only(
             org_id, projection_version=PROJECTION_VERSION
         )
         if wm is not None:
             cached = _cache_get(org_id, PROJECTION_VERSION, wm[1])
-            if cached is not None and not await self.reader.has_records_after(
-                org_id, cached.watermark
-            ):
+            if cached is not None and cached.record_count == total:
                 metrics.incr("state.cache.warm_hit")
                 return cached
 
@@ -212,18 +248,107 @@ class StateService:
                 await self._dispose(org_id)  # unusable/corrupt -> drop so rebuild can overwrite
             return await self.rebuild_org(org_id)
 
-        state, facts = await self._fold_stream(org_id, after=prev.watermark, base=prev)
-        if state is None:  # nothing past the watermark
+        delta = await self.reader.observed_since(
+            org_id, prev.watermark, limit=_MAX_INCREMENTAL_DELTA
+        )
+        if delta is None:
+            # Bigger than we are willing to hold in memory. A rebuild streams and
+            # costs the same work at bounded memory, so it is the cheaper answer.
+            return await self._rebuild_because(org_id, "delta_too_large")
+
+        if not delta:
+            if prev.record_count != total:
+                # Nothing NEW, yet the counts disagree — rows exist below a cursor
+                # that has already moved past them. This is the stranding an
+                # EXISTS probe could never see, and it is the reason the fast
+                # path counts instead of probing.
+                return await self._rebuild_because(org_id, "records_stranded")
             # Populate the warm cache so the next call takes the fast path
             # above; on cold Uvicorn workers this is the first time we've
-            # paid the deserialize cost for this (org, watermark).
+            # paid the deserialize cost for this (org, cursor).
             _cache_put(prev)
             return prev
+
+        # The delta arrives in OBSERVATION order; the reducer needs EVENT order.
+        # Sorting here is what lets one sync batch (all rows sharing a single
+        # transaction timestamp) fold in the order the facts actually happened.
+        delta.sort(key=lambda r: order_key(r.event_timestamp, r.memory_id))
+        earliest = delta[0]
+        if not prev.fold_frontier.precedes(earliest.event_timestamp, earliest.memory_id):
+            # This record happened BEFORE something already folded. Applying it
+            # now would overwrite a newer fact and diverge from a full rebuild,
+            # so the fold order assumption is void and we re-derive from scratch.
+            metrics.incr("state.out_of_order.detected")
+            return await self._rebuild_because(org_id, "out_of_order")
+
+        builder = StateBuilder.from_state(prev)
+        for rec in delta:
+            builder.apply(rec)
+        state = builder.finalize(as_of=None)
+
+        if state.record_count != total:
+            # The delta was consistent but the arithmetic is not: something landed
+            # below the cursor while we were folding, or a concurrent writer
+            # committed out of order. Either way this projection cannot prove it
+            # is complete, so it is not persisted.
+            return await self._rebuild_because(org_id, "count_mismatch")
+
         await self.snapshots.save(state)
         _cache_put(state)
         metrics.incr("state.incremental")
-        logger.info("state incremental org=%s +%d facts %s", org_id, facts, state.counts())
+        self._log_horizon("incremental", state, len(delta))
         return state
+
+    async def _rebuild_because(
+        self, org_id: uuid.UUID, reason: str
+    ) -> OrganizationalState:
+        """Fall back to the deterministic full rebuild, and SAY WHY.
+
+        Every incremental bail-out routes through here so the reason is both
+        metered and logged. A silent rebuild is almost as bad as a silent skip:
+        `out_of_order` and `records_stranded` are the two signals that tell an
+        operator a connector is delivering late or a future-dated event is in
+        play, and neither is visible from the projection itself.
+        """
+        metrics.incr("state.rebuild.fallback", labels={"reason": reason})
+        logger.warning(
+            "state incremental fold invalid org=%s reason=%s -> full rebuild",
+            org_id, reason,
+        )
+        # force=True: the stored snapshot is the thing we just rejected, so the
+        # contention fallback must not hand it back. See `rebuild_org`.
+        return await self.rebuild_org(org_id, force=True)
+
+    @staticmethod
+    def _log_horizon(kind: str, state: OrganizationalState, facts: int) -> None:
+        """Structured, content-free record of where this projection's clock sits.
+
+        Ids, counts and timestamps only — never a payload, a subject or an
+        address. `observation_horizon` is the invariant an operator watches:
+        it must never exceed wall clock, and the gap between it and now is the
+        organization's real projection lag.
+        """
+        horizon = state.watermark.last_timestamp
+        lag_s: float | None = None
+        if horizon is not None:
+            lag_s = max(
+                0.0, (datetime.now(timezone.utc) - horizon).total_seconds()
+            )
+            metrics.observe_ms("state.projection.lag", lag_s * 1000.0)
+        logger.info(
+            "state %s org=%s facts=%d records=%d observation_horizon=%s "
+            "as_of=%s fold_frontier=%s lag_s=%s %s",
+            kind, state.org_id, facts, state.record_count,
+            horizon.isoformat() if horizon else None,
+            state.as_of.isoformat() if state.as_of else None,
+            (
+                state.fold_frontier.last_event_timestamp.isoformat()
+                if state.fold_frontier.last_event_timestamp
+                else None
+            ),
+            None if lag_s is None else round(lag_s, 3),
+            state.counts(),
+        )
 
     async def get_state(self, org_id: uuid.UUID) -> OrganizationalState:
         # Warm-cache fast path — mirrors incremental_update. `get_state` is
@@ -274,6 +399,27 @@ class StateService:
                 state.projection_version, PROJECTION_VERSION,
             )
             return None
+        # AN OBSERVATION CURSOR IN THE FUTURE IS NOT A STALE CACHE, IT IS A LIE.
+        #
+        # `created_at` is assigned by Postgres at insert, so a cursor derived from
+        # it cannot exceed wall clock. If a stored one does, the row was written by
+        # something that did not mean observation time by it — which is exactly what
+        # production's orphaned `projection_version = 2` row turned out to be.
+        #
+        # Trusting it is unrecoverable rather than merely wrong: the delta past a
+        # future cursor is always empty, and the monotonic upsert guard then refuses
+        # every corrected write for being "older". So the invariant is enforced on
+        # READ, where a violation still costs one rebuild and disposes the bad row.
+        # This is the only clock reference in State, and it validates a CACHE — the
+        # projection itself stays a pure function of (memory_records, as_of).
+        cursor = state.watermark.last_timestamp
+        if cursor is not None and cursor > datetime.now(timezone.utc):
+            metrics.incr("state.snapshot.future_cursor")
+            logger.error(
+                "state snapshot cursor is in the future org=%s cursor=%s -> dispose + rebuild",
+                state.org_id, cursor.isoformat(),
+            )
+            return None
         return state
 
     async def _dispose(self, org_id: uuid.UUID) -> None:
@@ -283,31 +429,22 @@ class StateService:
         _cache_evict_org(org_id)
         metrics.incr("state.snapshot.disposed")
 
-    async def _fold_stream(
-        self,
-        org_id: uuid.UUID,
-        *,
-        after=None,
-        base: OrganizationalState | None = None,
-        as_of: datetime | None = None,
-    ) -> tuple[OrganizationalState | None, int]:
-        """Fold the memory stream WITHOUT materializing the full record set (streaming
-        rebuild). Relies on the reader's (event_timestamp, memory_id) ordering — the same
-        total order build_projection sorts into — so the result is byte-identical to a full
-        build_projection / continue_projection. `base` continues a prior projection
-        (incremental, deep-copied lazily so a no-op costs nothing); None starts from empty
-        (full). Returns (state_or_None, facts_folded); state is None ONLY for an incremental
-        with zero new records (the caller keeps `base`)."""
-        builder = None if base is not None else StateBuilder(org_id)
+    async def _fold_full(
+        self, org_id: uuid.UUID, *, as_of: datetime | None = None
+    ) -> tuple[OrganizationalState, int]:
+        """Fold the org's ENTIRE memory WITHOUT materializing the record set.
+
+        Relies on the reader's (event_timestamp, memory_id) ordering — the same
+        total order `build_projection` sorts into — so the result is byte-identical
+        to `build_projection` over the same rows. Always returns a projection: an
+        org with no records yields a well-formed empty one, which is what lets the
+        caller treat a rebuild as the unconditional recovery path.
+        """
+        builder = StateBuilder(org_id)
         facts = 0
-        async for rec in self.reader.stream(org_id, after=after):
-            if builder is None:
-                assert base is not None  # builder is None ⟺ base was provided
-                builder = StateBuilder.from_state(base)
+        async for rec in self.reader.stream(org_id):
             builder.apply(rec)
             facts += 1
-        if builder is None:
-            return None, 0
         return builder.finalize(as_of=as_of), facts
 
     async def _acquire_org_lock(self, org_id: uuid.UUID) -> bool:

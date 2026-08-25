@@ -20,7 +20,7 @@ from navis.memory.envelope import EntityType
 from navis.state.v2 import MorningBrief, scope_for
 from navis.state.v2.builders import build_projection
 from navis.state.v2.scope import _MORNING_BRIEF, _TIER_ORDER
-from tests.state.fakes import ORG_A, ORG_B, rec
+from tests.state.fakes import ORG_A, ORG_B, corpus, rec
 
 
 def _view(records, org_id=ORG_A, policy=None):
@@ -404,3 +404,250 @@ def test_scope_performs_no_io():
             mods = [node.module]
         for m in mods:
             assert m.split(".")[0] not in {"sqlalchemy", "httpx", "redis", "asyncpg", "openai"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONTEXT AS A PIPELINE STAGE
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `scope_for` had two callers — the `/context` endpoint and Ask Navis — and none
+# between State and Intelligence, so Context was an API helper rather than a
+# stage. `orchestration.brief` now builds it on the brief path and hands its
+# citations to Intelligence. These pin what that stage is allowed to be.
+
+
+def test_context_reads_state_and_never_a_provider():
+    """Context SELECTS from what State already folded. It may not reach Gmail,
+    Calendar, Slack or any connector — a stage that could fetch would be a second
+    ingestion path with no Memory record behind it."""
+    import ast
+    import pathlib
+
+    scope = pathlib.Path(__file__).resolve().parents[2] / "navis" / "state" / "v2" / "scope.py"
+    tree = ast.parse(scope.read_text(encoding="utf-8"), filename=str(scope))
+
+    forbidden_roots = {
+        "navis.signals", "navis.ml", "navis.reasoning", "navis.decisions",
+        "navis.intelligence", "navis.execution", "navis.learning", "navis.adaptive",
+    }
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported |= {a.name for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+    leaks = {m for m in imported if ".".join(m.split(".")[:2]) in forbidden_roots}
+    assert not leaks, f"Context reached outside State: {sorted(leaks)}"
+
+    # No session, no client, no clock. Selection is a pure function of a snapshot.
+    source = scope.read_text(encoding="utf-8")
+    for banned in ("sqlalchemy", "AsyncSession", "httpx", "requests", "datetime.now("):
+        assert banned not in source, f"Context gained `{banned}`"
+
+
+def test_context_invents_no_entity_that_state_does_not_hold():
+    """Every entity Context names must exist in the snapshot it was built from.
+    A selection that could add an entity would be manufacturing organizational
+    facts one layer below Intelligence."""
+    state = build_projection(ORG_A, corpus(ORG_A))
+    view = scope_for(state, MorningBrief(), None, as_of=state.as_of)
+
+    in_state = {
+        (entity_type, entity_id)
+        for entity_type, entities in state.entities.items()
+        for entity_id in entities
+    }
+    assert view.entities
+    for ref in view.entities:
+        assert (ref.entity_type, ref.entity_id) in in_state
+
+
+def test_context_citations_are_stable_and_come_from_the_entity_itself():
+    """Same snapshot in, byte-identical citations out — Intelligence versions an
+    insight on the watermark, so a citation that moved between two projections of
+    one snapshot would make the row unreproducible."""
+    state = build_projection(ORG_A, corpus(ORG_A))
+    a = scope_for(state, MorningBrief(), None, as_of=state.as_of)
+    b = scope_for(state, MorningBrief(), None, as_of=state.as_of)
+    assert a.to_dict() == b.to_dict()
+
+    cited = 0
+    for ref in a.entities:
+        citation = a.citations.get(ref.entity_id)
+        if citation is None:
+            continue
+        raw = state.entities[ref.entity_type][ref.entity_id].get("provenance", {})
+        # A SUBSET of the entity's own provenance — bounded, never added to.
+        assert set(citation.memory_ids) <= {str(m) for m in raw.get("memory_ids", [])}
+        assert set(citation.signal_ids) <= {str(s) for s in raw.get("signal_ids", [])}
+        cited += bool(citation.memory_ids)
+    assert cited, "no entity carried a memory citation"
+
+
+def test_reasoning_still_reads_the_full_state_not_the_context_selection():
+    """CONTEXT IS A SELECTION, NOT A SUBSTITUTE. Reasoning is an exhaustive
+    detector: feeding it a top-N slice would silently stop it finding
+    obligations, which is the opposite of what a selection is for. Context feeds
+    interpretation (Intelligence); State feeds detection (Reasoning)."""
+    import inspect
+
+    from navis.reasoning.v2 import run_reasoning_v2
+
+    params = inspect.signature(run_reasoning_v2).parameters
+    assert set(params) == {"state", "prior_state", "evidence"}, (
+        "run_reasoning_v2 gained an input; a ScopedView must never be one"
+    )
+
+    # And the selection really is narrower than the snapshot it came from.
+    state = build_projection(ORG_A, corpus(ORG_A))
+    capped = scope_for(state, MorningBrief(), {"brief_max_items": 1}, as_of=state.as_of)
+    assert len(capped.entities) < sum(len(e) for e in state.entities.values())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7.5.7 — Context preserves State's entity graph
+#
+# Context ranked entities and dropped every EDGE between them, so the layers
+# above it received a flat list and had to treat each entity as unrelated to
+# every other. Live, that is why one slipping commitment and the cooling
+# relationship OF THE SAME PERSON reached the brief as two independent cards
+# while State had recorded `relationship --commitments--> commitment` all along.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# The AJITESH case from the production audit, reduced to the records that
+# produce its edges. `compute_links` joins on the values the extractors recorded
+# — the commitment's `speaker_email` matching the relationship's `person_email`,
+# and the meeting's attendee list — so these are the real join keys, not fixtures
+# shaped to pass.
+def _linked_counterparty(org_id=ORG_A):
+    """Entity ids are org-scoped (`fakes.rec` hashes org_id), so this must be
+    built per org — a shared module-level list would give both tenants ORG_A's
+    ids and make an isolation assertion vacuous."""
+    return [
+        rec(EntityType.PERSON, "ajitesh@example.com",
+            {"email": "ajitesh@example.com", "name": "Ajitesh"},
+            offset=0, tag="p-aj", org_id=org_id),
+        rec(EntityType.RELATIONSHIP, "ajitesh@example.com",
+            {"person_email": "ajitesh@example.com", "direction": "outbound"},
+            offset=1, tag="r-aj", org_id=org_id),
+        rec(EntityType.COMMITMENT, "c-aj",
+            {"text": "I'll come back to you on it.", "speaker_email": "ajitesh@example.com",
+             "promised_at": "2026-06-01T12:00:00+00:00"},
+            offset=2, tag="c-aj", org_id=org_id),
+        rec(EntityType.MEETING, "m-aj",
+            {"title": "Intro", "attendees": ["ajitesh@example.com"]},
+            offset=3, tag="m-aj", org_id=org_id),
+    ]
+
+
+_LINKED_COUNTERPARTY = _linked_counterparty()
+
+
+def test_context_carries_the_edges_state_persisted():
+    """The four edges the audit found in production must survive the projection."""
+    state, view = _view(_LINKED_COUNTERPARTY)
+    edges = {
+        (e.entity_type, link.role, link.entity_type)
+        for e in view.entities
+        for link in e.links
+    }
+    assert ("commitment", "owner", "person") in edges
+    assert ("relationship", "commitments", "commitment") in edges
+    assert ("relationship", "meetings", "meeting") in edges
+    assert ("person", "relationships", "relationship") in edges
+
+
+def test_every_link_names_both_a_type_and_an_id():
+    """A link a consumer cannot resolve is not a link. `entity_id` alone does not
+    say what it addresses, which is why the role map exists."""
+    _state, view = _view(_LINKED_COUNTERPARTY)
+    links = [link for e in view.entities for link in e.links]
+    assert links, "fixture must produce edges"
+    for link in links:
+        assert link.entity_type and link.entity_id and link.role
+
+
+def test_links_come_from_state_and_are_never_invented():
+    """Every edge Context publishes must exist in the State entity it came from."""
+    state, view = _view(_LINKED_COUNTERPARTY)
+    for e in view.entities:
+        raw = state.entities[e.entity_type][e.entity_id]
+        for link in e.links:
+            assert link.entity_id in raw["links"][link.role]
+
+
+def test_an_entity_with_no_edges_reports_an_empty_tuple_not_a_guess():
+    _state, view = _view([
+        rec(EntityType.PERSON, "solo@example.com",
+            {"email": "solo@example.com", "name": "Solo"}, offset=0, tag="solo"),
+    ])
+    assert [e.links for e in view.entities] == [()]
+
+
+def test_the_link_role_map_covers_every_role_state_can_write():
+    """THE PIN THAT KEEPS THE MAP CLOSED AND HONEST.
+
+    `_LINK_TARGET_TYPE` is a read-side transcription of `folds.compute_links`,
+    and an unrecognised role is DROPPED rather than guessed — so a link added to
+    the fold without a matching entry here would silently vanish from Context
+    instead of failing. Reading the roles out of the fold's own source is what
+    makes that impossible: adding `_link(x, "teams", y)` breaks this test.
+    """
+    import inspect
+    import re
+
+    from navis.state.v2 import folds
+    from navis.state.v2.scope import _LINK_TARGET_TYPE
+
+    written = set(re.findall(r'_link\([^,]+,\s*"([^"]+)"', inspect.getsource(folds)))
+    assert written, "could not read link roles from folds.compute_links"
+    assert written <= set(_LINK_TARGET_TYPE), (
+        f"roles written by compute_links with no target type: "
+        f"{sorted(written - set(_LINK_TARGET_TYPE))}"
+    )
+
+
+def test_an_unknown_role_is_dropped_rather_than_typed_by_guess():
+    from navis.state.v2.scope import _links
+
+    class _Raw:
+        links = {"teams": ["t-1"], "owner": ["p-1"]}
+
+    roles = {link.role for link in _links(_Raw())}
+    assert roles == {"owner"}
+
+
+def test_links_are_deterministic_across_repeated_projections():
+    state, first = _view(_LINKED_COUNTERPARTY)
+    second = scope_for(state, MorningBrief(), None, as_of=state.as_of)
+    assert [
+        [(link.role, link.entity_type, link.entity_id) for link in e.links]
+        for e in first.entities
+    ] == [
+        [(link.role, link.entity_type, link.entity_id) for link in e.links]
+        for e in second.entities
+    ]
+
+
+def test_links_are_additive_to_the_wire_shape():
+    """Every field the ScopedView published before is still there, in place."""
+    _state, view = _view(_LINKED_COUNTERPARTY)
+    entity = view.to_dict()["entities"][0]
+    assert {
+        "entity_type", "entity_id", "rank", "reason",
+        "fields", "first_seen", "last_seen",
+    } <= set(entity)
+    assert isinstance(entity["links"], list)
+
+
+def test_links_cannot_address_another_tenant():
+    """Links are computed within one org's fold, so an id from another tenant can
+    never appear — `compute_links` only ever joins entities of the state it was
+    given."""
+    _state_a, view_a = _view(_linked_counterparty(ORG_A), org_id=ORG_A)
+    state_b, _view_b = _view(_linked_counterparty(ORG_B), org_id=ORG_B)
+    b_ids = {eid for bucket in state_b.entities.values() for eid in bucket}
+    a_link_targets = {link.entity_id for e in view_a.entities for link in e.links}
+    assert a_link_targets, "fixture must produce edges"
+    assert a_link_targets.isdisjoint(b_ids)

@@ -26,6 +26,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -104,6 +105,80 @@ async def lineage_by_memory_id(
         )
         for memory_id, signal_id, score, entity_id in rows
     }
+
+
+async def records_for_entities(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    entity_ids: Iterable[uuid.UUID],
+    *,
+    per_entity_limit: int = 4,
+) -> list[MemoryRecord]:
+    """Memory records about specific entities — BY ID, not by similarity.
+
+    WHY A LOOKUP AND NOT ANOTHER SEARCH. Vector retrieval finds text that reads
+    like the question. It cannot find a fact whose text carries no distinguishing
+    signal, and Memory is full of exactly that: measured on the live org, the ONE
+    `relationship` record for the person a question was about reads "Received
+    email from <addr>", which is lexically indistinguishable from the other 151
+    relationship records ("Sent email to <addr>"). It scored below the top-8 for
+    every phrasing of the question tried, including one embedding the person's
+    own aliases — so the single fact that answers "what is our relationship with
+    X" was unreachable by ranking, at any k, with 60% of the token budget unspent.
+
+    Once the identity graph has told us WHO the question is about, that record
+    does not need to be searched for. `memory_records.entity_id` is a uuid5 over
+    (organization, entity_type, natural_key) — `memory.ids.entity_id` — so the
+    caller can COMPUTE the id and ask for the rows directly. Deterministic, exact,
+    and the same answer every time; no scores, no ranking, nothing to tune.
+
+    Bounded per entity so a heavily-observed person cannot flood a context: the
+    newest `per_entity_limit` records for each, by event time. Newest because a
+    fact about a person is a description of a moment, and the recent moments are
+    the ones a founder is asking about.
+
+    Org-scoped in the query itself, on the same principle as its siblings here:
+    isolation is a property of this statement, not of the caller remembering.
+
+    Returns MEMORY RECORDS, not rendered text. The rendered form of a fact
+    (`memory_embeddings.source_text`) is produced and owned by the ML layer, and
+    a pipeline domain may not import `navis.ml` — the invariant in
+    tests/ml/test_ml_layer.py says so and is right to. Callers that want the text
+    render it with `ml.embeddings.service.memory_text`, the same pure, model-free
+    function that produced every `source_text` in the corpus, so the string is
+    identical by construction rather than by a second implementation.
+
+    Returns [] for an empty id set.
+    """
+    ids = [e for e in entity_ids if e is not None]
+    if not ids:
+        return []
+    rows = (
+        await db.scalars(
+            select(MemoryRecord)
+            .where(
+                MemoryRecord.organization_id == org_id,
+                MemoryRecord.entity_id.in_(ids),
+            )
+            .order_by(
+                MemoryRecord.entity_id,
+                MemoryRecord.event_timestamp.desc().nullslast(),
+                # Total order, so the same call returns the same rows rather than
+                # whatever the scan happened to reach first among equal timestamps.
+                MemoryRecord.memory_id,
+            )
+        )
+    ).all()
+
+    out: list[MemoryRecord] = []
+    seen: dict[uuid.UUID, int] = {}
+    for r in rows:
+        n = seen.get(r.entity_id, 0)
+        if n >= per_entity_limit:
+            continue
+        seen[r.entity_id] = n + 1
+        out.append(r)
+    return out
 
 
 async def classifications_by_entity(

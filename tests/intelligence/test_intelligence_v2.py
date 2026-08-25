@@ -230,7 +230,14 @@ def test_insight_vocabulary_is_closed_and_split_by_clock():
     }
     reality = {
         InsightType.RISK, InsightType.OPPORTUNITY, InsightType.RELATIONSHIP,
-        InsightType.COMMITMENT, InsightType.STATUS, InsightType.TREND,
+        InsightType.COMMITMENT, InsightType.OBLIGATION, InsightType.STATUS,
+        InsightType.TREND,
+        # Folded from the current snapshot's entity graph and the conclusions
+        # Reasoning reached over it — so it moves when State moves, exactly like
+        # every other reality family, and is versioned by
+        # `state_watermark|reasoning_version`. It is emphatically NOT Learning-
+        # derived: it measures nothing about past outcomes.
+        InsightType.SITUATION,
     }
     assert set(InsightType) == learning | reality
     assert learning.isdisjoint(reality)
@@ -455,7 +462,8 @@ def _reality_rows(reality=None, view=None) -> list[dict]:
 
 REALITY_TYPES = {
     InsightType.RISK, InsightType.OPPORTUNITY, InsightType.RELATIONSHIP,
-    InsightType.COMMITMENT, InsightType.STATUS, InsightType.TREND,
+    InsightType.COMMITMENT, InsightType.OBLIGATION, InsightType.STATUS,
+    InsightType.TREND, InsightType.SITUATION,
 }
 
 
@@ -482,6 +490,76 @@ def test_reality_signal_type_literals_are_real_signal_types():
         | {ins._RELATIONSHIP_COOLING, ins._OPPORTUNITY, ins._ORG_DRIFT, ins._PRIORITY_LOAD}
     )
     assert referenced <= known, f"not real SignalTypes: {sorted(referenced - known)}"
+
+
+# WHICH DECISION-WORTHY CONCLUSIONS INTELLIGENCE CAN SEE — and which it cannot.
+#
+# Measured, not assumed: of the nine SignalTypes that can become a Decision, the
+# reality generators consume seven. Two are consumed by NO generator, so a brief
+# card built from either travels
+#
+#     Signal -> Memory -> State -> Reasoning -> Decision -> Today
+#
+# with Intelligence contributing nothing — not an insight, not corroboration, not
+# an entry in `supporting_insights`. They are also, between them, two of the three
+# categories `execution.proposer` can turn into a real action, so the MOST
+# actionable cards on Today are exactly the ones the Intelligence layer is silent
+# about.
+#
+# This is a COVERAGE GAP, not an incorrect claim. `_RISK_SIGNAL_TYPES` is
+# byte-identical to the set `decisions.base` maps to `DecisionCategory.RISK`
+# (asserted below), so `status_intelligence`'s "N carrying open risk" counts
+# exactly what Decision also calls risk — the two layers agree, and neither
+# overstates.
+#
+# THE GAP IS NOW CLOSED. `obligation_intelligence` gave `waiting_on_user_reply`
+# and `decision_owed` their own family rather than folding them into RISK, so
+# every decision-worthy conclusion now has an Intelligence representation and the
+# risk vocabularies still match. This stays pinned at EMPTY: a new decision-worthy
+# SignalType added without a generator re-opens the blind spot, and this is where
+# that shows up.
+_UNCOVERED_BY_INTELLIGENCE: set[str] = set()
+
+
+def test_every_decision_worthy_conclusion_reaches_intelligence():
+    from navis.decisions.base import _CATEGORY_FOR_SIGNAL
+    from navis.intelligence import insights as ins
+
+    consumed = (
+        ins._RISK_SIGNAL_TYPES
+        | ins._OPPORTUNITY_SIGNAL_TYPES
+        | ins._COMMITMENT_SIGNAL_TYPES
+        | ins._OBLIGATION_SIGNAL_TYPES
+        | {ins._RELATIONSHIP_COOLING, ins._OPPORTUNITY, ins._ORG_DRIFT, ins._PRIORITY_LOAD}
+    )
+    decision_worthy = {t.value for t in _CATEGORY_FOR_SIGNAL}
+
+    assert decision_worthy - consumed == _UNCOVERED_BY_INTELLIGENCE, (
+        "a decision-worthy conclusion can reach Today with no Intelligence "
+        "behind it; give it a generator or update _UNCOVERED_BY_INTELLIGENCE "
+        "deliberately"
+    )
+
+
+def test_every_obligation_type_has_a_name_the_organization_would_use():
+    """A signal type in the set but not the noun map would render as a raw
+    engine identifier in a founder-facing summary."""
+    from navis.intelligence import insights as ins
+
+    assert set(ins._OBLIGATION_SIGNAL_TYPES) == set(ins._OBLIGATION_NOUNS)
+
+
+def test_intelligence_and_decision_mean_the_same_thing_by_risk():
+    """Two layers, one vocabulary. If these drift, `status_intelligence` starts
+    counting a different population than the brief calls risk, and the same
+    organization gets two different risk counts on one screen."""
+    from navis.decisions.base import _CATEGORY_FOR_SIGNAL, DecisionCategory
+    from navis.intelligence import insights as ins
+
+    decision_risk = {
+        t.value for t, c in _CATEGORY_FOR_SIGNAL.items() if c is DecisionCategory.RISK
+    }
+    assert decision_risk == set(ins._RISK_SIGNAL_TYPES)
 
 
 # ---- 1. positive case: every engine that can fire, fires ---------------------
@@ -1051,3 +1129,419 @@ async def test_the_serialized_response_contract_is_unchanged():
         and p["evidence"]["supporting_reasoning_signal_ids"]
         for p in reality
     ), "provenance was lost at the read boundary"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONTEXT AS A PIPELINE STAGE, and OBLIGATION as an insight family
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Before this, Context (`state.v2.scope.scope_for`) had exactly two callers — the
+# `/context` endpoint and Ask Navis — and none between State and Intelligence. So
+# an insight could name an affected entity and could not say which remembered
+# fact or which captured business-system event it was known from:
+# `service._provenance` documents that break in its own docstring. Context held
+# the answer the whole time.
+
+
+def _obligation_reality(*, context=None):
+    """A reality view whose signals are the two obligation types."""
+    from tests.intelligence.fakes import context_row, reality_signal
+
+    waiting = reality_signal(
+        "sig-wait", signal_type="waiting_on_user_reply", entity_type="thread",
+        entity_id="thr-1", confidence=0.9, severity=0.65,
+        evidence={"person_email": "nick@acme.com", "thread_id": "19fdb"},
+    )
+    owed = reality_signal(
+        "sig-owed", signal_type="decision_owed", entity_type="decision",
+        entity_id="dec-1", confidence=0.8, severity=0.5,
+        evidence={"person_email": "amy@beta.io", "decision": "ship or hold?"},
+    )
+    default = (
+        context_row(entity_type="thread", entity_id="thr-1", rank=0,
+                    reason="most recently active",
+                    memory_ids=("mem-thr-1",), signal_event_ids=("evt-1",)),
+        context_row(entity_type="decision", entity_id="dec-1", rank=1,
+                    reason="open, oldest activity",
+                    memory_ids=("mem-dec-1",), signal_event_ids=("evt-2",)),
+    )
+    return make_reality(
+        signals=(waiting, owed),
+        context=default if context is None else context,
+    )
+
+
+# ---- 9 + 10. the two blind-spot signal types now produce Intelligence --------
+
+def test_waiting_on_user_reply_now_produces_intelligence():
+    """THE regression this family exists for. A waiting card used to reach Today
+    with `Intelligence = []`."""
+    [row] = _of_type(_reality_rows(_obligation_reality()), InsightType.OBLIGATION) and [
+        r for r in _of_type(_reality_rows(_obligation_reality()), InsightType.OBLIGATION)
+        if r["key"] == "waiting_on_user_reply"
+    ]
+    assert row["title"] == "1 outstanding reply obligation"
+    assert row["evidence"]["outstanding"] == 1
+    assert row["evidence"]["signal_type"] == "waiting_on_user_reply"
+    assert row["supporting_learning_event_ids"] == []  # a reality fold, not Learning
+    assert row["evidence"]["supporting_reasoning_signal_ids"] == ["sig-wait"]
+
+
+def test_decision_owed_now_produces_intelligence():
+    [row] = [
+        r for r in _of_type(_reality_rows(_obligation_reality()), InsightType.OBLIGATION)
+        if r["key"] == "decision_owed"
+    ]
+    assert row["title"] == "1 outstanding decision obligation"
+    assert row["evidence"]["supporting_reasoning_signal_ids"] == ["sig-owed"]
+
+
+def test_each_obligation_kind_stays_its_own_insight():
+    """"4 people are waiting" must never hide inside a total with "1 decision is
+    owed" — they are different debts and a founder acts on them differently."""
+    rows = _of_type(_reality_rows(_obligation_reality()), InsightType.OBLIGATION)
+    assert sorted(r["key"] for r in rows) == ["decision_owed", "waiting_on_user_reply"]
+
+
+def test_no_obligation_signals_produces_no_obligation_claim():
+    """Absence of evidence is absence of insight — the rule every reality engine
+    is gated on."""
+    assert _of_type(_reality_rows(rich_reality()), InsightType.OBLIGATION) == []
+
+
+def test_obligation_is_not_folded_into_the_risk_count():
+    """`status_intelligence`'s "N carrying open risk" counts `_RISK_SIGNAL_TYPES`
+    and nothing else. If obligations leaked in, Intelligence and Decision would
+    report two different risk numbers for one organization."""
+    rows = _reality_rows(_obligation_reality())
+    [status] = _of_type(rows, InsightType.STATUS)
+    assert status["evidence"]["open_risks"] == 0
+
+
+def test_obligation_confidence_is_the_weakest_contributing_detection():
+    """A claim about several obligations can be no stronger than its weakest
+    member — the same rule every other composite insight applies."""
+    from tests.intelligence.fakes import reality_signal
+
+    reality = make_reality(signals=(
+        reality_signal("s1", signal_type="waiting_on_user_reply", entity_type="thread",
+                       entity_id="t1", confidence=0.9, severity=0.4),
+        reality_signal("s2", signal_type="waiting_on_user_reply", entity_type="thread",
+                       entity_id="t2", confidence=0.55, severity=0.8),
+    ))
+    [row] = _of_type(_reality_rows(reality), InsightType.OBLIGATION)
+    assert row["confidence"] == 0.55           # min, never the mean
+    assert row["evidence"]["peak_severity"] == 0.8   # exposure is set by the worst
+
+
+# ---- 8 + 11. Intelligence receives Context, and cites it ---------------------
+
+def test_an_insight_cites_the_memory_and_business_event_behind_each_entity():
+    """THE hop the provenance chain was missing. Before Context reached
+    Intelligence, an insight named an entity and stopped there."""
+    [row] = [
+        r for r in _of_type(_reality_rows(_obligation_reality()), InsightType.OBLIGATION)
+        if r["key"] == "waiting_on_user_reply"
+    ]
+    [entity] = row["evidence"]["entities"]
+
+    assert entity["entity_type"] == "thread" and entity["entity_id"] == "thr-1"
+    assert entity["memory_ids"] == ["mem-thr-1"]
+    assert entity["signal_event_ids"] == ["evt-1"]
+    # ... and WHY Context considered it relevant, in Context's own words.
+    assert entity["context_rank"] == 0
+    assert entity["context_reason"] == "most recently active"
+
+
+def test_an_entity_context_did_not_select_carries_no_invented_lineage():
+    """Context returns a top-N selection, so an insight may legitimately name an
+    entity it did not select. Absence is honest; an empty list would read as "we
+    looked and there was none"."""
+    from tests.intelligence.fakes import reality_signal
+
+    reality = make_reality(
+        signals=(reality_signal("s-x", signal_type="waiting_on_user_reply",
+                                entity_type="thread", entity_id="unselected"),),
+        context=(),
+    )
+    [row] = _of_type(_reality_rows(reality), InsightType.OBLIGATION)
+    [entity] = row["evidence"]["entities"]
+
+    assert "memory_ids" not in entity and "signal_event_ids" not in entity
+    assert "context_rank" not in entity and "context_reason" not in entity
+
+
+def test_context_lineage_never_crosses_entities():
+    """One entity's citations must never be attached to another's — that would be
+    fabricated provenance pointing at a real row, the worst kind."""
+    rows = _of_type(_reality_rows(_obligation_reality()), InsightType.OBLIGATION)
+    by_key = {r["key"]: r for r in rows}
+
+    [thread] = by_key["waiting_on_user_reply"]["evidence"]["entities"]
+    [decision] = by_key["decision_owed"]["evidence"]["entities"]
+    assert thread["memory_ids"] == ["mem-thr-1"]
+    assert decision["memory_ids"] == ["mem-dec-1"]
+
+
+def test_a_reality_view_without_context_projects_exactly_as_before():
+    """Context is additive. An org whose Context could not be built loses lineage
+    depth and gains nothing fabricated — every other field is byte-identical."""
+    with_ctx = _reality_rows(_obligation_reality())
+    without = _reality_rows(_obligation_reality(context=()))
+
+    def strip(rows):
+        out = []
+        for r in rows:
+            e = dict(r["evidence"])
+            if "entities" in e:
+                e["entities"] = [
+                    {k: v for k, v in ent.items()
+                     if k not in {"memory_ids", "signal_event_ids",
+                                  "context_rank", "context_reason"}}
+                    for ent in e["entities"]
+                ]
+            out.append({**r, "evidence": e})
+        return snapshot(out)
+
+    assert strip(with_ctx) == strip(without)
+
+
+def test_context_does_not_change_insight_identity():
+    """`compute_insight_id` hashes (org, type, key, watermark|reasoning_version).
+    Context deepens an insight's evidence; it must never fork its id, or every
+    projection with a differently-capped Context would mint a parallel row."""
+    a = {r["key"]: r["insight_id"] for r in _reality_rows(_obligation_reality())}
+    b = {r["key"]: r["insight_id"] for r in _reality_rows(_obligation_reality(context=()))}
+    assert a == b
+
+
+# ---- 20. no fake ML / LLM path ----------------------------------------------
+
+def test_no_generator_is_backed_by_a_model():
+    """Every reality insight names a deterministic engine. A model-backed
+    producer would break this table's core invariant — "drop the table,
+    re-project, get identical rows" — and there is no column for a model id, a
+    prompt version, or a wall-clock generated_at to make it safe."""
+    engines = {r["engine_name"] for r in _reality_rows(_obligation_reality())}
+    assert engines and all(e.startswith("intelligence.reality.") for e in engines)
+    for banned in ("llm", "model", "gpt", "claude", "gemini", "azure", "openai"):
+        assert not any(banned in e.lower() for e in engines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7.5.7 — Situation Intelligence: the engine that connects instead of counting
+#
+# Every other reality engine buckets signals by TYPE ("2 open commitment
+# slipping risks"), which restates Reasoning one altitude up and connects
+# nothing. These pin the one engine that reads State's persisted entity graph —
+# and, just as importantly, pin that it refuses to connect what State did not.
+# ══════════════════════════════════════════════════════════════════════════════
+
+from tests.intelligence.fakes import (  # noqa: E402
+    connected_counterparty_context,
+    context_link,
+    context_row,
+)
+
+
+def _connected_reality(org_id=ORG_A, **over):
+    """The AJITESH case: a slipping commitment and a cooling relationship that
+    State links to ONE counterparty."""
+    signals = (
+        reality_signal(
+            "sig-commit-1", signal_type="commitment_slipping",
+            entity_type="commitment", entity_id="com-1",
+            confidence=0.9, severity=0.84,
+            evidence={"age_days": 13.0, "speaker_email": "ajitesh@example.com"},
+        ),
+        reality_signal(
+            "sig-cool-1", signal_type="relationship_cooling",
+            entity_type="relationship", entity_id="rel-1",
+            confidence=0.85, severity=0.6,
+            evidence={"days_since_contact": 10.0, "person_email": "ajitesh@example.com"},
+        ),
+    )
+    over.setdefault("context", connected_counterparty_context())
+    return make_reality(org_id=org_id, signals=signals, **over)
+
+
+def test_a_connected_counterparty_produces_one_situation():
+    rows = _of_type(_reality_rows(_connected_reality()), InsightType.SITUATION)
+    assert len(rows) == 1
+
+
+def test_the_situation_names_the_counterparty_and_both_conclusions():
+    """The headline must be the connected sentence, not a bucket count."""
+    row = _of_type(_reality_rows(_connected_reality()), InsightType.SITUATION)[0]
+    assert "ajitesh@example.com" in row["title"]
+    assert "unresolved commitment" in row["title"]
+    assert "cooling relationship" in row["title"]
+
+
+def test_the_situation_cites_both_reasoning_signals():
+    """This is what makes ONE organizational sentence reach BOTH decisions —
+    `what_matters_today._relevant_facts` matches on the cited signal id."""
+    row = _of_type(_reality_rows(_connected_reality()), InsightType.SITUATION)[0]
+    assert set(row["evidence"]["supporting_reasoning_signal_ids"]) == {
+        "sig-commit-1", "sig-cool-1"
+    }
+
+
+def test_the_situation_carries_the_grounded_representation():
+    row = _of_type(_reality_rows(_connected_reality()), InsightType.SITUATION)[0]
+    ev = row["evidence"]
+    assert ev["situation_type"] == "commitment_slipping+relationship_cooling"
+    assert ev["primary_entity"]["entity_id"] == "rel-1"
+    assert ev["linked_entity_counts"] == {"commitment": 1, "meeting": 2, "person": 1}
+    assert {r["entity_type"] for r in ev["related_entities"]} == {
+        "commitment", "meeting", "person"
+    }
+    # Memory/business-system lineage, carried as POINTERS (Intelligence may not
+    # read Memory) — the hop the provenance chain used to stop short of.
+    assert ev["memory_ids"] and ev["signal_event_ids"]
+
+
+def test_every_related_entity_names_the_edge_that_put_it_there():
+    """"Why is this meeting here?" must be answerable from the stored row."""
+    row = _of_type(_reality_rows(_connected_reality()), InsightType.SITUATION)[0]
+    for related in row["evidence"]["related_entities"]:
+        assert related["via_role"] in {
+            "commitments", "meetings", "relationships_of", "owner", "owner_of"
+        }
+
+
+def test_the_implication_states_the_link_and_never_a_cause():
+    row = _of_type(_reality_rows(_connected_reality()), InsightType.SITUATION)[0]
+    implication = row["evidence"]["organizational_implication"].lower()
+    assert "connects them through" in implication
+    for causal in ("because", "caused", "due to", "led to", "resulted in"):
+        assert causal not in implication
+
+
+# ---- the refusals: what it must NOT connect ---------------------------------
+
+
+def test_unrelated_entities_are_never_joined_into_one_situation():
+    """TWO counterparties, each with their own conclusion, NO edge between them.
+
+    This is the false join the engine exists to avoid: without the link rule it
+    would be trivial to bundle any two signals that happen to co-occur.
+    """
+    signals = (
+        reality_signal(
+            "sig-commit-x", signal_type="commitment_slipping",
+            entity_type="commitment", entity_id="com-x",
+            evidence={"speaker_email": "x@example.com"},
+        ),
+        reality_signal(
+            "sig-cool-y", signal_type="relationship_cooling",
+            entity_type="relationship", entity_id="rel-y",
+            evidence={"person_email": "y@example.com"},
+        ),
+    )
+    context = (
+        context_row(entity_type="commitment", entity_id="com-x", rank=0, links=()),
+        context_row(entity_type="relationship", entity_id="rel-y", rank=1, links=()),
+    )
+    rows = _of_type(
+        _reality_rows(make_reality(signals=signals, context=context)),
+        InsightType.SITUATION,
+    )
+    assert rows == []
+
+
+def test_a_shared_company_does_not_merge_two_counterparties():
+    """`people` edges (company -> person, channel -> person) are deliberately NOT
+    traversable. A company with two contacts must stay two counterparties, or one
+    "situation" would silently span an entire customer account."""
+    signals = (
+        reality_signal(
+            "sig-cool-a", signal_type="relationship_cooling",
+            entity_type="relationship", entity_id="rel-a",
+            evidence={"person_email": "a@acme.com"},
+        ),
+        reality_signal(
+            "sig-cool-b", signal_type="relationship_cooling",
+            entity_type="relationship", entity_id="rel-b",
+            evidence={"person_email": "b@acme.com"},
+        ),
+    )
+    context = (
+        context_row(entity_type="relationship", entity_id="rel-a", rank=0, links=()),
+        context_row(entity_type="relationship", entity_id="rel-b", rank=1, links=()),
+        context_row(
+            entity_type="company", entity_id="co-acme", rank=2,
+            links=(
+                context_link(role="people", entity_type="person", entity_id="per-a"),
+                context_link(role="people", entity_type="person", entity_id="per-b"),
+            ),
+        ),
+    )
+    rows = _of_type(
+        _reality_rows(make_reality(signals=signals, context=context)),
+        InsightType.SITUATION,
+    )
+    assert rows == []
+
+
+def test_one_conclusion_alone_is_not_a_situation():
+    """A single conclusion about a single entity is a ReasoningSignal. Repeating
+    it as a "situation" would be exactly the restatement this engine replaces."""
+    signals = (
+        reality_signal(
+            "sig-cool-1", signal_type="relationship_cooling",
+            entity_type="relationship", entity_id="rel-1",
+            evidence={"person_email": "solo@example.com"},
+        ),
+    )
+    rows = _of_type(
+        _reality_rows(
+            make_reality(signals=signals, context=connected_counterparty_context())
+        ),
+        InsightType.SITUATION,
+    )
+    assert rows == []
+
+
+def test_without_context_no_situation_is_emitted():
+    """Context is the only source of edges. No Context => no claim about them,
+    and every other reality engine keeps working exactly as before."""
+    rows = _reality_rows(_connected_reality(context=()))
+    assert _of_type(rows, InsightType.SITUATION) == []
+    assert _of_type(rows, InsightType.RISK), "aggregation engines must still fire"
+
+
+def test_a_situation_is_versioned_by_state_and_reasoning_like_every_reality_row():
+    first = _of_type(_reality_rows(_connected_reality()), InsightType.SITUATION)[0]
+    moved = _of_type(
+        _reality_rows(_connected_reality(state_watermark="wm-state-2")),
+        InsightType.SITUATION,
+    )[0]
+    assert first["insight_id"] != moved["insight_id"]
+    assert first["key"] == moved["key"]
+
+
+def test_a_situation_is_deterministic():
+    a = _of_type(_reality_rows(_connected_reality()), InsightType.SITUATION)[0]
+    b = _of_type(_reality_rows(_connected_reality()), InsightType.SITUATION)[0]
+    assert a == b
+
+
+def test_a_situation_cannot_cross_tenants():
+    a = _of_type(_reality_rows(_connected_reality(org_id=ORG_A)), InsightType.SITUATION)[0]
+    b = _of_type(
+        _reality_rows(_connected_reality(org_id=ORG_B), view=make_view(
+            org_id=ORG_B, learning_version=0)),
+        InsightType.SITUATION,
+    )[0]
+    assert a["insight_id"] != b["insight_id"]
+    assert a["organization_id"] == ORG_A
+    assert b["organization_id"] == ORG_B
+
+
+def test_the_situation_confidence_is_the_weakest_contributing_signal():
+    """A composite claim can be no stronger than its weakest member — the same
+    rule every other composite insight follows."""
+    row = _of_type(_reality_rows(_connected_reality()), InsightType.SITUATION)[0]
+    assert row["confidence"] == 0.85
+    assert row["sample_size"] == 2

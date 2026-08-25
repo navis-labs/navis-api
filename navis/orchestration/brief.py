@@ -26,6 +26,8 @@ from navis.decisions.base import IntelligenceFact, IntelligenceView
 from navis.decisions.models import DailyBrief
 from navis.decisions.service import DecisionService
 from navis.intelligence.insights import (
+    ContextEntityRow,
+    ContextLink,
     OrganizationalRealityView,
     RealitySignalRow,
 )
@@ -41,18 +43,85 @@ from navis.platform.queue import celery_app, run_async
 from navis.reasoning.store import persist_signals
 from navis.reasoning.v2 import REASONING_VERSION, run_reasoning_v2
 from navis.reasoning.v2.contract import ReasoningSignal
-from navis.state.v2 import StateService
+from navis.state.v2 import MorningBrief, StateService, scope_for
 from navis.state.v2.models import OrganizationalState
+from navis.state.v2.scope import ScopedView
 
 logger = get_logger("orchestration.brief")
+
+
+# How many memory records / signal events one entity contributes to an insight's
+# evidence. `scope.py::_cite` already bounds each entity to its newest 10; an
+# insight names up to 20 entities, so a second bound here keeps one JSONB blob to
+# a readable size. The newest are kept — a fact about an entity is a description
+# of a moment, and the recent moments are the ones being reasoned about.
+_MAX_LINEAGE_PER_ENTITY = 3
+
+
+def _context_rows(view: ScopedView) -> tuple[ContextEntityRow, ...]:
+    """Flatten CONTEXT into the primitive rows Intelligence accepts.
+
+    This is the fifth join at this seam and the same shape as the other four:
+    read here, flatten to primitives, hand in. `navis/intelligence/**` imports no
+    State and gains none — it receives strings.
+
+    WHAT IT CARRIES AND WHY. `scope_for` already ranks the entities relevant to
+    the morning-brief intent and already resolves each one's citations from its
+    own `provenance` — `memory_ids` and `signal_ids`, the two hops the insight
+    provenance chain was missing (`intelligence.service._provenance` documents
+    the break in its own docstring). Nothing is re-derived and nothing is
+    fetched: this reshapes a view the pipeline was already capable of building
+    and had no consumer for.
+
+    Ordered by Context's own rank so the flattening is deterministic and a
+    replay of one snapshot produces byte-identical rows.
+    """
+    def row(entity) -> ContextEntityRow:
+        citation = view.citations.get(entity.entity_id)
+        return ContextEntityRow(
+            entity_type=entity.entity_type,
+            entity_id=entity.entity_id,
+            rank=entity.rank,
+            reason=entity.reason,
+            # THE ENTITY GRAPH, flattened one more time. `scope_for` resolves each
+            # edge's target type from its own closed role map, so this carries
+            # three strings per link and Intelligence still imports no State.
+            # Unbounded on purpose: a link list is entity ids only, State caps a
+            # relationship's links by that counterparty's real activity, and the
+            # situation engine applies its own enumeration bound. Truncating here
+            # would silently hide a connection rather than shorten a blob.
+            links=tuple(
+                ContextLink(
+                    role=link.role,
+                    entity_type=link.entity_type,
+                    entity_id=link.entity_id,
+                )
+                for link in entity.links
+            ),
+            # An entity that recorded no provenance keeps an honestly empty
+            # tuple rather than a fabricated one.
+            memory_ids=tuple(
+                (citation.memory_ids or ())[-_MAX_LINEAGE_PER_ENTITY:] if citation else ()
+            ),
+            signal_event_ids=tuple(
+                (citation.signal_ids or ())[-_MAX_LINEAGE_PER_ENTITY:] if citation else ()
+            ),
+        )
+
+    return tuple(
+        row(e)
+        for e in sorted(view.entities, key=lambda e: (e.rank, e.entity_type, e.entity_id))
+    )
 
 
 def _reality_view(
     org_id: uuid.UUID,
     state: OrganizationalState,
     signals: list[ReasoningSignal],
+    context: ScopedView | None = None,
 ) -> OrganizationalRealityView:
-    """Flatten State + ReasoningSignals into the contract Intelligence accepts.
+    """Flatten State + CONTEXT + ReasoningSignals into the contract Intelligence
+    accepts.
 
     PURE — no clock, no I/O, no randomness. `as_of` is State's logical time and
     the watermark is the memory record State actually folded to, so the same
@@ -100,6 +169,10 @@ def _reality_view(
                 key=lambda r: r.signal_id,
             )
         ),
+        # CONTEXT — the relevant slice of State, with its citations. Empty when
+        # Context could not be built, which costs an insight lineage depth and
+        # never gives it a fabricated id.
+        context=_context_rows(context) if context is not None else (),
     )
 
 
@@ -117,11 +190,25 @@ def _intelligence_view(org_id: uuid.UUID, rows) -> IntelligenceView:
     Each fact carries a COPY of the row's `evidence`. The ORM hands out the live
     JSONB dict, and a view that shared it would let a consumer dirty a persisted
     insight by touching what looks like a plain dict.
+
+    IT IS ALSO WHERE THE TWO INSIGHT FAMILIES ARE TOLD APART, because this is the
+    only layer that may know both vocabularies: `navis/decisions/**` may not
+    import `navis.intelligence` (AST-pinned), and `REALITY_INSIGHT_TYPES` is
+    Intelligence's own answer to "is this row a description of current State or a
+    measurement over past outcomes?". The distinction reaches Decision as a bool
+    on each fact — the same shape every other cross-layer input arrives in — and
+    decides both which relation a signal match records and whether the fact's
+    watermark is a claim about a snapshot at all. See
+    `decisions.base.InsightRelation` and `SupportingInsight`.
     """
+    from navis.intelligence.insights import REALITY_INSIGHT_TYPES
+
+    reality_types = frozenset(t.value for t in REALITY_INSIGHT_TYPES)
     facts = tuple(
         IntelligenceFact(
             insight_id=str(r.insight_id),
             insight_type=r.insight_type,
+            title=r.title,
             key=r.key,
             summary=r.summary,
             confidence=r.confidence,
@@ -135,6 +222,11 @@ def _intelligence_view(org_id: uuid.UUID, rows) -> IntelligenceView:
             ),
             state_watermark=r.state_watermark,
             learning_version=r.learning_version,
+            # Reality rows are versioned by `state_watermark`, Learning rows by
+            # `learning_version` — `intelligence.service._version_key` keys them
+            # on exactly this membership, so reading the same set here cannot
+            # drift from how the row was minted.
+            describes_state=r.insight_type in reality_types,
         )
         for r in rows
     )
@@ -237,12 +329,27 @@ async def build_brief(db: AsyncSession, org_id: uuid.UUID) -> DailyBrief:
     # State and never touch a database.
     await persist_signals(db, signals)
     watermark = state.watermark.last_memory_id
+    # ── CONTEXT ──────────────────────────────────────────────────────────────
+    # Resolved BEFORE Intelligence projects, and that ordering is the whole
+    # point: Context is what lets an insight cite the memory records and
+    # business-system events behind the entities it names, and it must therefore
+    # describe the same snapshot Reasoning just ran over.
+    #
+    # `resolve_policy` moved up with it because `scope_for` is governed by the
+    # same Adaptive policy Decision is (`brief_max_items` caps the per-type
+    # selection) — so Context, Reasoning's consumers and Decision all run under
+    # one governing snapshot instead of Context silently using code defaults.
+    # Purely a reordering of two reads; neither has a side effect.
+    #
+    # PURE, and State-only: `scope_for` selects and ranks entities State already
+    # holds. It reads no provider, performs no I/O and reaches no conclusion.
+    policy = await resolve_policy(db, org_id)
+    context = scope_for(state, MorningBrief(), policy, as_of=state.as_of)
     # Hand Intelligence the organization's CURRENT reality. Intelligence may not
     # import State or Reasoning (its repository reads Learning only, pinned by an
     # AST test), so the projection is assembled here — the same seam that already
     # reads `evidence` for Reasoning and resolves Adaptive's policy for Decision.
-    await _project_intelligence(org_id, _reality_view(org_id, state, signals))
-    policy = await resolve_policy(db, org_id)
+    await _project_intelligence(org_id, _reality_view(org_id, state, signals, context))
     # The fourth join at this seam, and the same shape as the other three: read
     # here, flatten to primitives, hand in. Decision imports no Intelligence.
     intelligence = await _current_intelligence(db, org_id)
@@ -255,6 +362,114 @@ async def build_brief(db: AsyncSession, org_id: uuid.UUID) -> DailyBrief:
         policy=policy,
         intelligence=intelligence,
     )
+
+
+async def current_state_watermark(db: AsyncSession, org_id: uuid.UUID) -> str | None:
+    """The memory record State has folded to, read WITHOUT folding anything.
+
+    `SnapshotRepository.watermark_only` exists for exactly this shape of question
+    — it selects the two cursor columns and skips the ~22KB `full_projection`
+    JSONB — so asking "has State moved?" costs one indexed row and never a fold.
+
+    None when the org has no snapshot at the current projection version, which is
+    a real answer ("State has never been built for this org") and must stay
+    distinguishable from "State is at watermark X".
+    """
+    from navis.state.v2.models import PROJECTION_VERSION
+    from navis.state.v2.repository import SnapshotRepository
+
+    cursor = await SnapshotRepository(db).watermark_only(
+        org_id, projection_version=PROJECTION_VERSION
+    )
+    if cursor is None:
+        return None
+    _timestamp, memory_id = cursor
+    return str(memory_id) if memory_id else None
+
+
+async def brief_for_today(db: AsyncSession, org_id: uuid.UUID) -> tuple[DailyBrief, dict]:
+    """Today's brief, REBUILT IF STATE HAS MOVED SINCE IT WAS RANKED.
+
+    THE DEFECT THIS CLOSES. `latest_brief` returns the newest stored brief and
+    `/brief/today` built one only when NONE existed — so once a brief existed, the
+    endpoint served it forever. Live, that meant Today presented a picture ranked
+    at watermark `f8675a7f` (2026-08-22) while State had advanced to `f0102043`,
+    with 55 memory records and 13 signal events folded in between. The founder was
+    reading a two-day-old organization with nothing on the page saying so, and the
+    commitment it led with had aged from 11.85 days to 13.89.
+
+    THE CACHE IS NOT REMOVED, it is given a validity condition. A brief's identity
+    is already `(org, reasoning_version, state_watermark)`
+    (`decisions.base.compute_brief_id`), so the watermark IS the cache key and
+    "the key changed" is the ordinary reason to recompute. When State has not
+    moved, this does exactly what it did before: one cheap indexed read, then the
+    stored brief.
+
+    NO SECOND SCHEDULER, and no new pipeline. It calls `build_brief` — the same
+    function `POST /brief/generate` and the Celery task both call — under a
+    condition, rather than introducing another producer. `build_brief` is
+    idempotent (deterministic brief id, upsert), so two concurrent readers
+    converge on one row instead of racing.
+
+    BOUNDED. A rebuild can only fire after State has actually advanced, which
+    requires a sync to have landed; between syncs, repeated polls compare equal
+    and do nothing. The fold itself is `incremental_update`, O(delta), and no
+    layer on this path calls an LLM.
+
+    Returns the brief and a `freshness` block that reports the comparison
+    honestly — including the case where it could NOT be made. Reporting is not
+    redundant with rebuilding: a rebuild can legitimately fail to advance the
+    watermark (State has no snapshot yet), and the founder must be able to tell
+    "current" from "we could not tell".
+    """
+    brief = await DecisionService(db).latest_brief(org_id)
+    state_watermark = await current_state_watermark(db, org_id)
+
+    if brief is None:
+        brief = await build_brief(db, org_id)
+        return brief, _freshness(brief, state_watermark, rebuilt=True)
+
+    # `None` means State has no snapshot at the current projection version, so
+    # there is nothing to compare against — never a reason to discard a brief
+    # that exists. Fails closed toward SERVING, and says so in `freshness`.
+    stale = state_watermark is not None and brief.state_watermark != state_watermark
+    if stale:
+        logger.info(
+            "brief stale org=%s brief_watermark=%s state_watermark=%s — rebuilding",
+            org_id, brief.state_watermark, state_watermark,
+        )
+        metrics.incr("brief.today.rebuilt_stale")
+        brief = await build_brief(db, org_id)
+        return brief, _freshness(brief, state_watermark, rebuilt=True)
+
+    return brief, _freshness(brief, state_watermark, rebuilt=False)
+
+
+def _freshness(brief: DailyBrief, state_watermark: str | None, *, rebuilt: bool) -> dict:
+    """Whether this brief describes the State that is currently folded. PURE.
+
+    `current` is TRI-STATE for the same reason `state.v2.models` fields are:
+
+      True  — the brief's watermark IS State's current watermark
+      False — State has moved past this brief (only reachable when a rebuild was
+              attempted and still could not close the gap)
+      None  — no comparison was possible, because State has no snapshot at the
+              current projection version. NOT "fresh", and not "stale" either.
+
+    A client that renders `current is False` or `current is None` as "up to date"
+    is making a claim this block deliberately refuses to make.
+    """
+    return {
+        "current": (
+            None if state_watermark is None
+            else brief.state_watermark == state_watermark
+        ),
+        "brief_watermark": brief.state_watermark,
+        "state_watermark": state_watermark,
+        # Whether THIS request recomputed the brief. Operationally the difference
+        # between "the scheduler is keeping up" and "reads are carrying it".
+        "rebuilt": rebuilt,
+    }
 
 
 async def run_brief_for_org(org_id: uuid.UUID) -> dict:

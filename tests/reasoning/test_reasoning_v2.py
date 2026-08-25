@@ -255,6 +255,222 @@ def test_store_round_trips_every_field_reasoning_emitted():
     assert row["evidence"] == (signal.evidence or {})
 
 
+# ---- Stable identity vs. temporal observation -------------------------------
+#
+# A signal is two things and used to be stored as one. Its IDENTITY is stable by
+# construction — not one `dedup_key` in the engine set carries time — and must
+# stay stable, because execution_requests / learning_events / intelligence_insights
+# all hold `reasoning_signal_ids` that cannot be recomputed once REASONING_VERSION
+# moves. Its ATTRIBUTES are functions of `state.as_of` and change at every fold.
+#
+# Storing both on one row under ON CONFLICT DO NOTHING meant first detection won
+# forever: production's commitment f33778d8 sits at 7.16 days / 0.7386 while the
+# decision citing that exact row reports 12 days / 0.8951.
+
+
+def test_observation_id_is_the_signal_snapshot_uniqueness_constraint():
+    """One conclusion at one snapshot is one row, and a null watermark is ONE
+    snapshot rather than infinitely many.
+
+    The null case is the reason this is a hashed primary key and not a UNIQUE
+    index: Postgres treats NULLs as distinct, so an organization with no folded
+    memory would have accumulated a fresh duplicate observation on every pass.
+    """
+    import uuid
+
+    from navis.reasoning.store import compute_observation_id
+
+    sig = uuid.uuid5(uuid.NAMESPACE_DNS, "sig-1")
+    other = uuid.uuid5(uuid.NAMESPACE_DNS, "sig-2")
+
+    # Same conclusion, same snapshot -> same row.
+    assert compute_observation_id(sig, "wm-1") == compute_observation_id(sig, "wm-1")
+    # Same conclusion, DIFFERENT snapshot -> a new row. This is the write that
+    # ON CONFLICT DO NOTHING used to swallow.
+    assert compute_observation_id(sig, "wm-1") != compute_observation_id(sig, "wm-2")
+    # Different conclusions never collide at one snapshot.
+    assert compute_observation_id(sig, "wm-1") != compute_observation_id(other, "wm-1")
+    # A null watermark is stable and distinct from the literal string.
+    assert compute_observation_id(sig, None) == compute_observation_id(sig, None)
+    assert compute_observation_id(sig, None) != compute_observation_id(sig, "-")
+
+
+def test_signal_identity_is_unchanged_by_the_observation_split():
+    """The whole point of splitting the tables was to leave this alone.
+
+    If `compute_signal_id` ever starts hashing the watermark, every stored
+    reference in execution/learning/intelligence orphans at once — 52 of
+    production's 122 decision references already resolve to nothing.
+    """
+    import inspect
+
+    from navis.reasoning.v2 import contract
+
+    src = inspect.getsource(contract.compute_signal_id)
+    assert "watermark" not in src, (
+        "compute_signal_id must not hash the state watermark — stable identity is "
+        "what makes historical reasoning references resolvable"
+    )
+    params = inspect.signature(contract.compute_signal_id).parameters
+    assert list(params) == [
+        "org_id", "reasoning_version", "engine_name", "engine_version",
+        "signal_type", "entity_id", "dedup_key",
+    ]
+
+
+def test_observation_row_carries_every_snapshot_dependent_field():
+    """A field left behind on the identity row is a value frozen at first
+    detection — the exact defect. Everything derived from `state.as_of` must
+    travel on the observation."""
+    from navis.reasoning.store import _observation_row, compute_observation_id
+
+    signal = run_reasoning_v2(_state())[0]
+    row = _observation_row(signal)
+
+    assert row["observation_id"] == compute_observation_id(
+        signal.signal_id, signal.state_watermark
+    )
+    assert row["signal_id"] == signal.signal_id
+    assert row["organization_id"] == signal.org_id
+    assert row["state_watermark"] == signal.state_watermark
+    assert row["state_as_of"] == signal.state_as_of
+    # The four snapshot-dependent values, verbatim from the engine.
+    assert row["confidence"] == signal.confidence
+    assert row["severity"] == signal.severity
+    assert row["why"] == signal.why
+    assert row["evidence"] == (signal.evidence or {})
+    # Logical time, never wall clock.
+    assert row["created_at"] == signal.created_at == signal.state_as_of
+
+
+async def test_persist_signals_writes_identity_once_and_an_observation_per_snapshot():
+    """Two statements, two DIFFERENT conflict rules — that difference IS the fix.
+
+    Asserts on the SQL actually emitted rather than on a fake's bookkeeping,
+    matching how `tests/state/test_service.py` pins the snapshot upsert guard.
+    """
+    from navis.reasoning.store import persist_signals
+
+    class _Res:
+        rowcount = 1
+
+    class _RecDB:
+        def __init__(self):
+            self.sql = []
+
+        async def execute(self, stmt):
+            from sqlalchemy.dialects import postgresql
+
+            self.sql.append(str(stmt.compile(dialect=postgresql.dialect())).upper())
+            return _Res()
+
+    db = _RecDB()
+    signals = run_reasoning_v2(_state())
+    assert signals, "the corpus produced no signals to persist"
+    await persist_signals(db, signals)
+
+    assert len(db.sql) == 2, "expected one identity write and one observation write"
+    identity, observation = db.sql
+
+    # The stable conclusion: appended once, never overwritten.
+    assert "INSERT INTO REASONING_SIGNALS" in identity
+    assert "ON CONFLICT (SIGNAL_ID) DO NOTHING" in identity
+    assert "DO UPDATE" not in identity, (
+        "the identity row must never be overwritten — history would be destroyed"
+    )
+
+    # The observation: appended per (conclusion, snapshot).
+    assert "INSERT INTO REASONING_SIGNAL_OBSERVATIONS" in observation
+    assert "ON CONFLICT (OBSERVATION_ID) DO NOTHING" in observation
+    assert "DO UPDATE" not in observation, "observations are append-only"
+
+    # Ordering is a foreign-key requirement, not a preference.
+    assert db.sql.index(identity) < db.sql.index(observation)
+
+
+async def test_persist_signals_does_not_touch_the_database_when_there_is_nothing_to_write():
+    from navis.reasoning.store import persist_signals
+
+    class _ExplodingDB:
+        async def execute(self, stmt):  # pragma: no cover - must never run
+            raise AssertionError("wrote to the database with no signals")
+
+    assert await persist_signals(_ExplodingDB(), []) == 0
+
+
+async def test_observations_at_fails_closed_rather_than_substituting_a_snapshot():
+    """An id with no observation at this watermark is ABSENT — never quietly
+    served an older observation, the latest one, or the identity row's own
+    first-detection columns. Substituting is how a decision came to report 11.85
+    days while its cited row said 7.16."""
+    from navis.reasoning.store import observations_at
+
+    captured = {}
+
+    class _Res:
+        def all(self):
+            return []
+
+    class _FakeDB:
+        async def scalars(self, stmt):
+            captured["sql"] = str(
+                stmt.compile(compile_kwargs={"literal_binds": True})
+            )
+            return _Res()
+
+    import uuid
+
+    out = await observations_at(
+        _FakeDB(), ORG_A, [uuid.uuid4()], state_watermark="wm-1"
+    )
+    assert out == {}                       # absent, not substituted
+    assert "organization_id" in captured["sql"] and ORG_A.hex in captured["sql"]
+    assert "state_watermark" in captured["sql"]
+
+    class _ExplodingDB:
+        async def scalars(self, stmt):  # pragma: no cover - must never run
+            raise AssertionError("queried the database with nothing to resolve")
+
+    assert await observations_at(_ExplodingDB(), ORG_A, [], state_watermark=None) == {}
+
+
+async def test_obligation_counts_read_observations_not_first_detection():
+    """THE `shown > total` DEFECT, pinned at the query.
+
+    Counting `reasoning_signals.state_watermark` asks "which conclusions were BORN
+    at this snapshot?". The brief ranks conclusions that were TRUE at it, so every
+    obligation carried over from an earlier fold vanished from the count — live,
+    `shown = 4, total = 2`, with both missing entries being the top-ranked
+    COMMITMENT_SLIPPING decisions. The blind spot grew with obligation age.
+    """
+    from navis.reasoning.store import signal_type_counts_at
+
+    captured = {}
+
+    class _Res:
+        def all(self):
+            return []
+
+    class _FakeDB:
+        async def execute(self, stmt):
+            captured["sql"] = str(
+                stmt.compile(compile_kwargs={"literal_binds": True})
+            ).upper()
+            return _Res()
+
+    await signal_type_counts_at(
+        _FakeDB(), ORG_A, reasoning_version=REASONING_VERSION, state_watermark="wm-9"
+    )
+    sql = captured["sql"]
+    # The snapshot filter is on the OBSERVATION, not on the identity row.
+    assert "REASONING_SIGNAL_OBSERVATIONS.STATE_WATERMARK" in sql
+    assert "REASONING_SIGNALS.STATE_WATERMARK" not in sql
+    # One conclusion observed here is one obligation, however many passes ran.
+    assert "COUNT(DISTINCT" in sql
+    # Still org-scoped, and on the observation's own indexed column.
+    assert "REASONING_SIGNAL_OBSERVATIONS.ORGANIZATION_ID" in sql
+
+
 async def test_resolve_signals_always_filters_by_organization():
     """org_id is a required filter, not a convenience.
 

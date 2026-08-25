@@ -146,3 +146,64 @@ def test_email_true_positives(utterance):
 def test_empty_input_is_safe():
     assert classify("") is ChatRoute.WORKSPACE_QA
     assert classify("   ") is ChatRoute.WORKSPACE_QA
+
+
+# ── EMAIL_SEARCH: retrieving mail is not sending it (TASK 7.5.4) ───────────
+#
+# "Find the email from Ajeet" was reaching WORKSPACE_QA and being answered with
+# reasoning prose about the organization while the message sat in signal_events.
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "Find the email from Ajeet.",
+        "Show me the latest email from Ajeet.",
+        "What did Ajeet email me about?",
+        "Find emails mentioning Navis.",
+        "Search my inbox for the invoice",
+        "Any emails from the investor?",
+    ],
+)
+def test_explicit_mail_retrieval_routes_to_email_search(utterance):
+    assert classify(utterance) is ChatRoute.EMAIL_SEARCH
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        # Sending ALWAYS wins the tie — these name mail too.
+        "Send the email to ajeet@example.com",
+        "Send an email to Ajeet about the deck",
+        "Draft an email to Ajeet",
+        "Reply to Ajeet's email and tell him we're delayed",
+    ],
+)
+def test_sending_still_wins_over_retrieval(utterance):
+    assert classify(utterance) is ChatRoute.SEND_EMAIL
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        # Organizational understanding has no mail noun and must stay on the
+        # Identity -> Memory -> State -> Context -> Reasoning -> Intelligence path.
+        "Why does Ajeet matter to my organization?",
+        "Who is Ajeet?",
+        "What is happening with Ajeet?",
+        "What changed with Ajeet?",
+        "What should I do first?",
+        # "message" is how a founder refers to Slack too — routing it to Gmail
+        # would answer from the wrong system on a Slack-only organization.
+        "Show me the message from Ajeet",
+    ],
+)
+def test_organizational_questions_never_route_to_email_search(utterance):
+    assert classify(utterance) is not ChatRoute.EMAIL_SEARCH
+
+
+def test_meeting_verbs_are_unaffected_by_the_new_rule():
+    assert classify("Schedule a meeting with Ajeet tomorrow") is ChatRoute.SCHEDULE_MEETING
+    assert classify("Cancel the meeting") is ChatRoute.CANCEL_MEETING
+    assert classify("Reschedule the meeting to 5-6 PM") is ChatRoute.RESCHEDULE_MEETING
+    assert classify("What meetings do I have this week?") is ChatRoute.CALENDAR_QUERY

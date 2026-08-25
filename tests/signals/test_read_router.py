@@ -28,6 +28,15 @@ class _Row:
     occurred_at: datetime | None
     payload: dict[str, Any]
     event_type: str = SignalEventType.EMAIL_RECEIVED.value
+    # When THIS version was ingested, as distinct from when the thing happens.
+    # `_shape_calendar` publishes it as `observed_at`; the real row inherits it
+    # from `Timestamped`, so it is never null in production.
+    created_at: datetime | None = None
+
+
+# The org a shaped meeting is scoped to. `_shape_calendar` folds it into the
+# meeting's entity_id, which is what joins this feed to `/context`.
+ORG = uuid.UUID("2f9a1c44-6b0e-4d7a-9f21-8c5e3b7d0a16")
 
 
 # ── _decrypt_content ────────────────────────────────────────────────────────
@@ -134,7 +143,7 @@ def test_shape_calendar_flattens_conference_and_organizer():
         },
         event_type=SignalEventType.CALENDAR_EVENT_CREATED.value,
     )
-    shaped = R._shape_calendar(row)
+    shaped = R._shape_calendar(row, org_id=ORG)
     assert shaped["summary"] == "Design review"
     assert shaped["attendees_count"] == 4
     assert shaped["organizer_email"] == "eng-lead@acme.com"
@@ -151,7 +160,7 @@ def test_shape_calendar_has_conference_is_true_for_hangout_only():
         occurred_at=datetime.now(timezone.utc),
         payload={"hangout_link": "https://meet.google.com/legacy"},
     )
-    assert R._shape_calendar(row)["has_conference"] is True
+    assert R._shape_calendar(row, org_id=ORG)["has_conference"] is True
 
 
 # ── _shape_drive ────────────────────────────────────────────────────────────
@@ -459,7 +468,7 @@ def test_shape_calendar_exposes_the_canonical_meet_url():
         },
         event_type=SignalEventType.CALENDAR_EVENT_UPDATED.value,
     )
-    shaped = R._shape_calendar(row)
+    shaped = R._shape_calendar(row, org_id=ORG)
 
     assert shaped["summary"] == "Nick and Abhi"
     assert shaped["status"] == "confirmed"

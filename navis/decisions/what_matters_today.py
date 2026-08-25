@@ -15,8 +15,10 @@ from datetime import datetime
 from navis.decisions.base import (
     Decision,
     DecisionCategory,
+    InsightRelation,
     IntelligenceFact,
     IntelligenceView,
+    SupportingInsight,
     category_for,
     compute_decision_id,
 )
@@ -54,8 +56,8 @@ _INTELLIGENCE_BIAS_CEILING = _CATEGORY_BIAS[DecisionCategory.RISK]
 
 def _relevant_facts(
     signal: ReasoningSignal, intelligence: IntelligenceView | None
-) -> tuple[IntelligenceFact, ...]:
-    """The organizational facts that are ABOUT this signal. Deterministic.
+) -> tuple[tuple[IntelligenceFact, InsightRelation], ...]:
+    """The organizational facts that are ABOUT this signal, AND HOW. Deterministic.
 
     Two relationships, both already recorded upstream, neither inferred:
 
@@ -68,14 +70,34 @@ def _relevant_facts(
     Everything else is unrelated and contributes nothing. No fuzzy matching,
     no text similarity, no model: an insight either names this signal or its
     entity, or it does not.
+
+    WHICH of the two applied is now returned alongside each fact rather than
+    discarded. Both were already being flattened into one id list on the
+    decision, where a reader cannot tell shared origin from topical overlap and
+    the natural reading of either is "this insight caused this decision" —
+    which neither one is. See `decisions.base.InsightRelation`. The FIRST match
+    wins per fact (the `continue` below), so an insight folded from this very
+    signal is never downgraded to a mere entity match.
+
+    A SIGNAL MATCH IS NOT ONE RELATIONSHIP BUT TWO, split on
+    `fact.describes_state`. A reality insight that names this signal was folded
+    from it in the same pass; a Learning insight that names it is a measurement
+    of what happened when the organization acted on it, which is a different
+    claim with a different clock. The two only ever looked alike because both
+    matched on a signal id.
     """
     if intelligence is None or not intelligence.facts:
         return ()
     signal_id = str(signal.signal_id)
-    out: list[IntelligenceFact] = []
+    out: list[tuple[IntelligenceFact, InsightRelation]] = []
     for fact in intelligence.facts:
         if signal_id in fact.supporting_reasoning_signal_ids:
-            out.append(fact)
+            out.append((
+                fact,
+                InsightRelation.DERIVED_FROM_SAME_SIGNAL
+                if fact.describes_state
+                else InsightRelation.LEARNED_FROM_OUTCOMES,
+            ))
             continue
         if not (signal.entity_type and signal.entity_id):
             continue
@@ -85,12 +107,44 @@ def _relevant_facts(
                 and entity.get("entity_type") == signal.entity_type
                 and entity.get("entity_id") == signal.entity_id
             ):
-                out.append(fact)
+                out.append((fact, InsightRelation.SHARES_ENTITY))
                 break
     return tuple(out)
 
 
-def _intelligence_bias(facts: tuple[IntelligenceFact, ...]) -> float:
+def _supporting(
+    fact: IntelligenceFact, relation: InsightRelation, state_watermark: str | None
+) -> SupportingInsight:
+    """One insight reference, carrying whether it still describes THIS snapshot.
+
+    PURE, and a comparison rather than a judgement: both watermarks are stored
+    values — the decision's is the snapshot Reasoning ran over, the fact's is the
+    snapshot the insight recorded — and this reports whether they are the same
+    string. Nothing is inferred and nothing is filtered: a stale insight is still
+    returned, still scored, and still listed. It simply stops being able to
+    masquerade as current.
+
+    `None` for a Learning-derived fact, because its watermark is inherited from
+    whichever execution happened to record one and is not a claim about a
+    snapshot at all. Reporting False there would invent a staleness the row never
+    asserted; reporting True would be worse. See `SupportingInsight`.
+    """
+    return SupportingInsight(
+        insight_id=fact.insight_id,
+        relation=relation,
+        insight_type=fact.insight_type,
+        title=fact.title,
+        sample_size=fact.sample_size,
+        state_watermark=fact.state_watermark,
+        describes_current_snapshot=(
+            fact.state_watermark == state_watermark if fact.describes_state else None
+        ),
+    )
+
+
+def _intelligence_bias(
+    facts: tuple[tuple[IntelligenceFact, InsightRelation], ...]
+) -> float:
     """How much the corroborating facts may move this decision: [0, ceiling].
 
     The STRONGEST relevant fact decides, not the sum. Summing would let a
@@ -99,7 +153,7 @@ def _intelligence_bias(facts: tuple[IntelligenceFact, ...]) -> float:
     """
     if not facts:
         return 0.0
-    strongest = max(min(max(f.confidence, 0.0), 1.0) for f in facts)
+    strongest = max(min(max(f.confidence, 0.0), 1.0) for f, _relation in facts)
     return _INTELLIGENCE_BIAS_CEILING * strongest
 
 
@@ -206,8 +260,18 @@ class WhatMattersTodayEngine:
                     # the same set `_intelligence_bias` scored, so the stored
                     # provenance and the applied nudge can never disagree.
                     supporting_insight_ids=tuple(
-                        sorted(f.insight_id for f in facts)
+                        sorted(f.insight_id for f, _r in facts)
                     ),
+                    # The same set again, each carrying the relationship that
+                    # admitted it. Sorted on the same key so the two sequences
+                    # are positionally identical and a client can zip them.
+                    supporting_insights=tuple(
+                        _supporting(f, r, state_watermark)
+                        for f, r in sorted(facts, key=lambda pair: pair[0].insight_id)
+                    ),
+                    # WHICH reasoning conclusion this is. `category` buckets six
+                    # signal types into RISK; this is the one the engine emitted.
+                    signal_type=s.signal_type.value,
                     # The signal's own values, passed through unchanged. NOT the
                     # ranking score: `_score` additionally folds in the category
                     # bias and the intelligence nudge, which are this engine's
@@ -215,6 +279,11 @@ class WhatMattersTodayEngine:
                     # statement about the finding.
                     confidence=s.confidence,
                     severity=s.severity,
+                    # The entity this decision is about, straight off the
+                    # signal. This engine already reads both fields to dedupe
+                    # (see `seen_entities` above) — they simply never left.
+                    entity_type=s.entity_type,
+                    entity_id=s.entity_id,
                 )
             )
         return decisions

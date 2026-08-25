@@ -31,6 +31,7 @@ from navis.api.admin_router import router as admin_router
 from navis.api.brief_router import router as brief_router
 from navis.api.chat_router import router as chat_router
 from navis.api.context_router import router as context_router
+from navis.api.knowledge_router import router as knowledge_router
 from navis.api.memory_router import router as memory_router
 from navis.api.workspace_router import router as workspace_router
 from navis.execution.router import router as execution_router
@@ -54,6 +55,10 @@ api_router.include_router(signals_read_router)
 api_router.include_router(identity_resolution_router)
 api_router.include_router(brief_router)
 api_router.include_router(context_router)
+# Canonical organizational entities, projected from State V2. Registered next to
+# `/context` because they are the two read-side shapes over the same snapshot;
+# `/memory/*` below is the legacy derived surface this supersedes.
+api_router.include_router(knowledge_router)
 api_router.include_router(execution_router)
 api_router.include_router(intelligence_router)
 api_router.include_router(adaptive_router)

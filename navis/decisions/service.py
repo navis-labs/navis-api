@@ -14,11 +14,17 @@ from sqlalchemy import desc, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from navis.decisions.base import IntelligenceView, compute_brief_id
+from navis.decisions.base import (
+    IntelligenceView,
+    check_decision_provenance,
+    compute_brief_id,
+    obligation_counts,
+)
 from navis.decisions.models import DailyBrief
 from navis.decisions.what_matters_today import WhatMattersTodayEngine
 from navis.platform.events import DomainEvent, EventType, event_bus
 from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import metrics
 from navis.reasoning.v2.contract import ReasoningSignal
 
 logger = get_logger("decisions")
@@ -144,6 +150,114 @@ class DecisionService:
             len(intelligence.facts) if intelligence else 0,
         )
         return await self.db.get(DailyBrief, brief_id)
+
+    async def obligations(self, brief: DailyBrief) -> dict:
+        """How much this brief is a window ONTO, resolved from Reasoning's record.
+
+        THE DEFECT THIS CLOSES. A brief shows at most `brief_max_items`
+        decisions (seven by default), ranked across every category and deduped
+        by entity. Nothing in the response said so, so the only count a surface
+        could form was `len(decisions)` — and a Today tile that reads "Waiting
+        on you: 2" off a brief holding two waiting decisions and five risks is
+        reporting the size of a display window as if it were the number of
+        people waiting for an answer. Every other number on that surface was
+        worse: with no backend count at all, the frontend fell back to counting
+        rendered cards, and one tile counted a thread feed that is not served.
+
+        The real answer is already persisted. `orchestration.brief` calls
+        `persist_signals` on EVERY signal of the pass — not just the ones that
+        became decisions — and a brief's identity IS
+        (org, reasoning_version, state_watermark), so the same tuple resolves
+        the exact reasoning pass this brief was ranked from.
+
+        `available` is the load-bearing field. A brief built before
+        `reasoning_signals` existed, or one whose pass was never persisted,
+        resolves to no rows — and reporting that as `{"waiting_on_user_reply":
+        0}` would be Navis stating "nobody is waiting on you" on the strength
+        of a table it could not read. It is the same distinction
+        `state.v2.models` draws between False and None, and the one the
+        frontend already understands as `threadActivityAvailable`. When
+        `available` is false the counts carry NO information; when it is true, a
+        type absent from `by_signal_type` is genuinely zero.
+
+        Read-only, one indexed query, and it never fabricates: `shown` is the
+        brief's own decision list and `by_signal_type` counts stored rows.
+        """
+        from navis.reasoning.store import signal_type_counts_at
+
+        emitted = await signal_type_counts_at(
+            self.db,
+            brief.organization_id,
+            reasoning_version=brief.reasoning_version,
+            state_watermark=brief.state_watermark,
+        )
+        counts = obligation_counts(emitted)
+        return {
+            "available": bool(emitted),
+            "reasoning_version": brief.reasoning_version,
+            "state_watermark": brief.state_watermark,
+            "by_signal_type": counts,
+            "total": sum(counts.values()),
+            # How many of them this brief is actually showing. The gap between
+            # `total` and `shown` is the honest "and N more" a surface needs in
+            # order not to imply the list is exhaustive.
+            "shown": len(brief.decisions or []),
+        }
+
+    async def provenance(self, brief: DailyBrief) -> dict[str, dict]:
+        """Prove, per decision, that its reasoning is reproducible AT ITS OWN SNAPSHOT.
+
+        THE P0-3 CHECK. A decision carries the values the engines produced during
+        the pass it was ranked in; its `reasoning_signal_ids` pointer resolves to
+        a stored conclusion. Those used to be the same row, and that row kept only
+        its FIRST detection — so a decision could publish 11.85 days / 0.8951 while
+        the signal it cites recorded 7.16 / 0.7386. Nothing detected it, because
+        nothing ever compared them.
+
+        `reasoning_signal_observations` makes the comparison possible, and this
+        performs it: resolve each cited conclusion AT `brief.state_watermark`, then
+        check field by field. ONE query for the whole brief, not one per decision.
+
+        FAILS CLOSED, in both directions. `observations_at` returns nothing for a
+        conclusion never recorded at this snapshot — no older observation, no
+        latest, no fallback to the identity row's own columns — and a decision
+        with no resolvable observation is reported `verified: false` with the
+        reason. It is never dropped and never silently presented as provenanced:
+        a brief that cannot back its own reasoning must say so, because a founder
+        acting on it is the one who bears the cost.
+
+        Keyed by `decision_id` so a caller can attach the result without
+        re-deriving the pairing.
+        """
+        from navis.reasoning.store import observations_at
+
+        decisions = list(brief.decisions or [])
+        if not decisions:
+            return {}
+        cited = [
+            (d.get("reasoning_signal_ids") or [None])[0]
+            for d in decisions
+        ]
+        observations = await observations_at(
+            self.db,
+            brief.organization_id,
+            [c for c in cited if c],
+            state_watermark=brief.state_watermark,
+        )
+        out: dict[str, dict] = {}
+        for decision in decisions:
+            signal_id = (decision.get("reasoning_signal_ids") or [None])[0]
+            check = check_decision_provenance(
+                decision, observations.get(str(signal_id)) if signal_id else None
+            )
+            if not check.verified:
+                metrics.incr("decisions.provenance.unverified")
+                logger.warning(
+                    "decision provenance unverified brief=%s decision=%s reason=%s",
+                    brief.id, decision.get("decision_id"), check.reason,
+                )
+            out[str(decision.get("decision_id"))] = check.to_dict()
+        return out
 
     async def latest_brief(self, org_id: uuid.UUID) -> DailyBrief | None:
         """The newest brief this org has, by the point in time it describes.

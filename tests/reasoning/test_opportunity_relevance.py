@@ -60,6 +60,11 @@ def _rel(
         source_signal_event_id=uuid.uuid5(NS, f"sig:{org_id}:{email}:{tag}"),
         schema_version=1,
         confidence=0.9,
+        # Observed the moment it happened — this corpus models a live inbox, not
+        # a backfill, so the two clocks coincide. The field is what gives the
+        # projection an observation cursor, which is the provenance
+        # `state_watermark` carries.
+        observed_at=NOW - timedelta(days=days_ago),
     )
 
 

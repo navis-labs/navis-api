@@ -345,6 +345,204 @@ async def test_no_n_plus_one(engine):
     event.remove(engine.sync_engine, "before_cursor_execute", _count)
 
     assert sum(1 for d in out["decisions"] if d["execution"]) == 10
-    assert len(selects) == 1, (
-        f"expected ONE batched lookup for 25 decisions, issued {len(selects)}"
+    # TWO statements, and BOTH are constant in the number of decisions: one
+    # grouped count over `reasoning_signals` for the obligations block, and one
+    # batched lookup of every obligation key. The invariant this test defends is
+    # "no query per decision", not a literal 1 — a second concern that costs one
+    # bounded statement is not an N+1.
+    assert len(selects) == 2, (
+        f"expected TWO bounded statements for 25 decisions, issued {len(selects)}"
+    )
+
+
+# ── The obligations block: how many, from Reasoning's own record ───────────
+#
+# A brief is a WINDOW. It is ranked, deduped by entity and truncated to
+# `brief_max_items`, so counting its decisions answers "how big is the card
+# list" — which a Today surface was rendering as "N people are waiting on you".
+# The real number lives in `reasoning_signals`, keyed by the same
+# (org, reasoning_version, state_watermark) tuple the brief is keyed on.
+
+
+async def seed_signals(engine, org_id, *, types, watermark="wm-1", version=2):
+    """Persist one reasoning pass through the REAL store, as the brief does."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from navis.reasoning.store import persist_signals
+    from navis.reasoning.v2.contract import ReasoningSignal, SignalType
+
+    signals = [
+        ReasoningSignal(
+            signal_id=uuid.uuid5(uuid.NAMESPACE_URL, f"{org_id}|{watermark}|{i}"),
+            org_id=org_id,
+            signal_type=SignalType(t),
+            entity_type="thread",
+            entity_id=f"e-{i}",
+            title=f"t{i}",
+            why="because",
+            evidence={},
+            confidence=0.9,
+            severity=0.6,
+            engine_name="test",
+            engine_version="1.0.0",
+            state_as_of=None,
+            state_watermark=watermark,
+            reasoning_version=version,
+            created_at=None,
+        )
+        for i, t in enumerate(types)
+    ]
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+    async with Session() as s:
+        await persist_signals(s, signals)
+        await s.commit()
+
+
+async def test_obligations_count_the_reasoning_pass_not_the_page(engine):
+    """Six waiting signals, one shown decision. The count must say six."""
+    org_id = await _org(engine)
+    await seed_signals(
+        engine, org_id,
+        types=["waiting_on_user_reply"] * 6
+        + ["commitment_slipping", "context_summary", "opportunity"],
+    )
+
+    out = await enrich(engine, org_id, [decision()])
+
+    obligations = out["obligations"]
+    assert obligations["available"] is True
+    assert obligations["by_signal_type"] == {
+        "waiting_on_user_reply": 6,
+        "commitment_slipping": 1,
+    }
+    # Interpretation is excluded — an observation asks nothing of anyone.
+    assert "context_summary" not in obligations["by_signal_type"]
+    assert "opportunity" not in obligations["by_signal_type"]
+    assert obligations["total"] == 7
+    assert obligations["shown"] == 1
+
+
+async def test_obligations_report_absence_when_no_pass_was_persisted(engine):
+    """A brief predating `reasoning_signals` must not render as "all clear"."""
+    org_id = await _org(engine)
+
+    out = await enrich(engine, org_id, [decision()])
+
+    assert out["obligations"]["available"] is False
+    assert out["obligations"]["by_signal_type"] == {}
+
+
+async def test_obligations_never_count_another_tenants_signals(engine):
+    """Two organizations can hold a brief at the same watermark string —
+    `state_watermark` is a memory id, and nothing stops a fixture or a replay
+    from colliding. The count is filtered on the organization, not trusted to
+    the key."""
+    mine, theirs = await _org(engine), await _org(engine)
+    await seed_signals(engine, theirs, types=["waiting_on_user_reply"] * 4)
+    await seed_signals(engine, mine, types=["decision_owed"])
+
+    out = await enrich(engine, mine, [decision()])
+
+    assert out["obligations"]["by_signal_type"] == {"decision_owed": 1}
+
+
+async def test_obligations_are_scoped_to_this_briefs_snapshot(engine):
+    """Yesterday's pass must not be counted into today's brief. A brief's
+    identity IS (org, reasoning_version, state_watermark), so the count resolves
+    the pass it was actually built from."""
+    org_id = await _org(engine)
+    await seed_signals(engine, org_id, types=["waiting_on_user_reply"] * 5,
+                       watermark="wm-0")
+    await seed_signals(engine, org_id, types=["waiting_on_user_reply"],
+                       watermark="wm-1")
+
+    out = await enrich(engine, org_id, [decision()])  # _Brief is at wm-1
+
+    assert out["obligations"]["state_watermark"] == "wm-1"
+    assert out["obligations"]["by_signal_type"] == {"waiting_on_user_reply": 1}
+
+
+# ── The action block: what can actually be done, if anything ───────────────
+
+
+async def test_a_draftable_decision_publishes_the_existing_action_type(engine):
+    """Today does not get its own execution path — the action named here is the
+    one `ExecutionService` would create, and nothing else."""
+    from navis.execution.models import ActionType
+
+    org_id = await _org(engine)
+    out = await enrich(engine, org_id, [decision()])
+
+    action = out["decisions"][0]["action"]
+    assert action["action_type"] == ActionType.REPLY_TO_EMAIL.value
+    assert action["requires_draft"] is True
+    assert action["obligation_key"]
+
+
+async def test_a_finding_publishes_no_action_so_no_button_can_be_offered(engine):
+    """`risk` is a finding to read. `action: null` is how a surface knows the
+    difference between "nothing done yet" and "there is nothing to do"."""
+    org_id = await _org(engine)
+    out = await enrich(engine, org_id, [decision(category="risk")])
+
+    assert out["decisions"][0]["action"] is None
+    assert out["decisions"][0]["execution"] is None
+
+
+async def test_the_published_action_matches_the_execution_it_resolves(engine):
+    """The key a card publishes and the key an execution was stored under are
+    the same string — that is what lets a surface say "already sent" instead of
+    offering to send it again."""
+    org_id = await _org(engine)
+    d = decision()
+    await seed_execution(engine, org_id, status="executed", d=d,
+                         provider_reference={"provider": "gmail", "external_id": GMAIL_ID})
+
+    [enriched] = (await enrich(engine, org_id, [d]))["decisions"]
+
+    assert enriched["execution"]["status"] == "executed"
+    assert enriched["action"]["obligation_key"]
+
+
+# ── The founder-facing explanation, on the wire ───────────────────────────
+
+
+async def test_every_decision_ships_a_readable_explanation(engine):
+    """The card a founder reads is served by the backend, not composed by the
+    client. Before this, `whyItMatters` read `decisionDetail` (not served by
+    this route) and `whatNext` rendered the headline a second time."""
+    org_id = await _org(engine)
+    d = decision()
+    d["signal_type"] = "waiting_on_user_reply"
+    d["title"] = "Mulayam is waiting for your reply"
+
+    [enriched] = (await enrich(engine, org_id, [d]))["decisions"]
+    e = enriched["explanation"]
+
+    assert e["explainable"] is True
+    assert e["kind"] == "reply_needed" and e["kind_label"] == "Reply needed"
+    assert e["headline"] == "Mulayam is waiting for your reply"
+    assert e["subject"]["label"] == "Mulayam"
+    assert e["next_step"] == "Reply to Mulayam, or hand the thread off."
+    # It mirrors the action block on the SAME row — one derivation, so a card
+    # cannot offer a button the worker would refuse.
+    assert e["can_navis_act"] is bool(enriched["action"])
+    assert e["provenance"]["state_watermark"] == enriched["state_watermark"]
+    assert e["provenance"]["decision_id"] == enriched["decision_id"]
+
+
+async def test_a_finding_ships_an_explanation_that_offers_nothing_to_execute(engine):
+    org_id = await _org(engine)
+    d = decision(category="risk")
+    d["signal_type"] = "relationship_cooling"
+    d["title"] = "Relationship cooling"
+    d["evidence"] = {"days_since_contact": 21.0, "person_email": "amy@beta.io"}
+
+    [enriched] = (await enrich(engine, org_id, [d]))["decisions"]
+
+    assert enriched["action"] is None
+    assert enriched["explanation"]["can_navis_act"] is False
+    # ... and the founder is told WHO, not the category name.
+    assert enriched["explanation"]["headline"] == (
+        "Communication with amy@beta.io has dropped off"
     )

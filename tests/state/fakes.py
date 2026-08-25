@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from navis.memory.envelope import EntityType
 from navis.state.v2.builders import MemoryRecordView
-from navis.state.v2.models import OrganizationalState, order_key
+from navis.state.v2.models import OrganizationalState, observation_key, order_key
 
 NS = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 ORG_A = uuid.UUID("11111111-1111-1111-1111-111111111111")
@@ -15,7 +15,17 @@ BASE = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def rec(entity_type: EntityType, natural_key: str, payload: dict, *, offset: int, tag: str,
-        org_id: uuid.UUID = ORG_A) -> MemoryRecordView:
+        org_id: uuid.UUID = ORG_A, observed_offset: int | None = None) -> MemoryRecordView:
+    """One memory record view.
+
+    `offset` is EVENT time (when the fact happened); `observed_offset` is
+    OBSERVATION time (when Navis learned it, = memory_records.created_at) and
+    defaults to the same position so a plain corpus is a well-ordered stream —
+    facts that happened in order and were observed in that order. Tests that need
+    the two clocks to diverge (a future meeting, a late delivery) set it
+    explicitly.
+    """
+    obs = offset if observed_offset is None else observed_offset
     return MemoryRecordView(
         memory_id=uuid.uuid5(NS, f"mem:{org_id}:{tag}"),
         org_id=org_id,
@@ -26,6 +36,7 @@ def rec(entity_type: EntityType, natural_key: str, payload: dict, *, offset: int
         source_signal_event_id=uuid.uuid5(NS, f"sig:{org_id}:{tag}"),
         schema_version=1,
         confidence=0.9,
+        observed_at=BASE + timedelta(seconds=obs),
     )
 
 
@@ -61,27 +72,62 @@ def corpus(org_id: uuid.UUID = ORG_A) -> list[MemoryRecordView]:
 
 
 class FakeReader:
+    """Mirrors MemoryReader's contract exactly, including the two clocks: `stream`
+    walks the org in EVENT order, `observed_since` returns the delta in
+    OBSERVATION order, and `count` is the completeness probe."""
+
     def __init__(self, records=None) -> None:
-        self._records = list(records or [])
+        self._records = []
+        self.add(records or [])
 
     def add(self, records) -> None:
-        self._records.extend(records)
+        """Append, ignoring a memory_id already held.
 
-    async def stream(self, org_id, *, after=None, batch=5000):
+        Mirrors the production writer exactly: `memory_records.memory_id` is the
+        primary key and `MemoryRepository.append` is
+        `INSERT ... ON CONFLICT (memory_id) DO NOTHING`, so a replayed signal or an
+        at-least-once redelivery converges on one row rather than accumulating.
+        A fake that let duplicates in would make replay look lossy when the real
+        table cannot store them.
+        """
+        seen = {r.memory_id for r in self._records}
+        for r in records:
+            if r.memory_id in seen:
+                continue
+            seen.add(r.memory_id)
+            self._records.append(r)
+
+    def _for_org(self, org_id):
+        return [r for r in self._records if r.org_id == org_id]
+
+    async def count(self, org_id) -> int:
+        return len(self._for_org(org_id))
+
+    async def stream(self, org_id, *, batch=5000):
         rows = sorted(
-            (r for r in self._records if r.org_id == org_id),
+            self._for_org(org_id),
             key=lambda r: order_key(r.event_timestamp, r.memory_id),
         )
         for r in rows:
-            if after is None or after.passed(r.event_timestamp, r.memory_id):
-                yield r
+            yield r
 
-    async def has_records_after(self, org_id, watermark) -> bool:
-        """Mirror MemoryReader.has_records_after: True iff any record past `watermark`."""
-        return any(
-            r.org_id == org_id and watermark.passed(r.event_timestamp, r.memory_id)
-            for r in self._records
+    async def observed_since(self, org_id, cursor, *, limit):
+        """Records observed strictly after `cursor`, in observation order.
+        None when the delta exceeds `limit` — the caller must rebuild.
+
+        A record with no `observed_at` has no place in observation order at all,
+        so it can only ever be reached by a full rebuild. That mirrors the
+        production reader, where `created_at` is NOT NULL and the case cannot arise.
+        """
+        rows = sorted(
+            (
+                r for r in self._for_org(org_id)
+                if r.observed_at is not None
+                and cursor.passed(r.observed_at, r.memory_id)
+            ),
+            key=lambda r: observation_key(r.observed_at, r.memory_id),
         )
+        return None if len(rows) > limit else rows
 
 
 class _Snap:

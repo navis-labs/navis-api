@@ -19,24 +19,86 @@ from navis.memory.envelope import EntityType
 
 # Bump when the projection LOGIC changes (forces rebuild); schema_version tracks
 # the serialized shape. Both are stored on every snapshot — no destructive migrations.
-PROJECTION_VERSION = 1
-STATE_SCHEMA_VERSION = 1
+#
+# v3: THE TWO CLOCKS WERE SPLIT. `Watermark` moved from event time to OBSERVATION
+#     time and the projection gained `record_count` + `fold_frontier`. Event time
+#     ("when did this business fact happen?") is not observation-monotone: the
+#     Calendar connector deliberately stamps a signal with the MEETING'S START
+#     (`signals/calendar/connector.py::_to_event`), so one meeting booked for
+#     tomorrow pushed the resume cursor into the future and every record observed
+#     afterwards sorted BELOW it and was silently never folded. See `Watermark`
+#     and `FoldFrontier` below for the invariants that now make that impossible.
+#
+#     WHY 3 AND NOT 2. Production already holds a `projection_version = 2` /
+#     `schema_version = 2` snapshot (org 071ae55b, written 2026-08-23 19:12) whose
+#     payload carries the OLD event-time watermark and neither new field. No
+#     committed branch sets those constants to 2, so an out-of-tree writer produced
+#     it. Reusing 2 would have made the new reader adopt that row as its own: its
+#     future watermark yields an empty delta, and `SnapshotRepository.save`'s
+#     monotonic guard (`stored <= incoming`) then REFUSES every corrected write,
+#     because an honest observation cursor is by definition earlier than a future
+#     event one. The org would have rebuilt correctly in memory on every single
+#     request and never once persisted. A version is a key, not a counter: taking a
+#     virgin one costs nothing and leaves the ambiguous row inert.
+PROJECTION_VERSION = 3
+STATE_SCHEMA_VERSION = 3
 
 
-# --- Ordering / watermark ----------------------------------------------------
+# --- Ordering: the two clocks ------------------------------------------------
+#
+# EVENT ORDER decides what the projection SAYS. The reducer is latest-non-null-wins,
+# so "latest" must mean "most recently happened" — that is what makes
+# `ThreadState.direction` describe the newest message in a thread.
+#
+# OBSERVATION ORDER decides what the projection HAS SEEN. A resume cursor answers
+# "which records are already incorporated?", and only a clock that never moves
+# backwards relative to arrival can answer it. `memory_records.created_at` is that
+# clock: it is assigned by Postgres at INSERT (`server_default=func.now()`), is
+# never written by the application, and is therefore always <= now.
+#
+# Conflating them is the defect this module was rewritten to remove. They are two
+# different questions and they get two different keys.
 
 def order_key(event_timestamp: datetime, memory_id: uuid.UUID) -> tuple[datetime, int]:
-    """Total deterministic order: event_timestamp, then memory_id as tiebreak."""
+    """Total deterministic EVENT order: event_timestamp, then memory_id as tiebreak.
+
+    This is the FOLD order — the order in which facts are reduced into the
+    projection. It is never a resume cursor; see `observation_key`.
+    """
     return (event_timestamp, memory_id.int)
+
+
+def observation_key(observed_at: datetime, memory_id: uuid.UUID) -> tuple[datetime, int]:
+    """Total deterministic OBSERVATION order: observed_at, then memory_id as tiebreak.
+
+    This is the RESUME order — the order in which facts became visible to Navis.
+    It is never a fold order; see `order_key`.
+    """
+    return (observed_at, memory_id.int)
 
 
 @dataclass(frozen=True, slots=True)
 class Watermark:
+    """The OBSERVATION cursor: everything observed up to and including this point
+    is folded into the projection.
+
+    `last_timestamp` is `memory_records.created_at` — when Navis LEARNED the fact
+    — not `event_timestamp`, which is when the fact happened and may legitimately
+    be in the future (a calendar meeting). Because `created_at` is DB-assigned at
+    insert, this cursor is bounded by wall clock by construction, which is what
+    makes `state.as_of <= observation_horizon` hold without any clamping.
+
+    The cursor alone is not sufficient to prove completeness — two transactions
+    can commit out of order relative to their `now()` stamps, leaving a row below
+    a cursor that has already advanced. `OrganizationalState.record_count` closes
+    that gap; see `StateService.incremental_update`.
+    """
+
     last_timestamp: datetime | None = None
     last_memory_id: uuid.UUID | None = None
 
-    def passed(self, event_timestamp: datetime, memory_id: uuid.UUID) -> bool:
-        """True if (ts, memory_id) is strictly AFTER this watermark.
+    def passed(self, observed_at: datetime, memory_id: uuid.UUID) -> bool:
+        """True if (observed_at, memory_id) is strictly AFTER this cursor.
 
         The two fields are a PAIR — both set, or both None; the snapshot table
         enforces exactly that with `ck_state_snapshots_watermark_paired`.
@@ -44,11 +106,11 @@ class Watermark:
         it fails SAFE: a half-set cursor cannot say what has already been
         folded, so every record counts as unseen and the fold replays rather
         than silently skipping history. Testing only `last_timestamp` here
-        would reach `None.int` inside `order_key` and raise AttributeError.
+        would reach `None.int` inside `observation_key` and raise AttributeError.
         """
         if self.last_timestamp is None or self.last_memory_id is None:
             return True
-        return order_key(event_timestamp, memory_id) > order_key(
+        return observation_key(observed_at, memory_id) > observation_key(
             self.last_timestamp, self.last_memory_id
         )
 
@@ -74,6 +136,62 @@ class Watermark:
             return cls()
         return cls(
             last_timestamp=datetime.fromisoformat(ts),
+            last_memory_id=uuid.UUID(mid),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FoldFrontier:
+    """The furthest EVENT-order position already reduced into the projection.
+
+    WHY IT EXISTS. The reducer is latest-non-null-wins in event order, so an
+    incremental fold is only equivalent to a full rebuild while every new record
+    folds strictly AFTER everything already folded. A record that arrives later
+    but happened earlier — a backfill, a connector replay, or any email observed
+    after a future-dated meeting was folded — would be applied on top of a newer
+    fact and silently clobber it.
+
+    That case is DETECTED, never absorbed: `StateService.incremental_update`
+    compares each delta against this frontier and falls back to `rebuild_org`,
+    which re-folds the whole history in correct event order. Correctness over
+    incremental performance; the record is never skipped.
+    """
+
+    last_event_timestamp: datetime | None = None
+    last_memory_id: uuid.UUID | None = None
+
+    def precedes(self, event_timestamp: datetime, memory_id: uuid.UUID) -> bool:
+        """True if (event_timestamp, memory_id) folds strictly AFTER this frontier.
+
+        An unset frontier precedes everything: an empty projection can absorb any
+        record in any order. Half-set fails SAFE the same way `Watermark.passed`
+        does — an incomplete frontier cannot prove ordering, so it forces the
+        conservative answer (rebuild) rather than a silent accept.
+        """
+        if self.last_event_timestamp is None or self.last_memory_id is None:
+            return True
+        return order_key(event_timestamp, memory_id) > order_key(
+            self.last_event_timestamp, self.last_memory_id
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "last_event_timestamp": (
+                self.last_event_timestamp.isoformat() if self.last_event_timestamp else None
+            ),
+            "last_memory_id": str(self.last_memory_id) if self.last_memory_id else None,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> "FoldFrontier":
+        if not d:
+            return cls()
+        ts = d.get("last_event_timestamp")
+        mid = d.get("last_memory_id")
+        if not ts or not mid:
+            return cls()
+        return cls(
+            last_event_timestamp=datetime.fromisoformat(ts),
             last_memory_id=uuid.UUID(mid),
         )
 
@@ -341,12 +459,25 @@ def _view(entity_type: EntityType, raw: dict) -> _BaseView:
 @dataclass(slots=True)
 class OrganizationalState:
     org_id: uuid.UUID
+    # LOGICAL TIME, and now an OBSERVATION time: the moment of the newest fact
+    # Navis had learned when this projection was folded (= `watermark.last_timestamp`).
+    # It is the only clock Reasoning is allowed to read, so every `days_between`
+    # age is measured from "when we last looked", never from a meeting that has
+    # not happened yet. Bounded by wall clock by construction.
     as_of: datetime | None
     watermark: Watermark
     schema_version: int = STATE_SCHEMA_VERSION
     projection_version: int = PROJECTION_VERSION
     # {entity_type_value: {entity_id_str: raw_state_dict}}
     entities: dict[str, dict[str, dict]] = field(default_factory=dict)
+    # HOW MANY memory records are folded in. The completeness proof: the resume
+    # cursor says where we stopped, this says how much we actually took. A row
+    # that landed below an already-advanced cursor (two transactions committing
+    # out of order relative to their `now()` stamps) is invisible to the cursor
+    # and unmissable to the count.
+    record_count: int = 0
+    # The furthest EVENT-order position folded — the ordering proof. See `FoldFrontier`.
+    fold_frontier: FoldFrontier = field(default_factory=FoldFrontier)
 
     def _by_type(self, entity_type: EntityType) -> list[_BaseView]:
         bucket = self.entities.get(entity_type.value, {})
@@ -380,6 +511,8 @@ class OrganizationalState:
             "schema_version": self.schema_version,
             "projection_version": self.projection_version,
             "watermark": self.watermark.to_dict(),
+            "fold_frontier": self.fold_frontier.to_dict(),
+            "record_count": self.record_count,
             "entities": ents,
             "counts": self.counts(),
         }
@@ -394,4 +527,11 @@ class OrganizationalState:
             schema_version=d.get("schema_version", STATE_SCHEMA_VERSION),
             projection_version=d.get("projection_version", PROJECTION_VERSION),
             entities=d.get("entities", {}),
+            # Absent on a blob written before v2. Both default to "nothing
+            # proven": an empty frontier accepts any order and a zero count can
+            # never match a non-empty org, so a pre-v2 blob that somehow reached
+            # this code fails CLOSED into a rebuild rather than being trusted.
+            # In practice `projection_version` already gates those rows out.
+            record_count=int(d.get("record_count") or 0),
+            fold_frontier=FoldFrontier.from_dict(d.get("fold_frontier")),
         )

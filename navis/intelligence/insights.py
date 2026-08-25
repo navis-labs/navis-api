@@ -109,6 +109,74 @@ class RealitySignalRow:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextLink:
+    """One persisted edge from a context entity to another entity.
+
+    `state.v2.scope.EntityLink`, flattened to primitives — same three strings, no
+    State import. The role is State's own link key ("owner", "commitments",
+    "meetings") and the type is resolved by Context from its closed role map,
+    never inferred here.
+
+    WHY INTELLIGENCE NEEDS IT. Without edges, the only relation an insight can
+    express between two entities is "both produced a signal of the same type",
+    which is a GROUP BY and not an organizational situation. With them, an
+    insight can say that the cooling relationship and the slipping commitment are
+    the same counterparty — because State recorded that they are.
+    """
+
+    role: str
+    entity_type: str
+    entity_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ContextEntityRow:
+    """One entity CONTEXT selected as relevant, with where it was learned.
+
+    THE GAP THIS CLOSES. `service._provenance` says it in its own words: "NOT
+    AVAILABLE HERE: memory_ids / signal_event_ids ... the chain stops at the
+    ReasoningSignal. A reality view does not close that gap either — it carries
+    each signal's own `evidence` verbatim and nothing more." So an insight could
+    name an affected entity and could not say which remembered fact, or which
+    captured business-system event, it was known from. The provenance chain
+    Navis is built on broke one hop short of the source.
+
+    Context already holds exactly that. `state.v2.scope.ScopedView` ranks the
+    entities relevant to an intent and carries `citations[entity_id] =
+    {memory_ids, signal_ids}` for every one — read straight off each entity's own
+    `provenance`, never re-derived. It simply had no consumer inside the
+    pipeline: `scope_for` was called by the `/context` endpoint and by Ask Navis,
+    and by nothing between State and Intelligence.
+
+    A SELECTION, NOT A SUBSTITUTE FOR STATE. Context returns the top-N per entity
+    type, so an insight may legitimately name an entity Context did not select —
+    that entity simply carries no lineage here, which is honest absence rather
+    than a gap to fill. Reasoning deliberately keeps reading the FULL State: an
+    exhaustive detector fed a top-N selection would silently stop finding
+    obligations, which is the opposite of what a selection is for.
+
+    Primitives only, like every other row in this contract: no ORM object, no
+    `ScopedView`, no session. `navis/intelligence/**` still imports no State.
+    """
+
+    entity_type: str
+    entity_id: str
+    # Where Context placed it and why — `scope_for`'s own rank and reason
+    # strings ("open, oldest activity", "stalest interaction"), verbatim.
+    rank: int
+    reason: str
+    # The memory records this entity's current state was folded from, and the
+    # captured business-system events those records came from. Bounded by the
+    # composition root; empty when the entity recorded no provenance.
+    memory_ids: tuple[str, ...] = ()
+    signal_event_ids: tuple[str, ...] = ()
+    # The entity's persisted edges (see `ContextLink`). Defaulted so every
+    # existing construction site stays valid; an empty tuple means State recorded
+    # no edge for this entity, never that edges are unavailable.
+    links: tuple[ContextLink, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class OrganizationalRealityView:
     """What is true of the organization NOW, as Intelligence is allowed to see it.
 
@@ -141,6 +209,11 @@ class OrganizationalRealityView:
     # Defaulted so every existing construction site stays valid; the composition
     # root supplies the real value.
     reasoning_version: int = 0
+    # CONTEXT — the relevant slice of State, with its citations. See
+    # `ContextEntityRow`. Defaulted to empty so every existing construction site
+    # stays valid and produces byte-identical insights; an org whose Context is
+    # unavailable loses lineage depth and never gains a fabricated id.
+    context: tuple[ContextEntityRow, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,6 +475,19 @@ _OPPORTUNITY_SIGNAL_TYPES = frozenset({"opportunity", "leverage_point"})
 # in the system that carries a real, stated deadline (`due_at` is quoted from
 # the message); `commitment_slipping` covers UNDATED promises by age alone.
 _COMMITMENT_SIGNAL_TYPES = frozenset({"commitment_slipping", "commitment_follow_up"})
+# Debts the organization owes a NAMED counterparty right now: an unanswered
+# person, and a judgment somebody asked for and has not received. Both are
+# observed rather than inferred — `engines/waiting.py` reads the thread's own
+# folded `direction`, and `engines/obligations.py` reads a recorded request — and
+# both are decision-worthy without being RISK. See `obligation_intelligence`.
+_OBLIGATION_SIGNAL_TYPES = frozenset({"waiting_on_user_reply", "decision_owed"})
+# What is owed, in the organization's language rather than the engine's. Keyed by
+# the same literals so a new obligation type cannot be added to the set without
+# deciding what to call it.
+_OBLIGATION_NOUNS = {
+    "waiting_on_user_reply": "reply",
+    "decision_owed": "decision",
+}
 _RELATIONSHIP_COOLING = "relationship_cooling"
 _OPPORTUNITY = "opportunity"
 _ORG_DRIFT = "org_drift"
@@ -418,8 +504,10 @@ REALITY_INSIGHT_TYPES = frozenset({
     InsightType.OPPORTUNITY,
     InsightType.RELATIONSHIP,
     InsightType.COMMITMENT,
+    InsightType.OBLIGATION,
     InsightType.STATUS,
     InsightType.TREND,
+    InsightType.SITUATION,
 })
 
 # How many affected entities an insight names in its evidence. Bounded so one
@@ -460,18 +548,52 @@ def _label(signal) -> str:
     return signal.entity_id or signal.signal_type
 
 
-def _entities(signals: list) -> list[dict[str, Any]]:
-    """The affected entities, named and bounded, sorted for determinism."""
-    return [
-        {
+def _context_index(reality) -> dict[tuple[str | None, str | None], Any]:
+    """(entity_type, entity_id) -> the ContextEntityRow for it, if any.
+
+    Rebuilt per call rather than threaded through every generator: Context is
+    capped at a few dozen rows and the generators run once per pass, so this is
+    a handful of dict inserts against a signature change in six places.
+    """
+    return {(c.entity_type, c.entity_id): c for c in getattr(reality, "context", ())}
+
+
+def _entities(signals: list, reality=None) -> list[dict[str, Any]]:
+    """The affected entities, named and bounded, sorted for determinism.
+
+    Each entity carries its CONTEXT lineage when Context selected it: the memory
+    records its current state was folded from, and the business-system events
+    those came from. That is the hop the provenance chain was missing — an
+    insight could name an entity and not say where it was learned.
+
+    Nothing is invented. An entity Context did not select, or one that recorded
+    no provenance, simply carries no lineage keys at all: absence is honest,
+    where an empty list would read as "we looked and there was none".
+
+    `reality` is optional so every existing caller and test keeps working and
+    keeps producing the same entity dicts it did before.
+    """
+    index = _context_index(reality) if reality is not None else {}
+    out: list[dict[str, Any]] = []
+    for s in signals[:_MAX_NAMED_ENTITIES]:
+        entity: dict[str, Any] = {
             "entity_type": s.entity_type,
             "entity_id": s.entity_id,
             "label": _label(s),
             "severity": round(s.severity, 4),
             "signal_id": s.signal_id,
         }
-        for s in signals[:_MAX_NAMED_ENTITIES]
-    ]
+        ctx = index.get((s.entity_type, s.entity_id))
+        if ctx is not None:
+            # Why CONTEXT considered this entity relevant, in its own words.
+            entity["context_rank"] = ctx.rank
+            entity["context_reason"] = ctx.reason
+            if ctx.memory_ids:
+                entity["memory_ids"] = list(ctx.memory_ids)
+            if ctx.signal_event_ids:
+                entity["signal_event_ids"] = list(ctx.signal_event_ids)
+        out.append(entity)
+    return out
 
 
 def _composite_confidence(signals: list) -> float:
@@ -542,7 +664,7 @@ def risk_intelligence(reality) -> list[InsightDraft]:
                     "signal_type": signal_type,
                     "affected": n,
                     "peak_severity": _peak_severity(signals),
-                    "entities": _entities(signals),
+                    "entities": _entities(signals, reality),
                 },
                 sample_size=n,
                 confidence=_composite_confidence(signals),
@@ -592,7 +714,7 @@ def opportunity_intelligence(reality) -> list[InsightDraft]:
                 evidence={
                     "signal_type": signal_type,
                     "count": n,
-                    "entities": _entities(signals),
+                    "entities": _entities(signals, reality),
                 },
                 sample_size=n,
                 confidence=_composite_confidence(signals),
@@ -644,8 +766,8 @@ def relationship_intelligence(reality) -> list[InsightDraft]:
                 "tracked": total,
                 "cooling": len(cooling),
                 "warm": len(warm),
-                "cooling_entities": _entities(cooling),
-                "warm_entities": _entities(warm),
+                "cooling_entities": _entities(cooling, reality),
+                "warm_entities": _entities(warm, reality),
             },
             sample_size=total,
             confidence=_composite_confidence(contributing),
@@ -680,7 +802,7 @@ def commitment_intelligence(reality) -> list[InsightDraft]:
         "open_obligations": n,
         "dated": len(overdue),
         "undated": n - len(overdue),
-        "entities": _entities(signals),
+        "entities": _entities(signals, reality),
     }
     if overdue:
         evidence["max_overdue_days"] = round(max(overdue), 1)
@@ -712,6 +834,76 @@ def commitment_intelligence(reality) -> list[InsightDraft]:
             supporting_signals=_signal_ids(signals),
         )
     ]
+
+
+# 4b. Obligation Intelligence --------------------------------------------------
+
+def obligation_intelligence(reality) -> list[InsightDraft]:
+    """What the organization currently OWES a named counterparty.
+
+    THE BLIND SPOT THIS CLOSES. Of the nine SignalTypes that can become a
+    Decision, these two reached Intelligence through no generator at all:
+    `waiting_on_user_reply` and `decision_owed`. A brief card built from either
+    travelled Signal -> Memory -> State -> Reasoning -> Decision -> Today with
+    Intelligence contributing nothing — no insight, no corroboration, an empty
+    `supporting_insights` — and they are, between them, two of the three
+    categories `execution.proposer` can turn into a real action. The most
+    actionable cards on Today were exactly the ones Intelligence was silent
+    about.
+
+    A THIRD FAMILY, NOT AN EXTENSION OF RISK. `_RISK_SIGNAL_TYPES` is
+    byte-identical to the set `decisions.base` maps to `DecisionCategory.RISK`
+    (asserted in tests), so the two layers mean the same thing by "risk" and
+    `status_intelligence`'s "N carrying open risk" counts exactly what the brief
+    calls risk. Folding obligations in would silently redefine that number for
+    every organization and make the two layers disagree. An unanswered person is
+    not a decaying relationship; it is a debt with a name on it.
+
+    THE ORGANIZATIONAL CLAIM, not the message. This does not say "an email
+    arrived" — that is the Signal, and Memory already holds it. It says how many
+    counterparties are currently owed something by this organization, which kind
+    of debt each is, and how bad the worst one has become. Keyed per signal type
+    so "4 people are waiting on a reply" never hides inside an undifferentiated
+    total with "1 decision is owed".
+
+    NOTHING IS RECOMPUTED. Reasoning already decided that a thread is unanswered
+    (`engines/waiting.py` reads `ThreadState.direction` — an observed fact, not
+    an inference) and that a judgment is owed. This aggregates those conclusions
+    with their own confidence, severity and evidence, exactly as the other
+    reality engines do.
+    """
+    out: list[InsightDraft] = []
+    for signal_type in sorted(_OBLIGATION_SIGNAL_TYPES):
+        signals = _by_type(reality, signal_type)
+        if not signals:
+            continue  # nothing owed of this kind => no claim about it
+        n = len(signals)
+        noun = _OBLIGATION_NOUNS[signal_type]
+        out.append(
+            InsightDraft(
+                insight_type=InsightType.OBLIGATION,
+                key=signal_type,
+                title=f"{n} outstanding {noun} {_plural(n, 'obligation')}",
+                summary=(
+                    f"{n} {_plural(n, 'counterparty')} "
+                    f"{'is' if n == 1 else 'are'} currently owed a {noun} by this "
+                    f"organization, peak severity {_peak_severity(signals):.2f}."
+                ),
+                evidence={
+                    "signal_type": signal_type,
+                    "outstanding": n,
+                    "peak_severity": _peak_severity(signals),
+                    "entities": _entities(signals, reality),
+                },
+                sample_size=n,
+                confidence=_composite_confidence(signals),
+                supporting=[],
+                engine_name="intelligence.reality.obligation",
+                engine_version=REALITY_ENGINE_VERSION,
+                supporting_signals=_signal_ids(signals),
+            )
+        )
+    return out
 
 
 # 5. Organizational Status -----------------------------------------------------
@@ -814,13 +1006,319 @@ def trend_intelligence(reality) -> list[InsightDraft]:
     return out
 
 
+# 7. Situation Intelligence ----------------------------------------------------
+
+# WHAT EACH CONCLUSION IS CALLED WHEN IT IS ONE CLAUSE OF A SENTENCE ABOUT A
+# COUNTERPARTY. Closed and keyed by the same literals the sets above use, so a
+# signal type cannot join a situation without a decision about how to say it. A
+# type absent from this map contributes its SIGNAL to the cluster (it is still
+# real pressure on the same counterparty) but never a clause to the headline —
+# the alternative is a sentence containing a raw engine identifier.
+_SITUATION_CLAUSES = {
+    "commitment_slipping":      "an unresolved commitment",
+    "commitment_follow_up":     "a commitment past its stated deadline",
+    "relationship_cooling":     "a cooling relationship",
+    "waiting_on_user_reply":    "an unanswered message",
+    "decision_owed":            "a decision they are waiting on",
+    "customer_engagement_drop": "falling engagement",
+}
+
+# WHICH EDGES A SITUATION MAY TRAVERSE, and the whole reason this engine cannot
+# fabricate a connection.
+#
+# A relationship's own commitments and meetings belong to ONE counterparty, so
+# following them can never merge two of them. `people` (company -> person,
+# channel -> person) is deliberately ABSENT: a company with twenty contacts
+# would otherwise collapse twenty unrelated counterparties into one "situation",
+# which is exactly the false join this engine exists to avoid. `documents`,
+# `projects` and `channels` are absent for the same reason — they are shared
+# workspaces, not counterparty facts.
+_SITUATION_FORWARD_ROLES = frozenset({"commitments", "meetings"})
+
+# Edges that point AT the anchor and name the same counterparty from the other
+# end: a person names its relationship, a commitment names its owner. Reading a
+# persisted directed edge from its target is not an inference — it is the same
+# stored fact, read backwards.
+_SITUATION_REVERSE_ROLES = frozenset({"relationships", "owner"})
+
+# One counterparty's situation names at most this many linked entities. A
+# relationship with fifty recorded meetings is real; enumerating all of them in a
+# JSONB blob is not useful. The COUNTS stay exact — only the enumeration is cut.
+_MAX_SITUATION_ENTITIES = 12
+
+# HOW EACH TRAVERSED EDGE READS IN A SENTENCE. `via_role` keeps State's own key
+# for the trace ("commitments", "relationships_of"); this is the same edge said
+# in words, so `organizational_implication` cannot leak an internal token like
+# "relationships_of" into a string a human reads. Closed, like every other map
+# here: a role with no phrase contributes none.
+_ROLE_PHRASES = {
+    "commitments":      "a commitment they made",
+    "meetings":         "a recorded meeting",
+    "relationships_of": "the person this relationship is with",
+    "owner_of":         "the person who made the commitment",
+    "owner":            "the person who made the commitment",
+}
+
+
+def _situation_label(signals: list, entity_id: str) -> str:
+    """The counterparty's name, from the signals' own evidence.
+
+    `_label` reads only keys the reasoning engines actually write
+    (`person_email`, `speaker_email`, …). The signals in one cluster are about
+    one counterparty by construction, so the first readable label is that
+    counterparty's — and the entity id is the honest fallback when no engine in
+    the cluster recorded a human-readable field.
+
+    Signals arrive already sorted by signal_id, so the choice is deterministic.
+    """
+    for s in signals:
+        label = _label(s)
+        if label and label != s.entity_id and label != s.signal_type:
+            return label
+    return entity_id
+
+
+def _clause_list(phrases: list[str]) -> str:
+    """"a and b" / "a, b and c" — Oxford-free, deterministic, no trailing comma."""
+    if len(phrases) == 1:
+        return phrases[0]
+    return f"{', '.join(phrases[:-1])} and {phrases[-1]}"
+
+
+def situation_intelligence(reality) -> list[InsightDraft]:
+    """ONE COUNTERPARTY, EVERYTHING REASONING CONCLUDED ABOUT THEM, CONNECTED.
+
+    THIS IS THE ENGINE THAT IS NOT A GROUP BY. Every other reality generator
+    buckets signals by TYPE — "2 open commitment slipping risks" — which restates
+    Reasoning at a higher altitude and connects nothing. Live, that is why one
+    slipping commitment and the cooling relationship OF THE SAME PERSON reached
+    the brief as two unrelated cards, while State had recorded
+    `relationship --commitments--> commitment` all along.
+
+    This engine reads that edge. The connection is not inferred, scored, modelled
+    or guessed: `folds.compute_links` computed it from data the extractors
+    recorded (the commitment's `speaker_email` matching the relationship's
+    `person_email`), Context carries it verbatim, and this engine follows it.
+
+    THE ANCHOR IS THE RELATIONSHIP, because a relationship IS a counterparty in
+    State's vocabulary — it is keyed by one person's email and it is the only
+    entity whose links are all about that same person (`_SITUATION_FORWARD_ROLES`).
+    Anchoring anywhere else would either miss the connection (a commitment names
+    only its owner) or invite a false one (a company names every contact at it).
+
+    IT EMITS ONLY WHEN THERE IS GENUINELY A CONNECTION: at least two distinct
+    conclusions, spread across at least two distinct entities. One conclusion
+    about one entity is a ReasoningSignal, and repeating it here as a "situation"
+    would be the same restatement in a new costume. Silence is the correct output
+    for an organization whose pressures do not overlap, and it is the common case.
+
+    NOTHING IS INVENTED. No company, customer, project, role, importance or
+    causality appears unless a persisted edge put it there. The headline is
+    assembled from a closed clause map over signal types the engines emitted; the
+    counts are cardinalities of link lists; the lineage is Context's own
+    citations. `organizational_implication` states what the GRAPH says — that
+    these conclusions share a counterparty — and never why, which no layer here
+    can know.
+
+    Pure and deterministic: sorted inputs, sorted outputs, no clock, no I/O.
+    """
+    context = tuple(getattr(reality, "context", ()) or ())
+    if not context:
+        return []
+
+    by_entity: dict[tuple[str | None, str | None], list] = {}
+    for s in reality.signals:
+        if s.entity_type and s.entity_id:
+            by_entity.setdefault((s.entity_type, s.entity_id), []).append(s)
+    if not by_entity:
+        return []
+
+    rows = {(c.entity_type, c.entity_id): c for c in context}
+    # Reverse index: which context entities point AT this one, and by which role.
+    # Built once for the pass — Context is capped at a few dozen rows.
+    pointing_at: dict[str, list[tuple[str, Any]]] = {}
+    for row in context:
+        for link in row.links or ():
+            if link.role in _SITUATION_REVERSE_ROLES:
+                pointing_at.setdefault(link.entity_id, []).append((link.role, row))
+
+    out: list[InsightDraft] = []
+    anchors = sorted(
+        (c for c in context if c.entity_type == "relationship"),
+        key=lambda c: c.entity_id,
+    )
+    for anchor in anchors:
+        # ── Build the cluster from persisted edges only ──────────────────────
+        # (entity_type, entity_id) -> the role that put it here, for the trace.
+        members: dict[tuple[str, str], str] = {(anchor.entity_type, anchor.entity_id): "anchor"}
+        for link in anchor.links or ():
+            if link.role in _SITUATION_FORWARD_ROLES:
+                members.setdefault((link.entity_type, link.entity_id), link.role)
+        # The person who names this relationship, and the owner of any commitment
+        # in it — the same stored edges, read from their target end.
+        for role, row in pointing_at.get(anchor.entity_id, ()):
+            members.setdefault((row.entity_type, row.entity_id), f"{role}_of")
+        for (member_type, member_id), _role in list(members.items()):
+            if member_type != "commitment":
+                continue
+            member_row = rows.get((member_type, member_id))
+            for link in (member_row.links if member_row else ()) or ():
+                if link.role == "owner":
+                    members.setdefault((link.entity_type, link.entity_id), "owner")
+
+        # ── The conclusions Reasoning reached about that cluster ─────────────
+        cluster_signals = sorted(
+            (s for key in members for s in by_entity.get(key, ())),
+            key=lambda s: s.signal_id,
+        )
+        signal_entities = {(s.entity_type, s.entity_id) for s in cluster_signals}
+        # A situation is a CONNECTION. Two conclusions about one entity is that
+        # entity's own story and every other generator already tells it.
+        if len(cluster_signals) < 2 or len(signal_entities) < 2:
+            continue
+
+        label = _situation_label(cluster_signals, anchor.entity_id)
+        # Clause per DISTINCT signal type, in the order the types were first seen
+        # across id-sorted signals — deterministic, and it reads as one sentence.
+        seen_types: list[str] = []
+        for s in cluster_signals:
+            if s.signal_type not in seen_types:
+                seen_types.append(s.signal_type)
+        clauses = [_SITUATION_CLAUSES[t] for t in seen_types if t in _SITUATION_CLAUSES]
+        if not clauses:
+            # Every conclusion here is a type this engine has no words for. Say
+            # nothing rather than publish a headline containing engine literals.
+            continue
+
+        linked_counts: dict[str, int] = {}
+        for (member_type, _mid), role in members.items():
+            if role != "anchor":
+                linked_counts[member_type] = linked_counts.get(member_type, 0) + 1
+        linked_phrase = _clause_list(
+            [
+                f"{n} {_plural(n, t)}"
+                for t, n in sorted(linked_counts.items())
+            ]
+        ) if linked_counts else ""
+
+        related = [
+            {
+                "entity_type": member_type,
+                "entity_id": member_id,
+                # WHICH persisted edge put this entity in the situation. The
+                # trace answer to "why is this meeting here?".
+                "via_role": role,
+                "has_signal": (member_type, member_id) in signal_entities,
+            }
+            for (member_type, member_id), role in sorted(
+                members.items(), key=lambda kv: (kv[0][0], kv[0][1])
+            )
+            if role != "anchor"
+        ][:_MAX_SITUATION_ENTITIES]
+
+        # Context's own citations for every entity in the cluster — the memory
+        # records these facts were folded from and the business-system events
+        # behind them. Pointers, never bodies: Intelligence may not read Memory,
+        # and `Citation` is explicit that a ScopedView stays pointer-carrying.
+        memory_ids: list[str] = []
+        signal_event_ids: list[str] = []
+        for key in sorted(members):
+            row = rows.get(key)
+            if row is None:
+                continue
+            memory_ids.extend(row.memory_ids or ())
+            signal_event_ids.extend(row.signal_event_ids or ())
+
+        out.append(
+            InsightDraft(
+                insight_type=InsightType.SITUATION,
+                # Keyed on the counterparty, so the same situation keeps one
+                # identity across snapshots and the id changes only with the
+                # version key (watermark + reasoning version).
+                key=f"relationship:{anchor.entity_id}",
+                title=f"{label} has {_clause_list(clauses)}",
+                summary=(
+                    f"Reasoning reached {len(cluster_signals)} separate conclusions "
+                    f"about this counterparty at this snapshot"
+                    + (f"; State links {linked_phrase} to them" if linked_phrase else "")
+                    + "."
+                ),
+                evidence={
+                    # ── The grounded representation (see the module docstring on
+                    # the ML boundary). Every field below is a persisted fact or a
+                    # cardinality of one; nothing is generated prose.
+                    "situation_type": "+".join(sorted(seen_types)),
+                    "primary_entity": {
+                        "entity_type": anchor.entity_type,
+                        "entity_id": anchor.entity_id,
+                        "label": label,
+                        "context_rank": anchor.rank,
+                        "context_reason": anchor.reason,
+                    },
+                    "related_entities": related,
+                    "signals": [
+                        {
+                            "signal_id": s.signal_id,
+                            "signal_type": s.signal_type,
+                            "entity_type": s.entity_type,
+                            "entity_id": s.entity_id,
+                            "severity": round(s.severity, 4),
+                            "confidence": round(s.confidence, 4),
+                        }
+                        for s in cluster_signals
+                    ],
+                    # Same shape every other reality insight publishes, so a
+                    # consumer that already reads `entities` keeps working.
+                    "entities": _entities(cluster_signals, reality),
+                    "linked_entity_counts": linked_counts,
+                    "peak_severity": _peak_severity(cluster_signals),
+                    # WHAT THE GRAPH SAYS — structural, never causal. It states
+                    # that these conclusions share a counterparty, which is what
+                    # was persisted; it does not claim one caused the other.
+                    "organizational_implication": (
+                        f"{len(cluster_signals)} conclusions that Reasoning reached "
+                        f"independently are about one counterparty. State connects them "
+                        f"through "
+                        + (
+                            _clause_list(
+                                sorted({
+                                    _ROLE_PHRASES[r["via_role"]]
+                                    for r in related
+                                    if r["via_role"] in _ROLE_PHRASES
+                                })
+                            )
+                            or "no recorded link"
+                        )
+                        + "."
+                    ),
+                    "memory_ids": sorted(set(memory_ids))[:_MAX_SITUATION_ENTITIES],
+                    "signal_event_ids": sorted(set(signal_event_ids))[:_MAX_SITUATION_ENTITIES],
+                },
+                sample_size=len(cluster_signals),
+                confidence=_composite_confidence(cluster_signals),
+                supporting=[],
+                engine_name="intelligence.reality.situation",
+                engine_version=REALITY_ENGINE_VERSION,
+                # BOTH signals. This is what makes the situation reach BOTH
+                # decisions: `what_matters_today._relevant_facts` matches an
+                # insight to a decision when the insight names that decision's
+                # signal, so naming both is what lets one organizational sentence
+                # corroborate the commitment card and the relationship card alike.
+                supporting_signals=_signal_ids(cluster_signals),
+            )
+        )
+    return out
+
+
 _REALITY_GENERATORS = (
     risk_intelligence,
     opportunity_intelligence,
     relationship_intelligence,
     commitment_intelligence,
+    obligation_intelligence,
     status_intelligence,
     trend_intelligence,
+    situation_intelligence,
 )
 
 # DELIBERATELY ABSENT, and each for a reason rather than an oversight:

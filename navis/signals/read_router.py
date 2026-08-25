@@ -26,16 +26,24 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypeAlias
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import DateTime, cast, func, select
+from sqlalchemy import DateTime, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.dependencies import CurrentContext, get_current_context
 from navis.identity.models import Integration, IntegrationProvider
+# THE identity function, not a copy of it. A meeting's entity id must be the
+# same uuid5 Memory minted and `/context` publishes, or the two feeds describing
+# one meeting cannot be joined — re-deriving the formula here would be a second
+# identity space that agrees only by luck. `memory.ids` imports nothing but
+# `uuid`, so this costs the signals layer no dependency; `signals/router.py`
+# already reaches into `navis.memory` for the same kind of reason.
+from navis.memory.envelope import EntityType
+from navis.memory.ids import entity_id as entity_id_for
 from navis.organization.contract import Capability
 from navis.organization.guards import require_capability
 from navis.platform.database import get_session
@@ -276,17 +284,115 @@ def _shape_gmail(rec: _SignalRow) -> dict[str, Any]:
     return _shape_gmail_from_decrypted(rec, _decrypt_content(rec.payload or {}))
 
 
-def _shape_calendar(rec: _SignalRow) -> dict[str, Any]:
+# ── The provider-neutral envelope ───────────────────────────────────────────
+#
+# Every item a surface consumes should describe WHAT KIND OF THING it is and
+# WHICH SYSTEM produced it, as two separate facts. `source_type` is the
+# organizational concept ("calendar", and later "message", "issue", "document");
+# `provider` is the system that observed it ("google_calendar", and later
+# "outlook_calendar", "slack", "jira"). A consumer branches on the CONCEPT and
+# never on the provider — which is what stops a future Jira or Slack feed from
+# needing its own renderer, and stops today's calendar card from being a Google
+# card wearing a generic name.
+#
+# The distinction is not cosmetic here: `SignalSource.CALENDAR` is already the
+# concept and `IntegrationProvider.GOOGLE_CALENDAR` is already the system, so
+# both values are read from the vocabularies the pipeline already keeps rather
+# than introduced by this module.
+_CALENDAR_SOURCE_TYPE = SignalSource.CALENDAR.value
+_CALENDAR_PROVIDER = IntegrationProvider.GOOGLE_CALENDAR.value
+
+
+def _timed(slot: Any) -> str | None:
+    """The ISO-8601 instant a Google start/end slot names, or None if all-day.
+
+    Google expresses a timed event as `{"dateTime": "...", "timeZone": "..."}`
+    and an all-day event as `{"date": "YYYY-MM-DD"}`. None here means ALL-DAY,
+    not missing — `all_day` in the shaped item is what says which, so a consumer
+    never has to infer it from a null.
+
+    Deliberately identical to `memory.extractors.calendar.MeetingExtractor`,
+    which reads `(start or {}).get("dateTime")` into `starts_at`. That is the
+    point: the same meeting must not have one set of field names in Memory and
+    another on the signals read path.
+    """
+    if not isinstance(slot, dict):
+        return None
+    value = slot.get("dateTime")
+    return value if isinstance(value, str) else None
+
+
+def _is_all_day(slot: Any) -> bool:
+    return isinstance(slot, dict) and not slot.get("dateTime") and bool(slot.get("date"))
+
+
+def _shape_calendar(rec: _SignalRow, *, org_id: uuid.UUID) -> dict[str, Any]:
+    """One upcoming meeting, in the names the rest of the pipeline already uses.
+
+    WHY THE CANONICAL NAMES ARE HERE. This endpoint used to publish Google's own
+    shape — `summary`, and `start`/`end` as raw `{dateTime|date, timeZone}`
+    objects — while Memory, State and every reasoning engine call the same three
+    things `title`, `starts_at` and `ends_at`. One meeting therefore had two
+    representations inside one backend, and the consumer was the one made to
+    reconcile them: a client reading this feed had to know Google's slot format
+    AND guess which of `start`, `start_time`, `starts_at` or `scheduled_at` a
+    given surface meant. The canonical names now come from the backend, once.
+
+    STRICTLY ADDITIVE. `summary`, `start`, `end` and `hangout_link` are still
+    published unchanged — an all-day event's date lives in `start.date`, which
+    the canonical fields deliberately do not flatten into a timestamp — so no
+    existing consumer changes. New consumers read the canonical names.
+
+    `entity_id` IS THE JOIN, and it is the field whose absence made "no meeting
+    context available yet" unanswerable. Memory keys a meeting entity as
+    uuid5(org, "meeting", <calendar event id>) — `memory.ids.entity_id`, the one
+    identity function in the system — and `GET /context` publishes exactly that
+    id for every MEETING entity State holds, with its commitments, decisions and
+    citations. Without it here, the two feeds described the same meeting and
+    could not be joined, so a client had no way to distinguish "Navis knows
+    nothing about this meeting" from "Navis knows something and this feed cannot
+    reach it". It is COMPUTED, not stored: a pure function of (org, event id),
+    so it is correct even for a meeting Memory has not extracted yet — in which
+    case `/context` simply holds no such entity, which is the honest absence.
+
+    NO DEEP LINK IS INVENTED. Google's `htmlLink` is not captured by the
+    connector, so this feed cannot produce one; `meeting_url` is the conference
+    link and is null when the meeting has none. A surface that wants "open in
+    the provider" needs the connector to capture it first.
+    """
     p = rec.payload or {}
     organizer = p.get("organizer") or {}
     conference = p.get("conference_data") or {}
+    start, end = p.get("start"), p.get("end")
     return {
         "event_id":       str(rec.id),
         "external_id":    rec.external_id,
+        # ── provider-neutral envelope (see above) ──────────────────────────
+        "source_type":    _CALENDAR_SOURCE_TYPE,
+        "provider":       _CALENDAR_PROVIDER,
+        "event_type":     rec.event_type,
+        # The organizational entity this signal is about, in Memory's id space.
+        "entity_type":    EntityType.MEETING.value,
+        "entity_id":      str(entity_id_for(org_id, EntityType.MEETING.value, rec.external_id)),
+        # ── canonical meeting fields (same names as Memory/State) ──────────
+        "title":          p.get("summary"),
+        "starts_at":      _timed(start),
+        "ends_at":        _timed(end),
+        # True when the event is a whole-day block, which is why `starts_at` /
+        # `ends_at` are null. Without this a consumer cannot tell an all-day
+        # meeting from one whose times were never captured.
+        "all_day":        _is_all_day(start),
+        "meeting_url":    p.get("hangout_link"),
+        # WHEN THE THING HAPPENS vs WHEN WE SAW IT. `occurred_at` for a calendar
+        # signal is the meeting's start (see `_latest_per_external_id_stmt`);
+        # `observed_at` is when this version was ingested. A surface that treats
+        # ingestion time as event time reorders the day.
+        "observed_at":    rec.created_at.isoformat() if rec.created_at else None,
+        # ── unchanged, provider-shaped, still published ────────────────────
         "summary":        p.get("summary"),
         "status":         p.get("status"),
-        "start":          p.get("start"),
-        "end":            p.get("end"),
+        "start":          start,
+        "end":            end,
         "attendees_count": p.get("attendee_count") or 0,
         # ADDITIVE: the emails behind the count. A meeting card that can only say
         # "2 attendees" cannot name who is in the room, which is the one thing the
@@ -351,6 +457,85 @@ def _latest_per_external_id_stmt(*, org_id: uuid.UUID, source: SignalSource):
     ).subquery()
 
 
+async def search_emails(
+    db: AsyncSession,
+    *,
+    org_id: uuid.UUID,
+    senders: Sequence[str] = (),
+    text_match: str | None = None,
+    limit: int = _DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    """THE org's captured mail, newest first, optionally narrowed. ONE reader.
+
+    Extracted from `gmail_recent` so the HTTP route and Ask Navis answer "find
+    the email from X" out of the SAME implementation. The route below is now a
+    thin adapter over this; nothing about its response changed.
+
+    WHY THE FILTERS ARE SQL PREDICATES AND WHAT THEY CAN SEE. Only `body_text`
+    and `snippet` are sealed at capture (`_content_fields`); `sender_email`,
+    `sender_name` and `subject` are stored as plaintext JSONB because identity
+    resolution and the importance scorer both read them. So sender and subject
+    narrow in the database, over the whole corpus, with no decryption — while
+    BODY TEXT IS DELIBERATELY NOT SEARCHED. Matching it would mean decrypting
+    every candidate row in Python to filter, which turns a bounded query into a
+    full scan of sealed content; a caller that needs body relevance should use
+    Memory retrieval, which is what the embeddings exist for.
+
+    `senders` are matched case-insensitively against BOTH the address and the
+    display name, OR-ed together — the caller passes every alias the identity
+    graph resolved for one person, so a person who mails from two addresses is
+    still one person here. Empty means "no sender filter", never "match nobody".
+
+    Org-scoped in the statement, like every other read in this module.
+    """
+    connected = await _is_connected(db, org_id=org_id, provider=IntegrationProvider.GMAIL)
+    stmt = select(SignalEventRecord).where(
+        SignalEventRecord.organization_id == org_id,
+        SignalEventRecord.source == SignalSource.GMAIL.value,
+        SignalEventRecord.event_type == SignalEventType.EMAIL_RECEIVED.value,
+    )
+    if senders:
+        stmt = stmt.where(
+            or_(
+                *[
+                    cond
+                    for s in senders
+                    if s
+                    for cond in (
+                        SignalEventRecord.payload["sender_email"].astext.ilike(
+                            f"%{_like_escape(s)}%", escape="\\"
+                        ),
+                        SignalEventRecord.payload["sender_name"].astext.ilike(
+                            f"%{_like_escape(s)}%", escape="\\"
+                        ),
+                    )
+                ]
+            )
+        )
+    if text_match:
+        stmt = stmt.where(
+            SignalEventRecord.payload["subject"].astext.ilike(
+                f"%{_like_escape(text_match)}%", escape="\\"
+            )
+        )
+    rows = (
+        await db.scalars(
+            stmt.order_by(SignalEventRecord.occurred_at.desc()).limit(limit)
+        )
+    ).all()
+    items = [_shape_gmail(r) for r in rows]
+    return {"source": "gmail", "connected": connected, "count": len(items), "items": items}
+
+
+def _like_escape(value: str) -> str:
+    """Neutralise LIKE metacharacters so a user's `%` cannot become a wildcard.
+
+    Same escaping `identity_resolution.search` already applies for the same
+    reason; `\\` is Postgres's default LIKE escape and is declared explicitly.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @router.get(
     "/gmail/recent",
     dependencies=[Depends(require_capability(Capability.GMAIL))],
@@ -366,22 +551,11 @@ async def gmail_recent(
     ("1" — an email is an immutable fact) so external_id is already unique
     per (org, integration); no DISTINCT ON needed. Bodies/snippets are
     encrypted at rest and decrypted on the way out for the caller.
+
+    An HTTP adapter over `search_emails` — the tenant comes from the
+    authenticated context and the unfiltered call is the original behaviour.
     """
-    connected = await _is_connected(db, org_id=ctx.org_id, provider=IntegrationProvider.GMAIL)
-    rows = (
-        await db.scalars(
-            select(SignalEventRecord)
-            .where(
-                SignalEventRecord.organization_id == ctx.org_id,
-                SignalEventRecord.source == SignalSource.GMAIL.value,
-                SignalEventRecord.event_type == SignalEventType.EMAIL_RECEIVED.value,
-            )
-            .order_by(SignalEventRecord.occurred_at.desc())
-            .limit(limit)
-        )
-    ).all()
-    items = [_shape_gmail(r) for r in rows]
-    return {"source": "gmail", "connected": connected, "count": len(items), "items": items}
+    return await search_emails(db, org_id=ctx.org_id, limit=limit)
 
 
 @router.get(
@@ -499,8 +673,21 @@ async def calendar_upcoming(
         .limit(limit)
     )
     result = await db.execute(stmt)
-    items = [_shape_calendar(_RowShim(row)) for row in result.mappings().all()]
-    return {"source": "calendar", "connected": connected, "count": len(items), "items": items}
+    items = [
+        _shape_calendar(_RowShim(row), org_id=ctx.org_id)
+        for row in result.mappings().all()
+    ]
+    return {
+        "source": "calendar",
+        # The same two facts every item carries, hoisted so a consumer can route
+        # the whole feed without inspecting a row — and so an EMPTY feed still
+        # says what kind of thing it would have held.
+        "source_type": _CALENDAR_SOURCE_TYPE,
+        "provider": _CALENDAR_PROVIDER,
+        "connected": connected,
+        "count": len(items),
+        "items": items,
+    }
 
 
 @router.get(

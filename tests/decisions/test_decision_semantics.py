@@ -936,3 +936,107 @@ def test_existing_serialized_fields_are_unchanged():
         "supporting_insight_ids",
     ):
         assert key in body, key
+
+
+# ── Decision ↔ reasoning-observation agreement (P0-3) ────────────────────────
+#
+# A decision publishes the values the engines produced during its pass; its
+# `reasoning_signal_ids` pointer resolves to a stored conclusion. Those were one
+# row, and the row kept only its FIRST detection — so live decision 4373a0b3
+# reports 11.85 days / confidence 0.8951 against a cited signal recording 7.16 /
+# 0.7386. Nothing compared them, so nothing noticed.
+#
+# `check_decision_provenance` is that comparison. Pure, duck-typed, and it FAILS
+# CLOSED: an observation it cannot resolve is reported, never substituted.
+
+
+class _Obs:
+    """The five fields the check reads off a `ReasoningSignalObservation`."""
+
+    def __init__(self, *, watermark="wm-1", confidence=0.8951, severity=0.7951,
+                 why="Open for 12 days with no newer fact in Memory.", evidence=None):
+        self.state_watermark = watermark
+        self.confidence = confidence
+        self.severity = severity
+        self.why = why
+        self.evidence = {"age_days": 11.85} if evidence is None else evidence
+
+
+def _decision_dict(**overrides):
+    body = {
+        "decision_id": "d-1",
+        "reasoning_signal_ids": ["s-1"],
+        "state_watermark": "wm-1",
+        "confidence": 0.8951,
+        "severity": 0.7951,
+        "why": "Open for 12 days with no newer fact in Memory.",
+        "evidence": {"age_days": 11.85},
+    }
+    body.update(overrides)
+    return body
+
+
+def test_a_decision_matching_its_observation_verifies():
+    from navis.decisions.base import check_decision_provenance
+
+    got = check_decision_provenance(_decision_dict(), _Obs())
+    assert got.verified is True
+    assert got.reason == ""
+    assert got.signal_id == "s-1" and got.state_watermark == "wm-1"
+
+
+def test_an_unresolvable_observation_is_reported_not_substituted():
+    from navis.decisions.base import check_decision_provenance
+
+    got = check_decision_provenance(_decision_dict(), None)
+    assert got.verified is False
+    assert "no reasoning observation recorded" in got.reason
+    # Still names what could not be verified, so the gap is actionable.
+    assert got.signal_id == "s-1" and got.state_watermark == "wm-1"
+
+
+def test_a_decision_citing_no_signal_cannot_be_verified():
+    from navis.decisions.base import check_decision_provenance
+
+    got = check_decision_provenance(_decision_dict(reasoning_signal_ids=[]), _Obs())
+    assert got.verified is False
+    assert "cites no reasoning signal" in got.reason
+
+
+def test_an_observation_from_another_snapshot_never_passes_as_this_one():
+    """THE production shape: the cited conclusion was recorded at an EARLIER fold."""
+    from navis.decisions.base import check_decision_provenance
+
+    got = check_decision_provenance(
+        _decision_dict(), _Obs(watermark="an-older-watermark")
+    )
+    assert got.verified is False
+    assert "an-older-watermark" in got.reason and "wm-1" in got.reason
+
+
+@pytest.mark.parametrize(
+    "field, observation_value",
+    [
+        ("confidence", 0.7386),                     # the live contradiction
+        ("severity", 0.6386),
+        ("why", "Open for 7 days with no newer fact in Memory."),
+        ("evidence", {"age_days": 7.16}),
+    ],
+)
+def test_every_published_value_must_be_reproducible(field, observation_value):
+    from navis.decisions.base import check_decision_provenance
+
+    got = check_decision_provenance(_decision_dict(), _Obs(**{field: observation_value}))
+    assert got.verified is False
+    assert got.reason.startswith(f"{field} disagrees")
+
+
+def test_confidence_is_compared_at_the_precision_the_decision_publishes():
+    """`Decision.to_dict` rounds to 4dp. Comparing against the observation's raw
+    float would report a rounding artefact as a broken lineage."""
+    from navis.decisions.base import check_decision_provenance
+
+    got = check_decision_provenance(
+        _decision_dict(), _Obs(confidence=0.89510000001, severity=0.79509999998)
+    )
+    assert got.verified is True

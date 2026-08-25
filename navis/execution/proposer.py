@@ -173,24 +173,116 @@ def _map(decision: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     return None, {}
 
 
-def decision_obligation_key(decision: dict[str, Any]) -> str | None:
-    """The stable obligation a brief decision represents, or None if it has none.
+@dataclass(frozen=True, slots=True)
+class DecisionAction:
+    """WHAT, if anything, can be executed about one brief decision.
+
+    `action_type` is an `ActionType` value and `obligation_key` is the stable
+    identity of the thing it would act on — both exactly as the proposer would
+    write them, because they come from the same `_map`. `requires_draft` says
+    the candidate is a placeholder that cannot be sent as authored.
+
+    The remaining fields are READ OFF THE REGISTERED `ActionSpec`, never decided
+    here. `execution.actions` is the single declaration of what an action is —
+    which provider performs it, which entitlement it consumes, how much damage it
+    can do, whether a human must approve, and whether performing it refreshes
+    Navis's own read model. Every one of those was already required to execute
+    the action and none of it was reachable from the decision that proposes it,
+    so a surface could name an action and still not say who would perform it or
+    whether pressing the button sends something that cannot be unsent.
+
+    Copied rather than re-derived: `require_spec` fails closed on an unknown
+    action type, so an action can never be described here under a policy the
+    worker would not apply.
+    """
+
+    action_type: str
+    obligation_key: str
+    requires_draft: bool
+    # `Provider.name` — WHO would perform it. Provider-neutral by construction:
+    # a future Jira action registers its own spec and answers this identically,
+    # with no branch anywhere in Decision or Today.
+    provider: str
+    # The connector entitlement it consumes, checked IN ADDITION to the blanket
+    # EXECUTION capability. A surface can tell "not entitled" from "not possible".
+    capability: str
+    # `ActionRisk` — "moves an object" vs "delivers a message that cannot be
+    # unsent". The one thing a person needs before pressing approve.
+    risk: str
+    # True while `ApprovalPolicy.REQUIRED`. DECLARATIVE: the hard boundary is the
+    # status machine (REQUESTED -> APPROVED is the single edge into APPROVED and
+    # is reachable only from the approve endpoint), so this reports the policy
+    # and never grants an exemption from it.
+    requires_approval: bool
+    # Whether performing this action pulls its own result back into
+    # `signal_events` — the Execution -> Observation -> State edge, closed today
+    # for the calendar verbs by `_calendar_reconcile` and not for the mail ones,
+    # where the reply re-enters through the next Gmail sync instead. Published
+    # because "when will Today stop showing this?" has two different answers.
+    updates_read_model: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_type": self.action_type,
+            "obligation_key": self.obligation_key,
+            "requires_draft": self.requires_draft,
+            "provider": self.provider,
+            "capability": self.capability,
+            "risk": self.risk,
+            "requires_approval": self.requires_approval,
+            "updates_read_model": self.updates_read_model,
+        }
+
+
+def decision_action(decision: dict[str, Any]) -> DecisionAction | None:
+    """The action a brief decision would produce, or None if it produces none.
 
     THE point of this function is that it runs the decision through the SAME
-    `_map` the proposer uses, so "which obligation is this decision about?" has
+    `_map` the proposer uses, so "what can be done about this decision?" has
     exactly one answer in the codebase. The brief-enrichment read path and the
-    execution write path cannot drift into disagreeing about identity — if they
-    did, the dashboard would report "no reply sent" for an obligation that had
-    been sent, or vice versa.
+    execution write path cannot drift into disagreeing — if they did, a card
+    would offer to send a reply the proposer refuses to create, or report "no
+    reply sent" for an obligation that had been sent.
 
-    Returns None for every decision that is a finding to read rather than a
-    reply to send (risk / priority / opportunity / delegation), and for a
-    draftable decision that cannot name what it is about.
+    None is the ORDINARY answer, and it is a real one: `risk`, `opportunity`
+    and `delegation` decisions are findings to read, not replies to send, and a
+    draftable decision whose thread carries no `rfc_message_id` has no stable
+    obligation identity (see `propose_from_decisions`). Both cases must reach a
+    surface as "there is nothing to execute here" rather than as an Execute
+    button that would fail or duplicate.
     """
     action_type, payload = _map(decision)
     if action_type is None:
         return None
-    return reply_obligation_key(action_type, payload)
+    key = reply_obligation_key(action_type, payload)
+    if key is None:
+        return None
+    # Lazy: `execution.actions` imports the provider registry, which imports this
+    # module's siblings. Local, like every other cross-module import here.
+    from navis.execution.actions import ApprovalPolicy, require_spec
+
+    spec = require_spec(action_type)
+    return DecisionAction(
+        action_type=action_type,
+        obligation_key=key,
+        requires_draft=bool(payload.get("requires_draft")),
+        provider=spec.provider,
+        capability=spec.capability.value,
+        risk=spec.risk.value,
+        requires_approval=spec.approval is ApprovalPolicy.REQUIRED,
+        updates_read_model=spec.reconciler is not None,
+    )
+
+
+def decision_obligation_key(decision: dict[str, Any]) -> str | None:
+    """The stable obligation a brief decision represents, or None if it has none.
+
+    A projection of `decision_action` — one derivation, so the enrichment read
+    path and the execution write path cannot drift into disagreeing about
+    identity.
+    """
+    action = decision_action(decision)
+    return action.obligation_key if action else None
 
 
 def propose_from_decisions(decisions: list[dict], org_id: uuid.UUID) -> list[ProposedAction]:

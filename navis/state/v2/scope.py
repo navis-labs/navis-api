@@ -53,12 +53,66 @@ Intent = Union[MorningBrief]
 # ── Output shape ────────────────────────────────────────────────────────────
 
 
+# WHICH ENTITY TYPE EACH LINK ROLE POINTS AT.
+#
+# State stores links as ``{role: [entity_id, ...]}`` and the entity ids alone do
+# not say what they address — so a consumer holding ``{"owner": ["455812d6"]}``
+# cannot resolve it without knowing that an owner is a person. That knowledge
+# exists in exactly one place, `folds.compute_links`, and this is its read-side
+# transcription: every ``_link(...)`` call there appears here and nothing else
+# does.
+#
+# CLOSED, and deliberately so. A role this map does not name is DROPPED rather
+# than guessed — see `_links`. Inventing a type for an unrecognised role is the
+# one way this module could manufacture a relationship, which is precisely what
+# it must never do. Adding a link in `compute_links` means adding it here; the
+# pinning test (`tests/state/test_scope_projection.py`) fails otherwise.
+_LINK_TARGET_TYPE: dict[str, str] = {
+    "relationships": EntityType.RELATIONSHIP.value,  # person   -> relationship
+    "commitments":   EntityType.COMMITMENT.value,    # relationship -> commitment
+    "meetings":      EntityType.MEETING.value,       # relationship -> meeting
+    "owner":         EntityType.PERSON.value,        # commitment -> person
+    "owners":        EntityType.PERSON.value,        # document -> person
+    "people":        EntityType.PERSON.value,        # company/channel -> person
+    "channels":      EntityType.CHANNEL.value,       # person -> channel
+    "documents":     EntityType.DOCUMENT.value,      # person/project -> document
+    "projects":      EntityType.PROJECT.value,       # document -> project
+}
+
+
+@dataclass(frozen=True, slots=True)
+class EntityLink:
+    """One persisted edge from an entity in scope to another entity.
+
+    THE THING CONTEXT USED TO DROP. State computes a real entity graph in
+    `folds.compute_links` — a commitment names its owner, a relationship names
+    its commitments and meetings — and `EntityRef` carried `fields` but not
+    `links`, so every consumer downstream of Context received a ranked FLAT LIST
+    and had to treat each entity as unrelated to every other. Live, that is why
+    one slipping commitment and the cooling relationship of the very same person
+    reached the brief as two independent cards.
+
+    ``role`` is State's own link key, verbatim ("owner", "commitments",
+    "meetings"). ``entity_type`` is resolved from `_LINK_TARGET_TYPE`, never
+    inferred from the id.
+
+    DETERMINISTIC AND PERSISTED. Nothing here is derived, scored, or guessed:
+    the edge either exists in `state.links` or it does not appear.
+    """
+    role: str
+    entity_type: str
+    entity_id: str
+
+
 @dataclass(frozen=True, slots=True)
 class EntityRef:
     """One entity in scope, with its rank and why it made the cut.
 
     ``fields`` is the entity's current-state field dict (from State V2's raw
     fold — same shape typed views expose). Consumers pick what they need.
+
+    ``links`` is the entity's persisted edges (see `EntityLink`). Empty for an
+    entity State recorded none for, which is honest absence rather than a gap.
     """
     entity_type: str
     entity_id: str
@@ -67,6 +121,9 @@ class EntityRef:
     fields: dict[str, Any]
     first_seen: str | None
     last_seen: str | None
+    # Defaulted so every existing construction site — tests and fakes included —
+    # stays valid and keeps producing the view it did before.
+    links: tuple[EntityLink, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +173,19 @@ class ScopedView:
                     "fields": e.fields,
                     "first_seen": e.first_seen,
                     "last_seen": e.last_seen,
+                    # ADDITIVE. Every key above is untouched and in the same
+                    # place; a consumer that does not read `links` sees exactly
+                    # the view it saw before. Always present (an empty list when
+                    # State recorded no edge) so a client can tell "this entity
+                    # has no links" from "this build does not report them".
+                    "links": [
+                        {
+                            "role": link.role,
+                            "entity_type": link.entity_type,
+                            "entity_id": link.entity_id,
+                        }
+                        for link in e.links
+                    ],
                 }
                 for e in self.entities
             ],
@@ -177,6 +247,31 @@ def _cite(view: _BaseView) -> Citation:
     )
 
 
+def _links(view: _BaseView) -> tuple[EntityLink, ...]:
+    """The entity's persisted edges, typed and deterministically ordered.
+
+    Reads `state.links` — computed by `folds.compute_links` from joins on data
+    the extractors recorded (an email address, a meeting attendee list, a folder
+    id) — and attaches the target entity type from `_LINK_TARGET_TYPE`.
+
+    FAILS CLOSED IN BOTH DIRECTIONS. A role the map does not name is skipped, and
+    so is a falsy id: an unrecognised edge contributes nothing rather than an
+    entity reference whose type is a guess. Sorted by (role, entity_id) so one
+    snapshot always flattens identically, whatever order the fold produced.
+    """
+    out: list[EntityLink] = []
+    for role, ids in (view.links or {}).items():
+        target = _LINK_TARGET_TYPE.get(role)
+        if target is None:
+            continue
+        for entity_id in ids or ():
+            if entity_id:
+                out.append(
+                    EntityLink(role=role, entity_type=target, entity_id=str(entity_id))
+                )
+    return tuple(sorted(out, key=lambda link: (link.role, link.entity_id)))
+
+
 def _ref(entity_type: str, view: _BaseView, rank: int, reason: str) -> EntityRef:
     return EntityRef(
         entity_type=entity_type,
@@ -186,6 +281,7 @@ def _ref(entity_type: str, view: _BaseView, rank: int, reason: str) -> EntityRef
         fields=dict(view.fields or {}),
         first_seen=view.first_seen,
         last_seen=view.last_seen,
+        links=_links(view),
     )
 
 

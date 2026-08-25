@@ -729,3 +729,236 @@ def test_ml_reads_learning_through_the_contract_not_its_tables():
     assert "from navis.learning.metrics import" in builder, (
         "ML stopped consuming Learning through its contract"
     )
+
+
+# ── ContextBuilder reads Intelligence (TASK 7.5) ───────────────────────────
+#
+# `_CONCLUSION_KINDS` has reserved a band for "intelligence" since it was
+# written, but nothing ever produced a fact for it: Ask was asking the LLM to
+# re-derive, from raw memory, conclusions the organization had already reached
+# and persisted in `intelligence_insights`. These pin the wiring — without them a
+# refactor can drop the call and every other test still passes.
+
+
+async def test_context_builder_reads_intelligence_and_leads_with_it(monkeypatch):
+    """Persisted insights reach the model, AHEAD of the evidence behind them."""
+    import uuid as _uuid
+
+    from navis.ml.rag import context_builder as CB
+    from navis.ml.rag.grounding import Grounding
+
+    org = _uuid.UUID("11111111-1111-1111-1111-111111111111")
+    seen: list = []
+
+    class _Retriever:
+        def __init__(self, db):
+            pass
+
+        async def search(self, org_id, query, **kw):
+            return []
+
+    async def _no_learning(db, org_id):
+        return []
+
+    async def _insights(db, org_id):
+        seen.append(org_id)
+        return [
+            Grounding(
+                kind=CB.INTELLIGENCE_KIND,
+                source="insight:i-1",
+                text="Investor threads stall after Thursday.",
+                lineage=("reasoning_signal:rs-1",),
+            )
+        ]
+
+    monkeypatch.setattr(CB, "MemoryRetriever", _Retriever)
+    monkeypatch.setattr(CB, "learning_groundings", _no_learning)
+    monkeypatch.setattr(CB, "intelligence_groundings", _insights)
+
+    ctx = await CB.ContextBuilder(object()).build(
+        org,
+        "why do investor threads stall?",
+        extra=[Grounding(kind="memory", source="mem-1", text="A thread.")],
+    )
+
+    # Asked for the caller's org, and nothing else.
+    assert seen == [org]
+    kinds = [f.kind for f in ctx.facts]
+    assert kinds[0] == "intelligence", "a conclusion must precede its evidence"
+    assert "memory" in kinds
+    # Lineage survives assembly.
+    insight = next(f for f in ctx.facts if f.kind == "intelligence")
+    assert insight.lineage == ("reasoning_signal:rs-1",)
+
+
+async def test_intelligence_outage_never_fails_the_turn(monkeypatch):
+    """Intelligence is enrichment. Losing it costs the answer its conclusions,
+    never the answer — the same contract Learning already keeps."""
+    import uuid as _uuid
+
+    from navis.ml.rag import context_builder as CB
+    from navis.ml.rag.grounding import Grounding
+
+    class _Retriever:
+        def __init__(self, db):
+            pass
+
+        async def search(self, org_id, query, **kw):
+            return []
+
+    async def _no_learning(db, org_id):
+        return []
+
+    async def _broken(db, org_id):
+        raise RuntimeError("intelligence repository down")
+
+    monkeypatch.setattr(CB, "MemoryRetriever", _Retriever)
+    monkeypatch.setattr(CB, "learning_groundings", _no_learning)
+    monkeypatch.setattr(CB, "intelligence_groundings", _broken)
+
+    ctx = await CB.ContextBuilder(object()).build(
+        _uuid.uuid4(),
+        "anything",
+        extra=[Grounding(kind="memory", source="mem-1", text="A thread.")],
+    )
+
+    assert [f.kind for f in ctx.facts] == ["memory"]
+
+
+async def test_retrieval_query_is_what_gets_embedded_not_the_question(monkeypatch):
+    """The model is shown the founder's words; retrieval searches for the
+    resolved person. Memory holds a person's ADDRESS far more often than their
+    display name, so the two must be allowed to differ."""
+    import uuid as _uuid
+
+    from navis.ml.rag import context_builder as CB
+
+    embedded: list = []
+
+    class _Retriever:
+        def __init__(self, db):
+            pass
+
+        async def search(self, org_id, query, **kw):
+            embedded.append(query)
+            return []
+
+    async def _none(db, org_id):
+        return []
+
+    monkeypatch.setattr(CB, "MemoryRetriever", _Retriever)
+    monkeypatch.setattr(CB, "learning_groundings", _none)
+    monkeypatch.setattr(CB, "intelligence_groundings", _none)
+
+    ctx = await CB.ContextBuilder(object()).build(
+        _uuid.uuid4(),
+        "Why does Abhishek matter?",
+        retrieval_query="Why does Abhishek matter? abhishek@acme.com",
+    )
+
+    assert embedded == ["Why does Abhishek matter? abhishek@acme.com"]
+    assert ctx.question == "Why does Abhishek matter?"
+
+
+# ── Subject-aware composition + the one expansion hop (TASK 7.5.1) ─────────
+#
+# MEASURED ON THE LIVE ORG: all eight entity-centric probe questions produced a
+# byte-identical 53-fact bundle at ~1450/1500 tokens whose first SEVEN facts were
+# org-wide insights naming nobody. Only 9-11 of 53 facts mentioned the person
+# asked about. The bundle was, in effect, question-independent.
+
+
+def test_subject_facts_lead_and_off_subject_conclusions_are_capped():
+    """On an entity question, facts naming the subject precede org-wide ones and
+    the generic conclusions cannot own the opening."""
+    from navis.ml.rag.context_builder import _compose
+    from navis.ml.rag.grounding import Grounding
+
+    def g(kind, text):
+        return Grounding(kind=kind, source=f"{kind}:{text[:6]}", text=text)
+
+    cands = [
+        g("intelligence", "3 hub companies connect multiple people"),
+        g("intelligence", "Tracking 113 organizational entities"),
+        g("intelligence", "1 warm relationship this window"),
+        g("intelligence", "2 open commitments at risk"),
+        g("intelligence", "Priya is the counterparty on the stalled deal"),
+        g("memory", "Person Priya, sender"),
+        g("memory", "Unrelated invoice thread"),
+        g("state", "relationship: Priya — open"),
+        g("state", "company: Acme — active"),
+    ]
+    out = _compose(cands, "why does priya matter?", ("priya",))
+    texts = [f.text for f in out]
+
+    # The conclusion ABOUT the subject leads.
+    assert texts[0] == "Priya is the counterparty on the stalled deal"
+    # At most three off-subject conclusions may precede the subject's evidence.
+    first_mem = next(i for i, t in enumerate(texts) if t == "Person Priya, sender")
+    off_before = sum(
+        1 for t in texts[:first_mem]
+        if "priya" not in t.lower()
+    )
+    assert off_before <= 3, f"generic facts owned the opening: {texts[:first_mem]}"
+    # Nothing is dropped — this decides order only.
+    assert len(out) == len(cands)
+
+
+def test_composition_is_unchanged_without_a_subject():
+    """An org-wide question keeps the previous ordering exactly: every conclusion
+    IS the subject there, so the cap must not bind."""
+    from navis.ml.rag.context_builder import _compose
+    from navis.ml.rag.grounding import Grounding
+
+    cands = [
+        Grounding(kind="intelligence", source=f"i{i}", text=f"insight {i}")
+        for i in range(6)
+    ] + [Grounding(kind="memory", source="m", text="evidence")]
+
+    out = _compose(cands, "how are we doing?")
+    assert [f.kind for f in out[:6]] == ["intelligence"] * 6
+
+
+async def test_expand_runs_once_and_never_fails_the_turn(monkeypatch):
+    """The second hop is called exactly once with the retrieved facts, and an
+    expansion that raises costs depth, not the answer."""
+    import uuid as _uuid
+
+    from navis.ml.rag import context_builder as CB
+    from navis.ml.rag.grounding import Grounding
+
+    class _Retriever:
+        def __init__(self, db):
+            pass
+
+        async def search(self, org_id, query, **kw):
+            from navis.ml.retrieval.vector_search import Hit
+            return [Hit(_uuid.uuid4(), 0.9, "person", "A retrieved fact", None)]
+
+    async def _none(db, org_id):
+        return []
+
+    monkeypatch.setattr(CB, "MemoryRetriever", _Retriever)
+    monkeypatch.setattr(CB, "learning_groundings", _none)
+    monkeypatch.setattr(CB, "intelligence_groundings", _none)
+
+    calls: list = []
+
+    async def _expand(retrieved):
+        calls.append([f.text for f in retrieved])
+        return [Grounding(kind="memory", source="expanded-1", text="An expanded fact")]
+
+    ctx = await CB.ContextBuilder(object()).build(
+        _uuid.uuid4(), "q", expand=_expand
+    )
+    assert len(calls) == 1, "the hop must run exactly once, never in a loop"
+    assert calls[0] == ["A retrieved fact"], "the callback sees what retrieval found"
+    assert "An expanded fact" in [f.text for f in ctx.facts]
+
+    async def _boom(retrieved):
+        raise RuntimeError("expansion backend down")
+
+    ctx2 = await CB.ContextBuilder(object()).build(
+        _uuid.uuid4(), "q", expand=_boom
+    )
+    assert [f.text for f in ctx2.facts] == ["A retrieved fact"]

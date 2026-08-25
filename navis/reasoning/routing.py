@@ -50,6 +50,9 @@ class ChatRoute(str, enum.Enum):
     RESCHEDULE_MEETING = "reschedule_meeting"
     CANCEL_MEETING = "cancel_meeting"
     SEND_EMAIL = "send_email"
+    # Retrieving mail the organization already has, as opposed to sending any.
+    # Read-only; never reaches Execution.
+    EMAIL_SEARCH = "email_search"
     CALENDAR_QUERY = "calendar_query"
     # Grounded answer over memory — WITH a Calendar/Gmail fallback so an empty
     # memory no longer means an empty answer. See `reasoning.workspace_context`.
@@ -177,6 +180,52 @@ _EMAIL_SELF_REFERENCE_RE = re.compile(
 )
 
 
+# ── Retrieving mail (as opposed to sending it) ─────────────────────────
+#
+# "Find the email from Ajeet" is a request to LOOK SOMETHING UP, and it was
+# reaching the memory-QA path — which answered it with reasoning prose about the
+# organization while the actual message sat in `signal_events`. That is the same
+# class of failure this module was written to fix for calendar mutations: a real
+# request with no rule, falling through to the general answer path.
+#
+# DELIBERATELY NARROW. This fires only when the utterance names MAIL and asks to
+# retrieve it. Everything organizational — "why does Ajeet matter", "what is
+# happening with Ajeet" — has no mail noun and stays on the understanding path,
+# which is where the answer to those questions actually lives.
+_EMAIL_RETRIEVE_VERB_RE = re.compile(
+    r"\b(?:find|show|search|look\s+up|pull\s+up|fetch|get|list|read|open|"
+    r"bring\s+up|any|check)\b",
+    re.IGNORECASE,
+)
+# "What did X email me about?" / "what emails came in" — a question form that
+# carries no retrieval verb but is unmistakably a request for the messages.
+_EMAIL_QUESTION_FORM_RE = re.compile(
+    r"\b(?:what|which|who|when|how\s+many)\b[^.?!]*\b(?:e-?mail(?:s|ed)?|inbox)\b",
+    re.IGNORECASE,
+)
+# The noun that makes this about mail at all. Narrower than `_EMAIL_NOUN_RE`,
+# which includes "note"/"message"/"reply" — those are also how a founder refers
+# to Slack and to replies in general, and pulling them in here would route
+# "show me the message from Ajeet" to Gmail on a Slack-only organization.
+_MAIL_NOUN_RE = re.compile(r"\b(?:e-?mails?|inbox|mailbox)\b", re.IGNORECASE)
+
+
+def is_email_search_intent(utterance: str) -> bool:
+    """True iff the user is asking to RETRIEVE mail.
+
+    Checked AFTER `is_send_email_intent` in `classify`, which is load-bearing:
+    "send the email to Ajeet" contains a mail noun and would match the question
+    form otherwise. Sending wins, always — misreading a send as a search is
+    harmless, but misreading a search as a send is not.
+    """
+    u = normalise_utterance(utterance)
+    if not u or not _MAIL_NOUN_RE.search(u):
+        return False
+    return bool(
+        _EMAIL_RETRIEVE_VERB_RE.search(u) or _EMAIL_QUESTION_FORM_RE.search(u)
+    )
+
+
 def _is_mutation_question(u: str) -> bool:
     return bool(_MUTATION_QUESTION_RE.search(u))
 
@@ -249,9 +298,14 @@ def classify(utterance: str, *, has_pending_scheduling: bool = False) -> ChatRou
     if is_scheduling_intent(u):
         return ChatRoute.SCHEDULE_MEETING
 
-    # 3. Outbound email.
+    # 3. Outbound email. BEFORE the retrieval rule below, because "send the
+    #    email to Ajeet" names mail too and sending must always win the tie.
     if is_send_email_intent(u):
         return ChatRoute.SEND_EMAIL
+
+    # 3b. Retrieving mail. A read — it can never reach Execution.
+    if is_email_search_intent(u):
+        return ChatRoute.EMAIL_SEARCH
 
     # 4. Reading the calendar.
     if is_calendar_query_intent(u):
