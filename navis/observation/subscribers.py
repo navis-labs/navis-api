@@ -74,3 +74,45 @@ async def on_action_rejected(event: DomainEvent) -> None:
 @subscribe(EventType.ACTION_CANCELLED)
 async def on_action_cancelled(event: DomainEvent) -> None:
     await _capture(event, OutcomeType.ACTION_CANCELLED)
+
+
+# ── Human judgement on a DECISION ─────────────────────────────────────
+#
+# The same gap the two handlers above closed, one layer up. `/brief/decisions/
+# {ref}/dismiss` has always persisted the dismissal and published
+# DECISION_DISMISSED — its own docstring says "for Learning to consume as an
+# explicit negative signal" — and no handler existed, so the claim was false and
+# every dismissal was published and dropped.
+#
+# THIS IS THE ONLY VERDICT MOST DECISIONS CAN RECEIVE. `risk`, `opportunity` and
+# `delegation` decisions map to no action type, so they never become an
+# ExecutionRequest and can never be rejected or cancelled. Live, that is the
+# category of every decision on the current brief — so before this handler, the
+# entire brief was unmeasurable and the signals behind it could never be shown
+# to be unreliable.
+#
+# SAME PATH, NO SHORTCUT: inbox-deduped on the event id, lineage read off the
+# event, recorded by ObservationService, and learned by the existing
+# OUTCOME_OBSERVED subscriber. Nothing here writes a learning event, and the
+# router does not either — it publishes, and the chain does the rest.
+#
+# IDEMPOTENT BY CONSTRUCTION. `dismiss_decision` derives its dismissal id as
+# uuid5(org | decision_ref | user) and publishes it as `event_id`, so a
+# re-clicked dismiss produces the same event id, the inbox claim fails, and no
+# second outcome is recorded.
+
+
+@subscribe(EventType.DECISION_DISMISSED)
+async def on_decision_dismissed(event: DomainEvent) -> None:
+    await _capture(event, OutcomeType.DECISION_DISMISSED)
+
+
+# BRIEF_OPENED IS DELIBERATELY NOT SUBSCRIBED.
+#
+# It is a page view, not a verdict. Every outcome recorded here becomes a
+# learning event and increments the SIGNAL and DECISION aggregates for every
+# decision on the brief, so subscribing it would add one NEUTRAL sample per
+# signal per open — inflating `total` without ever moving `decisive`, and
+# swamping the genuine judgement evidence with a count of how often a tab was
+# focused. Opening a brief says nothing about whether its decisions were right,
+# and Learning stores only facts that do.

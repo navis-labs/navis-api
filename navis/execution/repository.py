@@ -98,6 +98,27 @@ class ExecutionRepository:
         ).all()
         return {r.obligation_key: r for r in rows if r.obligation_key}
 
+    async def recent_for_org(
+        self, org_id: uuid.UUID, *, limit: int = 200
+    ) -> Sequence[ExecutionRequest]:
+        """This organization's newest execution rows, whatever their status.
+
+        EVERY status, unlike `GET /actions` — which filters to REQUESTED +
+        PROACTIVE because it serves an approval queue. A decision's history has
+        the opposite requirement: an execution that has already run is the
+        interesting one, and filtering it out is what let a surface report "no
+        reply sent" for an obligation that had been sent an hour earlier.
+
+        Org-scoped and bounded. Read-only; nothing here transitions a row.
+        """
+        rows = await self.db.scalars(
+            select(ExecutionRequest)
+            .where(ExecutionRequest.organization_id == org_id)
+            .order_by(ExecutionRequest.created_at.desc())
+            .limit(limit)
+        )
+        return rows.all()
+
     async def add_event(
         self, execution_id: uuid.UUID, org_id: uuid.UUID, event_type: str, payload: dict
     ) -> None:

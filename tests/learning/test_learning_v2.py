@@ -322,7 +322,21 @@ def test_the_migration_backfill_matches_the_live_classifier():
         assert classify_surface(outcome_type).value == surface, outcome_type
     from navis.learning.attribution import _OUTCOME_VOCABULARY
 
-    assert set(module._SURFACE_BY_TYPE) == set(_OUTCOME_VOCABULARY)
+    # SUBSET, NOT EQUALITY, and the direction is the whole point.
+    #
+    # A type the migration maps but the live classifier does not know would
+    # backfill historical rows to a surface nothing can reproduce — that is the
+    # defect this test exists to catch, and it is what the loop above plus this
+    # assertion cover.
+    #
+    # The reverse is not a defect. `outcome_type` is a plain String(40)
+    # precisely so a member can be added without a migration, and a type minted
+    # AFTER 0040 ran cannot appear in the rows 0040 backfilled. Requiring
+    # equality would have meant every new outcome type had to be written back
+    # into an already-applied migration — rewriting history to satisfy a test —
+    # and `decision_dismissed` is the first member to prove it.
+    unknown = set(module._SURFACE_BY_TYPE) - set(_OUTCOME_VOCABULARY)
+    assert not unknown, f"0040 maps types the classifier does not know: {sorted(unknown)}"
 
 
 # ---- patterns ----

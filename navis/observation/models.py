@@ -66,6 +66,27 @@ class OutcomeType(str, enum.Enum):
     ACTION_REJECTED = "action_rejected"
     ACTION_CANCELLED = "action_cancelled"
 
+    # A founder removed a DECISION from their brief. The judgement above are
+    # verdicts on a proposed ACTION; this is a verdict on the CONCLUSION itself
+    # — "Navis, this did not need me" — and it is the ONLY human choice most
+    # decisions can receive: `risk`, `opportunity` and `delegation` map to no
+    # action type (`execution.proposer.decision_action`), so they never become
+    # an ExecutionRequest and can never be rejected or cancelled.
+    #
+    # ITS OWN MEMBER, and not ACTION_REJECTED reused. The three existing
+    # judgement types all carry an `execution_id`; this one carries a decision
+    # and its reasoning signals and nothing else, and folding it into a member
+    # whose whole meaning is "about an action" would make `execution_id IS NULL`
+    # the only way to tell two different verdicts apart. The same argument the
+    # REJECTED/CANCELLED split already documents.
+    #
+    # WHY the brief-dismissal reason is NOT split into three members: the reason
+    # ("explicit" / "stale" / "duplicate") is stored verbatim on the outcome
+    # payload, so a later pass can separate them without re-deriving anything,
+    # and minting three types before anything reads them would fix a taxonomy to
+    # a distinction nothing yet uses.
+    DECISION_DISMISSED = "decision_dismissed"
+
     # ── World: what actually happened (provider webhooks) ────────────────
     REPLY_RECEIVED = "reply_received"
     MEETING_ACCEPTED = "meeting_accepted"

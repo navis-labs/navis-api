@@ -26,6 +26,10 @@ from navis.execution.proposer import decision_action
 from navis.execution.repository import ExecutionRepository
 from navis.execution.summary import execution_summary
 from navis.orchestration.brief import brief_for_today, build_brief, propose_actions
+from navis.orchestration.decision_history import (
+    DEFAULT_EPISODE_LIMIT,
+    decision_history,
+)
 from navis.organization.contract import Capability
 from navis.organization.guards import require_capability
 from navis.platform.database import get_session
@@ -228,6 +232,32 @@ async def mark_brief_opened(
     return {"status": "opened", "brief_id": str(brief_id)}
 
 
+@router.get(
+    "/decisions/history",
+    dependencies=[Depends(rate_limit("read", "rate_limit_read_per_window"))],
+)
+async def decisions_history(
+    limit: int = DEFAULT_EPISODE_LIMIT,
+    p: Principal = Depends(require_capability(Capability.DECISION)),
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """What has happened to the decisions this organization has made.
+
+    Decision -> Human choice -> Execution -> Outcome -> Learning, folded per
+    REASONING CONCLUSION rather than per decision id — see
+    `orchestration.decision_history` for why a decision id cannot key a history.
+
+    Lives on this router for the same reason `/today` does: the arrow stays
+    API -> Orchestration -> Decision, and the join across Execution, Observation
+    and Learning belongs to the composition root, not to any of them.
+
+    STRICTLY READ-ONLY, and deliberately unlike `/today`: it never calls
+    `build_brief`, so opening the Decisions page cannot rebuild a brief, fold
+    State or re-project Intelligence.
+    """
+    return await decision_history(db, p.org_id, limit=max(1, min(limit, 200)))
+
+
 class DismissDecisionBody(BaseModel):
     reason: Literal["explicit", "stale", "duplicate"] = "explicit"
 
@@ -246,10 +276,25 @@ async def dismiss_decision(
 
     `decision_ref` is opaque by design — the frontend may pass a Decision id, a
     reasoning signal id, or any stable event id; we don't couple to a specific
-    identifier space, so removed decisions still carry their dismissal history."""
+    identifier space, so removed decisions still carry their dismissal history.
+
+    THE EVENT NOW CARRIES LINEAGE, which is what makes the sentence above true
+    rather than aspirational. `DECISION_DISMISSED` used to publish the dismissal
+    id, the ref, the reason and the user — and nothing that names WHAT was
+    dismissed in the pipeline's own identifiers. Observation dedupes on
+    `event_id` and Learning attributes on `reasoning_signal_ids`, so an event
+    without either could not have been consumed even once a handler existed.
+
+    Both are resolved from data that is already stored: the dismissal id is
+    deterministic (uuid5 over org|ref|user) and doubles as the idempotency key,
+    and the reasoning lineage is read off the stored decision via
+    `DecisionService.find_decision`. Nothing is guessed — a ref that resolves to
+    no decision publishes no lineage rather than a neighbouring decision's, and
+    the dismissal is still persisted either way."""
     dismissal_id = uuid.uuid5(
         _DISMISSAL_NAMESPACE, f"{ctx.org_id}|{decision_ref}|{ctx.user.id}"
     )
+    decision = await DecisionService(db).find_decision(ctx.org_id, decision_ref)
     stmt = (
         pg_insert(DecisionDismissal)
         .values(
@@ -269,10 +314,25 @@ async def dismiss_decision(
         org_id=ctx.org_id,
         source="brief.router",
         payload={
+            # THE IDEMPOTENCY KEY. Deterministic in (org, ref, user), so a
+            # re-clicked dismiss produces the same id, Observation's inbox claim
+            # fails, and no second outcome is recorded.
+            "event_id": str(dismissal_id),
             "dismissal_id": str(dismissal_id),
             "decision_ref": decision_ref,
+            # The founder's stated grounds. Carried through to the outcome
+            # payload verbatim by `ObservationService.record_from_execution`,
+            # which already preserves `reason` for the same purpose on a
+            # rejected action.
             "reason": body.reason,
             "user_id": str(ctx.user.id),
+            # ── Lineage, read off the stored decision. Absent (null / empty)
+            # when the ref resolves to no decision — an honest gap rather than
+            # an invented attribution.
+            "decision_id": (decision or {}).get("decision_id"),
+            "reasoning_signal_ids": list((decision or {}).get("reasoning_signal_ids") or ()),
+            "reasoning_version": (decision or {}).get("reasoning_version"),
+            "state_watermark": (decision or {}).get("state_watermark"),
         },
     ))
     return {"status": "dismissed", "dismissal_id": str(dismissal_id)}

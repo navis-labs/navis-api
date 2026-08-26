@@ -20,8 +20,11 @@ not these tables.
 """
 from navis.learning.metrics import (
     AggregateFact,
+    LearningEventFact,
     LearningSnapshot,
+    LearningTotals,
     SignalPattern,
+    learning_events_for,
     learning_snapshot,
 )
 from navis.learning.models import (
@@ -38,10 +41,13 @@ __all__ = [
     "AggregateFact",
     "LearningAggregate",
     "LearningEvent",
+    "LearningEventFact",
     "LearningResult",
     "LearningService",
     "LearningSnapshot",
+    "LearningTotals",
     "OutcomeSurface",
     "SignalPattern",
+    "learning_events_for",
     "learning_snapshot",
 ]

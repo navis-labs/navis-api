@@ -125,8 +125,14 @@ class ObservationService:
         #
         # Keys are omitted rather than stored as None so a reader can distinguish
         # "not applicable to this outcome type" from "applicable but absent".
-        payload: dict = {"action_type": p.get("action_type")}
-        for key in ("error", "failure_kind", "reason"):
+        #
+        # `action_type` now follows that rule too. It was unconditional, which
+        # was harmless while every event here came from Execution — and became
+        # wrong the moment DECISION_DISMISSED arrived, because a dismissed
+        # decision has no action and stamping `action_type: null` on it asserts
+        # that it did and the value went missing.
+        payload: dict = {}
+        for key in ("action_type", "error", "failure_kind", "reason"):
             value = p.get(key)
             if value is not None:
                 payload[key] = value

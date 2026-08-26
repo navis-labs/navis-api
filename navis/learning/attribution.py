@@ -51,6 +51,20 @@ _OUTCOME_VOCABULARY: dict[str, tuple[OutcomeSurface, LearningResult]] = {
     # which they are not"); scoring a cancellation as a failure here would
     # perform exactly that collapse one layer down.
     "action_cancelled": (OutcomeSurface.JUDGEMENT, LearningResult.NEUTRAL),
+    # A verdict on the CONCLUSION rather than on a proposed action: the founder
+    # removed this decision from their brief. Decisive, and negative — Navis
+    # raised something that did not need them, which is direct evidence about
+    # the reasoning that raised it. That is what makes it useful: `risk`
+    # decisions produce no execution at all, so a dismissal is the ONLY
+    # judgement signal their signals can ever receive, and leaving it
+    # unclassified meant the most-raised conclusions were also the least
+    # measured.
+    #
+    # FAILURE for all three dismissal reasons. "explicit" (did not need me),
+    # "stale" (out of date) and "duplicate" (already told me) are three ways of
+    # saying the brief should not have carried it; the reason itself is stored
+    # on the outcome payload, so splitting them later needs no re-derivation.
+    "decision_dismissed": (OutcomeSurface.JUDGEMENT, LearningResult.FAILURE),
 
     # ── World: what actually happened afterwards ──────────────────────
     "reply_received": (OutcomeSurface.WORLD, LearningResult.SUCCESS),

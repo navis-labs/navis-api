@@ -40,6 +40,8 @@ from navis.identity.router import router as identity_router
 from navis.identity.scim_router import router as scim_router
 from navis.identity_resolution.router import router as identity_resolution_router
 from navis.intelligence.router import router as intelligence_router
+from navis.learning.router import router as learning_router
+from navis.observation.router import router as observation_router
 from navis.observation.webhooks.router import router as observation_webhooks_router
 from navis.organization.router import router as organization_router
 from navis.signals.read_router import router as signals_read_router
@@ -60,6 +62,12 @@ api_router.include_router(context_router)
 # `/memory/*` below is the legacy derived surface this supersedes.
 api_router.include_router(knowledge_router)
 api_router.include_router(execution_router)
+# The two read edges that close the loop on the wire. Observation and Learning
+# have persisted outcomes and attributions since they shipped and neither had a
+# reader, so "what happened after Navis decided?" could only be answered by
+# fabricating it. Both are read-only and gated on their own capability.
+api_router.include_router(observation_router)
+api_router.include_router(learning_router)
 api_router.include_router(intelligence_router)
 api_router.include_router(adaptive_router)
 api_router.include_router(observation_webhooks_router)

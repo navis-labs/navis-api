@@ -70,6 +70,26 @@ class OutcomeRepository:
         stmt = stmt.order_by(Outcome.occurred_at.asc(), Outcome.created_at.asc())
         return (await self.db.scalars(stmt)).all()
 
+    async def recent(self, org_id: uuid.UUID, *, limit: int = 200) -> Sequence[Outcome]:
+        """This organization's newest outcomes first — the read-surface order.
+
+        NOT `for_replay` with a limit. That method is ascending because replay
+        must fold outcomes in the order they occurred, so taking `limit` off it
+        returns the OLDEST rows — the opposite of what a feed wants, and a
+        difference that only shows up once an org has more history than the page
+        size.
+
+        Ordered by `occurred_at` (reality time) with `created_at` breaking ties,
+        mirroring `timeline` so the two agree about sequence.
+        """
+        stmt = (
+            select(Outcome)
+            .where(Outcome.organization_id == org_id)
+            .order_by(Outcome.occurred_at.desc(), Outcome.created_at.desc())
+            .limit(limit)
+        )
+        return (await self.db.scalars(stmt)).all()
+
     async def for_replay(
         self, org_id: uuid.UUID, *, since: datetime | None = None, limit: int = 1000
     ) -> Sequence[Outcome]:

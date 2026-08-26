@@ -20,7 +20,7 @@ from navis.decisions.base import (
     compute_brief_id,
     obligation_counts,
 )
-from navis.decisions.models import DailyBrief
+from navis.decisions.models import DailyBrief, DecisionDismissal
 from navis.decisions.what_matters_today import WhatMattersTodayEngine
 from navis.platform.events import DomainEvent, EventType, event_bus
 from navis.platform.monitoring import get_logger
@@ -258,6 +258,89 @@ class DecisionService:
                 )
             out[str(decision.get("decision_id"))] = check.to_dict()
         return out
+
+    async def recent_briefs(
+        self, org_id: uuid.UUID, *, limit: int = 200
+    ) -> list[DailyBrief]:
+        """The org's newest briefs, in the same total order as `latest_brief`.
+
+        ONE ORDER, ONE PLACE. The ordering below is byte-identical to
+        `latest_brief`'s — `as_of DESC NULLS LAST, reasoning_version DESC,
+        id DESC` — because a history built in a different order than the brief
+        that heads it would disagree with Today about which decision is current.
+        `latest_brief` is that same query with `LIMIT 1`; both are here so
+        neither can drift.
+
+        BOUNDED, and the bound is on BRIEFS rather than on decisions. A brief is
+        rebuilt whenever the state watermark moves (`brief_for_today`), so the
+        row count grows with sync frequency and not with the organization. The
+        caller reports how many it scanned so the bound is visible rather than
+        silently truncating a history.
+        """
+        rows = await self.db.scalars(
+            select(DailyBrief)
+            .where(DailyBrief.organization_id == org_id)
+            .order_by(
+                desc(DailyBrief.as_of).nulls_last(),
+                desc(DailyBrief.reasoning_version),
+                desc(DailyBrief.id),
+            )
+            .limit(limit)
+        )
+        return list(rows)
+
+    async def dismissals(
+        self, org_id: uuid.UUID, *, limit: int = 500
+    ) -> list[DecisionDismissal]:
+        """Every decision this organization has explicitly dismissed, newest first.
+
+        The founder's own verdicts, and the only human choice a `risk` decision
+        can receive — those decisions map to no action type, so they never reach
+        Execution and `execution_requests` holds nothing about them.
+        """
+        rows = await self.db.scalars(
+            select(DecisionDismissal)
+            .where(DecisionDismissal.organization_id == org_id)
+            .order_by(desc(DecisionDismissal.created_at))
+            .limit(limit)
+        )
+        return list(rows)
+
+    async def find_decision(
+        self, org_id: uuid.UUID, decision_ref: str
+    ) -> dict | None:
+        """The stored decision with this id, from the newest brief carrying it.
+
+        WHY A LOOKUP AND NOT A JOIN. `daily_briefs.decisions` is JSONB and a
+        decision has no row of its own — that is deliberate (the brief is a
+        replayable cache, not a second store), so "which decision is this?" is a
+        containment test against the array.
+
+        `decision_ref` is opaque by contract (`dismiss_decision` accepts a
+        decision id, a signal id, or any stable event id), so a value that is
+        not a decision id simply matches nothing and this returns None. None is
+        a real answer: the dismissal is still recorded, it just carries no
+        reasoning lineage, and inventing one from a neighbouring decision would
+        attribute a founder's verdict to a signal they never saw.
+
+        Scoped on `organization_id` FIRST, so a decision id guessed from another
+        tenant cannot be resolved here.
+        """
+        brief = await self.db.scalar(
+            select(DailyBrief)
+            .where(
+                DailyBrief.organization_id == org_id,
+                DailyBrief.decisions.contains([{"decision_id": decision_ref}]),
+            )
+            .order_by(desc(DailyBrief.as_of).nulls_last(), desc(DailyBrief.id))
+            .limit(1)
+        )
+        if brief is None:
+            return None
+        for decision in brief.decisions or []:
+            if str(decision.get("decision_id")) == decision_ref:
+                return decision
+        return None
 
     async def latest_brief(self, org_id: uuid.UUID) -> DailyBrief | None:
         """The newest brief this org has, by the point in time it describes.

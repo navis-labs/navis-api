@@ -46,6 +46,12 @@ from navis.learning.patterns import MIN_SAMPLES
 _MAX_LINEAGE = 50
 _LINEAGE_SCAN_LIMIT = 20000
 
+# How many learning events one `learning_events_for` call will return. A read
+# surface renders a page, not a history; the exact totals always come from the
+# aggregates (`LearningSnapshot.totals`), which are computed over every event
+# regardless of this bound.
+_MAX_EVENTS_READ = 200
+
 
 @dataclass(frozen=True, slots=True)
 class AggregateFact:
@@ -77,6 +83,61 @@ class SignalPattern:
     kind: str            # reliable | unreliable
     success_rate: float
     samples: int
+
+
+@dataclass(frozen=True, slots=True)
+class LearningTotals:
+    """How much this organization has learned, in whole numbers.
+
+    Summed over the OUTCOME dimension and no other. That dimension is keyed on
+    `outcome_type`, so every learning event lands in exactly one of its rows —
+    which makes the sum a true total. Summing SIGNAL or DECISION rows would
+    double-count: one event fans out to every signal it cites AND to its
+    decision (`aggregates.aggregate_keys`).
+
+    `success_rate` is None, never 0.0, when nothing decisive has happened. A
+    rate over zero decisive samples is not a measurement, and rendering it as
+    0% states that the organization tried and failed. Neutrals are attempts, not
+    verdicts, so they stay out of the numerator and the denominator alike —
+    exactly as `AggregateFact.decisive` and `patterns.derive_signal_patterns`
+    already treat them.
+    """
+
+    events: int
+    successes: int
+    failures: int
+    neutrals: int
+
+    @property
+    def decisive(self) -> int:
+        return self.successes + self.failures
+
+    @property
+    def success_rate(self) -> float | None:
+        return success_rate(self.successes, self.failures)
+
+
+@dataclass(frozen=True, slots=True)
+class LearningEventFact:
+    """One attributed outcome, flattened to primitives.
+
+    Exactly the columns `learning_events` already carries — nothing derived,
+    nothing recomputed. It exists so a consumer can ask "what did the
+    organization learn from THIS decision / THIS reasoning signal?" without
+    reaching into Learning's tables, which is the one thing this module exists
+    to prevent. `AggregateFact` answers the same question in counts; this
+    answers it in events, with the lineage needed to join them to a decision.
+    """
+
+    learning_event_id: str
+    outcome_id: str | None
+    execution_id: str | None
+    decision_id: str | None
+    reasoning_signal_ids: tuple[str, ...]
+    outcome_type: str
+    outcome_surface: str
+    result: str
+    occurred_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +199,25 @@ class LearningSnapshot:
             grouped.setdefault(classify_surface(agg.key).value, []).append(agg)
         return grouped
 
+    def totals(self) -> LearningTotals:
+        """The organization's whole-number learning position. See `LearningTotals`.
+
+        `events` is `learning_version` — the exact count of learning events,
+        computed by `_event_stats` over every row rather than over the bounded
+        aggregate set, so it stays exact for an organization of any size.
+        """
+        successes = failures = neutrals = 0
+        for agg in self.by_dimension(AggregateDimension.OUTCOME):
+            successes += agg.successes
+            failures += agg.failures
+            neutrals += agg.neutrals
+        return LearningTotals(
+            events=self.learning_version,
+            successes=successes,
+            failures=failures,
+            neutrals=neutrals,
+        )
+
 
 async def learning_snapshot(db, org_id: uuid.UUID) -> LearningSnapshot:
     """Read one organization's complete learning state.
@@ -180,6 +260,61 @@ async def learning_snapshot(db, org_id: uuid.UUID) -> LearningSnapshot:
         ),
         lineage=lineage,
         signal_lineage=signal_lineage,
+    )
+
+
+async def learning_events_for(
+    db, org_id: uuid.UUID, *, limit: int = _MAX_EVENTS_READ
+) -> tuple[LearningEventFact, ...]:
+    """This organization's most recent attributed outcomes, newest first.
+
+    THE SECOND SHAPE OF THE SAME CONTRACT. `learning_snapshot` answers "what are
+    the counts?"; this answers "which outcomes produced them?". Both are needed
+    by a surface that shows one decision's history — a count cannot say whether
+    the verdict on THIS decision was a rejection or a reply — and both stay
+    inside this module for the reason the module exists: no consumer may SELECT
+    `learning_events` itself.
+
+    Org-scoped like every other read here, bounded like `_lineage`, and
+    projected rather than hydrated (Row tuples, no ORM instances, no identity
+    map) — the same discipline `_lineage` documents.
+
+    NEWEST FIRST, unlike `LearningRepository.all_events`, which is ascending
+    because replay must fold events in the order they occurred. A read surface
+    wants the other end of the log, and taking `limit` off an ascending scan
+    would return the OLDEST events instead of the most recent ones.
+    """
+    rows = (
+        await db.execute(
+            select(
+                LearningEvent.id,
+                LearningEvent.outcome_id,
+                LearningEvent.execution_id,
+                LearningEvent.decision_id,
+                LearningEvent.reasoning_signal_ids,
+                LearningEvent.outcome_type,
+                LearningEvent.outcome_surface,
+                LearningEvent.result,
+                LearningEvent.occurred_at,
+            )
+            .where(LearningEvent.organization_id == org_id)
+            .order_by(LearningEvent.occurred_at.desc(), LearningEvent.id.desc())
+            .limit(limit)
+        )
+    ).all()
+    return tuple(
+        LearningEventFact(
+            learning_event_id=str(r[0]),
+            outcome_id=str(r[1]) if r[1] else None,
+            execution_id=str(r[2]) if r[2] else None,
+            decision_id=str(r[3]) if r[3] else None,
+            reasoning_signal_ids=tuple(str(s) for s in (r[4] or ())),
+            outcome_type=r[5] or "",
+            outcome_surface=r[6] or "",
+            result=r[7] or "",
+            occurred_at=r[8],
+        )
+        for r in rows
     )
 
 
