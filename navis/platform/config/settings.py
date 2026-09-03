@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://localhost/navis"
 
     # ---- Redis ----
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = "redis://localhost:6380/0"
     # Failure-domain separation (Phase 6): cache and the event stream can be split
     # onto independent Redis instances later WITHOUT code change — each defaults to
     # `redis_url`. A cache outage then can't take down event mirroring, and vice versa.
@@ -204,8 +204,8 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:3000"
 
     # ---- Background tasks ----
-    celery_broker_url: str = "redis://localhost:6379/2"
-    celery_result_backend: str = "redis://localhost:6379/3"
+    celery_broker_url: str = "redis://localhost:6380/2"
+    celery_result_backend: str = "redis://localhost:6380/3"
     # When True, POST /actions/{id}/approve schedules an INLINE execution
     # pass (asyncio.create_task) alongside the Celery enqueue. This lets
     # meeting scheduling work end-to-end WITHOUT a running Celery worker

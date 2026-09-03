@@ -535,24 +535,29 @@ class _ManagedCalendarClient:
             # what made chat claim "not connected" while the dashboard happily
             # listed the same org's meetings.
             integration = await resolve_calendar_integration(self._db, self._org_id)
-            # Persist a self-heal (a materialised google_calendar row) NOW,
-            # while the stored tokens are still ciphertext. The decrypt-in-place
-            # below mutates the ORM object, so any later commit on this session
-            # would write the tokens back as plaintext — which is why __aexit__
-            # rolls back unless it is deliberately persisting a refreshed token.
+            # Persist a self-heal (a materialised google_calendar row) NOW, so
+            # the INSERT is not still pending across the external Google call.
             await self._db.commit()
-            access = (
-                token_cipher.decrypt(integration.access_token)
-                if integration.access_token
-                else None
-            )
-            refresh = (
-                token_cipher.decrypt(integration.refresh_token)
-                if integration.refresh_token
-                else None
-            )
-            integration.access_token = access
-            integration.refresh_token = refresh
+            # HAND `TokenManager` THE TOKENS EXACTLY AS STORED — CIPHERTEXT.
+            #
+            # This used to decrypt them in place onto the ORM row first, and
+            # that was wrong twice over. `TokenManager.get_token` decrypts what
+            # it is given (signals/google/oauth.py), so the row arrived
+            # pre-decrypted and got decrypted a SECOND time. While
+            # `signals_reject_legacy_plaintext` was off that second call quietly
+            # returned the untagged value as-is and everything worked; the day
+            # the sunset switch went on it raised `TokenDecryptError` instead,
+            # and because the scheduling agent catches bare `Exception` around
+            # freebusy, every availability check in the product turned into the
+            # generic "I couldn't check your calendar availability just now.
+            # Try reconnecting Google Calendar" clarification — on orgs whose
+            # Google grant was perfectly healthy and correctly scoped.
+            #
+            # Assigning plaintext onto the row was also a latent
+            # encryption-at-rest leak: it marks the row dirty, so any commit on
+            # this session would write the real tokens back unencrypted. The
+            # execution senders removed the identical helper for the identical
+            # reason — see `_Grant` in execution/providers/_senders.py.
             self._integration = integration
             self._token_manager = TokenManager(integration)
             self._transport = GoogleTransport(
