@@ -233,6 +233,10 @@ async def test_sync_skips_before_touching_the_provider(monkeypatch):
         user_id=uuid.uuid4(),
         provider=S.IntegrationProvider.GMAIL,
         is_active=True,
+        # Healthy, so this test isolates the ENTITLEMENT refusal. The auth gate
+        # sits immediately after the entitlement gate, and a fake defaulting to
+        # a broken credential would let this test pass for the wrong reason.
+        auth_state=S.IntegrationAuthState.OK.value,
         sync_state={},
     )
 

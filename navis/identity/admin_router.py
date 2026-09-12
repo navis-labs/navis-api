@@ -11,10 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.apikeys import ApiKeyService
 from navis.identity.audit import AuditAction, AuditService
-from navis.identity.authz import Principal, require_permission
+from navis.identity.authz import Principal, ensure_grantable_scopes, require_permission
 from navis.identity.members import MemberConflict, MemberError, MemberForbidden, MemberService
 from navis.identity.models import Role
-from navis.identity.permissions import Permission, validate_permission
+from navis.identity.permissions import Permission
 from navis.identity.service_accounts import ServiceAccountService
 from navis.identity.sso import SsoConnectionService
 from navis.platform.database import get_session
@@ -23,21 +23,11 @@ from navis.platform.events import DomainEvent, EventType, event_bus
 router = APIRouter(prefix="/identity", tags=["identity-admin"])
 
 
-def _ensure_grantable_scopes(scopes: list[str], principal: Principal) -> None:
-    """A machine credential may never hold a permission its creator lacks — closes
-    the 'mint an api key with execute_actions you don't have' escalation. Also rejects
-    typo/unknown scopes (400) so garbage never persists into a credential."""
-    for scope in scopes:
-        try:
-            validate_permission(scope)
-        except ValueError as exc:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
-    excess = set(scopes) - set(principal.permissions)
-    if excess:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            f"cannot grant scopes you do not hold: {sorted(excess)}",
-        )
+# The escalation guard now lives in `identity.authz` — the Agents API needs the
+# same rule, and two copies of "may this principal grant this scope" is one copy
+# that gets a fix and one that does not. Re-exported under the module-private
+# name this file has always used so its call sites (and their tests) are unchanged.
+_ensure_grantable_scopes = ensure_grantable_scopes
 
 
 async def _emit(event_type: EventType, org_id: uuid.UUID, actor_id: uuid.UUID, **payload: Any) -> None:

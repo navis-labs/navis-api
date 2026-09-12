@@ -31,6 +31,39 @@ from navis.signals.service import SignalIngestionService
 
 logger = get_logger("signals.sync")
 
+#: Upper bound on a stored failure reason. The column is VARCHAR(500); this is
+#: tighter, so the truncation is ours and visible rather than the database's.
+_MAX_FAILURE_REASON = 300
+
+
+def _auth_failure_reason(exc: BaseException) -> str | None:
+    """The provider's words if `exc` means "this credential is dead", else None.
+
+    A CREDENTIAL failure and a TRANSPORT failure need opposite responses. A 503
+    or a timeout should be retried — the next pass may well work. A rejected
+    refresh token will be rejected identically forever, and retrying it on every
+    beat is how a dead grant generates thousands of useless calls while telling
+    the sync loop nothing it can act on. Only the second kind may stop the
+    dispatch gate, so only the second kind is reported here.
+
+    IMPORTED LOCALLY, and that is deliberate rather than lazy. This module is the
+    engine every connector runs through and it imports no provider package —
+    `navis.signals.slack.client` in particular reaches back into transport code
+    that would make this a cycle. The cost is one import on an error path that
+    has already done network I/O and written to the DLQ; `sys.modules` serves
+    every call after the first.
+    """
+    from navis.signals.google.oauth import ReconsentRequired
+    from navis.signals.slack.client import SlackReconsentRequired
+
+    if not isinstance(exc, (ReconsentRequired, SlackReconsentRequired)):
+        return None
+    # `str(exc)` on these carries the provider's own error code —
+    # "google refresh rejected (invalid_grant)", "token_revoked" — which is
+    # exactly what an operator needs and contains no secret. Bounded anyway: an
+    # exception message is a classic place for a credentialled URL to appear.
+    return (str(exc) or type(exc).__name__)[:_MAX_FAILURE_REASON]
+
 
 @dataclass(slots=True)
 class SyncOutcome:
@@ -40,6 +73,22 @@ class SyncOutcome:
     cursor: dict[str, Any] = field(default_factory=dict)
     full_resync_performed: bool = False
     failed: bool = False
+    #: The failure was the CREDENTIAL, not the network or the connector.
+    #:
+    #: WHY THIS IS CLASSIFIED HERE AND ACTED ON ELSEWHERE. This module's contract
+    #: is that signals own their log and identity owns tokens and cursors — it
+    #: returns facts for orchestration to persist and touches no identity row. It
+    #: is also the only place that SEES the exception: the `except` below is
+    #: broad by design, so a `ReconsentRequired` is caught, dead-lettered, and
+    #: collapsed into `failed=True` along with every timeout and 500. That is why
+    #: a dead Google grant used to vanish — the information existed for exactly
+    #: one stack frame and had nowhere to go.
+    #:
+    #: So: classify here, where the exception is; record in
+    #: `orchestration.sync.sync_integration`, which owns the row.
+    auth_failed: bool = False
+    #: The provider's own words, for `integrations.last_failure_reason`.
+    auth_failure_reason: str | None = None
 
 
 class SignalSyncService:
@@ -111,7 +160,17 @@ class SignalSyncService:
                 },
             )
             logger.exception("sync fetch failed source=%s org=%s", connector.source.value, ctx.org_id)
-            return SyncOutcome(failed=True, cursor=cursor)
+            # CURSOR UNCHANGED on every failure, including this one. A grant that
+            # needs re-consent must resume exactly where it stopped once the user
+            # re-authorises; discarding the cursor here would silently turn every
+            # re-consent into a full historical resync.
+            reason = _auth_failure_reason(exc)
+            return SyncOutcome(
+                failed=True,
+                cursor=cursor,
+                auth_failed=reason is not None,
+                auth_failure_reason=reason,
+            )
 
         events = list(result.events)
         # Meet rides on the Calendar pass — derived, never independently polled.

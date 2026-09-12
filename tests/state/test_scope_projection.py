@@ -318,9 +318,14 @@ def test_types_with_no_entities_do_not_shift_anyone_elses_position():
 
 
 def test_grounding_labels_resolve_from_normalized_state_fields():
-    """The chat composition turns EntityRef.fields into a human label. Every
-    projected type must yield something better than a bare uuid."""
-    from navis.api.chat_router import _entity_label
+    """The shared context composer turns EntityRef.fields into a human label.
+    Every projected type must yield something better than a bare uuid.
+
+    Imported from `orchestration.context`, which is where the composition
+    lives now that `/chat` and `POST /developer/context` both call it — the
+    label a founder reads and the one an agent reads are the same function.
+    """
+    from navis.orchestration.context import entity_label as _entity_label
 
     _state, view = _view(_ONE_OF_EACH)
     for e in view.entities:

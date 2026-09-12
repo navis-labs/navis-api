@@ -161,6 +161,24 @@ class Principal:
     role: str | None = None
     user: User | None = None
     scopes: list[str] = field(default_factory=list)
+    # WHICH CREDENTIAL authenticated this request, as distinct from WHO it
+    # authenticated. `subject_id` collapses the two for machine callers: when a
+    # key is bound to a service account it becomes the SERVICE ACCOUNT's id, so
+    # the `api_keys` row that actually presented itself was unrecoverable from
+    # the resolved principal. A service account may hold several keys over its
+    # life (`ServiceAccountService.rotate` mints one and revokes the rest), and
+    # every question about a machine call — which credential to revoke after a
+    # leak, which one a rotation retired, which one is spending a quota, which
+    # one performed an audited read — is a question about the KEY, not the
+    # account. Non-null for `api_key`/`service_account` principals and always
+    # the `api_keys.id`.
+    #
+    # None for `user` principals: a JWT's credential identity is its `jti`,
+    # which lives in the token rather than in a table, is already enforced by
+    # the revocation denylist, and has no attribution consumer. Carrying it
+    # here would put a session identifier on a field whose whole contract is
+    # "a revocable credential row", so the honest value is absence.
+    credential_id: uuid.UUID | None = None
 
     def has(self, permission: str) -> bool:
         return permission in self.permissions
@@ -273,6 +291,28 @@ async def _principal_from_api_key(db: AsyncSession, plaintext: str) -> Principal
         sa = await db.get(ServiceAccount, key.service_account_id)
         if sa is None or sa.revoked_at is not None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "service account revoked")
+        # THE CREDENTIAL -> AGENT -> ORGANIZATION CHAIN, CLOSED.
+        #
+        # The organization below is taken from the KEY and the subject from the
+        # SERVICE ACCOUNT, and until now nothing checked that those two rows name
+        # the same tenant. No route can currently create that mismatch — the only
+        # writer of `api_keys.service_account_id` is `ServiceAccountService`,
+        # which sets both from one org — but "unreachable today" is a property of
+        # the callers, not of this function, and this function is the one place
+        # every machine request is authorized from. The database cannot help: the
+        # FK is to `service_accounts.id` alone, so no constraint spans the pair.
+        #
+        # A mismatch would produce a principal whose org_id is tenant A and whose
+        # acting agent belongs to tenant B — every downstream tenant filter would
+        # then work perfectly and still be filtering the wrong tenant. Fail closed
+        # rather than trust an invariant nothing enforces.
+        if sa.organization_id != key.organization_id:
+            logger.error(
+                "credential/agent tenant mismatch: key=%s org=%s service_account=%s org=%s",
+                key.id, key.organization_id, sa.id, sa.organization_id,
+            )
+            metrics.incr("auth.rejected", labels={"reason": "credential_org_mismatch"})
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid api key")
         kind = PrincipalKind.SERVICE_ACCOUNT
     scopes = list(key.scopes or [])
     return Principal(
@@ -281,6 +321,12 @@ async def _principal_from_api_key(db: AsyncSession, plaintext: str) -> Principal
         subject_id=key.service_account_id or key.id,
         permissions=frozenset(scopes),
         scopes=scopes,
+        # ALWAYS the api_keys row, never the service account. See the field note
+        # on `Principal.credential_id`: `subject_id` above deliberately reports
+        # the ACCOUNT when there is one, which is what authorization asks about;
+        # attribution, rotation and revocation ask about the KEY, and this is
+        # the only place that still knows it.
+        credential_id=key.id,
     )
 
 
@@ -317,6 +363,35 @@ async def get_principal(
         # One place that counts every auth rejection (401 invalid/revoked vs 403).
         metrics.incr("auth.rejected", labels={"status": str(exc.status_code)})
         raise
+
+
+def ensure_grantable_scopes(scopes: list[str], principal: Principal) -> None:
+    """A machine credential may never hold a permission its creator lacks.
+
+    Closes the "mint an api key with `execute_actions` you don't have"
+    escalation, and rejects typo/unknown scopes (400) so garbage never persists
+    into a credential.
+
+    LIVES HERE, NOT ON A ROUTER. It began as a private helper in
+    `identity.admin_router` and is now needed by a second edge
+    (`developer.agents_router`). Two copies of an escalation guard is one copy
+    that gets a fix and one that does not, and the divergence is invisible until
+    a credential is minted through the wrong door. `authz` is the module that
+    already owns "what may this principal do", so it owns this too.
+    """
+    from navis.identity.permissions import validate_permission
+
+    for scope in scopes:
+        try:
+            validate_permission(scope)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    excess = set(scopes) - set(principal.permissions)
+    if excess:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"cannot grant scopes you do not hold: {sorted(excess)}",
+        )
 
 
 def require_permission(permission: str):

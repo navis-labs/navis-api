@@ -34,7 +34,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.dependencies import CurrentContext, get_current_context
-from navis.identity.models import Integration, IntegrationProvider
+from navis.identity.models import Integration, IntegrationAuthState, IntegrationProvider
 from navis.platform.cache import redis_client
 from navis.platform.config import settings
 from navis.platform.database import get_session
@@ -357,6 +357,21 @@ async def google_callback(
                     "token_expires_at": expires_at,
                     "scopes": granted,
                     "is_active": True,
+                    # ── RECOVERY, AND IT IS DETERMINISTIC ────────────────
+                    # A completed OAuth grant is the ONE event that proves a
+                    # credential works, so it is the one event allowed to clear
+                    # `reconsent_required`. Clearing it here — in the same
+                    # statement that stores the new token, rather than in a
+                    # follow-up write — means a re-consent can never leave the
+                    # row holding a fresh token and a stale "broken" flag, which
+                    # would keep a working account out of the sync fan-out
+                    # indefinitely with nothing to show why.
+                    #
+                    # Unconditional, not conditional on the current state: an
+                    # `ok` row being set to `ok` is a no-op, and a CASE here
+                    # would only add a way to get it wrong.
+                    "auth_state": IntegrationAuthState.OK.value,
+                    "last_failure_reason": None,
                     "updated_at": func.now(),
                 },
             )
@@ -635,7 +650,22 @@ async def list_integrations(
             "integration_id":     str(r.id),
             "provider":           provider_value,
             "external_account":   r.external_account,
+            # THE USER'S INTENT. Unchanged in meaning — still "is this
+            # connected?" — but no longer the only health signal on this row.
             "is_active":          r.is_active,
+            # ── AUTH AND SYNC HEALTH (0050) ──────────────────────────────
+            # Additive. `is_active` used to carry all of this implicitly, which
+            # is why a revoked Google grant rendered as a healthy connection.
+            # `auth_state` is what a reconnect prompt should key off;
+            # `last_success_at` is what a staleness warning should key off. They
+            # are different questions and the UI needs both to say "connected,
+            # but nothing has arrived since Tuesday".
+            "auth_state":           r.auth_state,
+            "last_attempt_at":      r.last_attempt_at.isoformat() if r.last_attempt_at else None,
+            "last_success_at":      r.last_success_at.isoformat() if r.last_success_at else None,
+            # Already truncated and scrubbed by the writer; a provider error
+            # CODE, never a token.
+            "last_failure_reason":  r.last_failure_reason,
             "connected_at":       r.created_at.isoformat() if r.created_at else None,
             "updated_at":         r.updated_at.isoformat() if r.updated_at else None,
             "token_expires_at":   r.token_expires_at.isoformat() if r.token_expires_at else None,

@@ -34,6 +34,10 @@ from navis.api.context_router import router as context_router
 from navis.api.knowledge_router import router as knowledge_router
 from navis.api.memory_router import router as memory_router
 from navis.api.workspace_router import router as workspace_router
+from navis.developer.agents_router import router as developer_agents_router
+from navis.developer.context_router import router as developer_context_router
+from navis.developer.router import router as developer_router
+from navis.developer.runs_router import router as developer_runs_router
 from navis.execution.router import router as execution_router
 from navis.identity.admin_router import router as identity_admin_router
 from navis.identity.router import router as identity_router
@@ -75,4 +79,30 @@ api_router.include_router(workspace_router)
 api_router.include_router(chat_router)
 api_router.include_router(memory_router)
 api_router.include_router(admin_router)
+# The MACHINE-ACCESS boundary — `/api/v1/developer/*`. Mounted here, on the same
+# router as every human-facing edge, because there must be exactly one
+# application, one OpenAPI schema and one auth chain. Its routes delegate to the
+# handlers above rather than reimplementing them, so the Developer contract that
+# future MCP/SDK/CLI clients consume can never drift from what the web app sees.
+api_router.include_router(developer_router)
+# The Agent LIFECYCLE — `/api/v1/developer/agents`. A separate module rather than
+# more handlers in `developer_router`, because that file's contract is
+# "read-only, by construction" and it is worth keeping literally true. Same
+# application, same prefix, same auth chain; an agent is a `service_accounts` row
+# and nothing here declares a model or a tenant resolver of its own.
+api_router.include_router(developer_agents_router)
+# The Agent EXECUTION LEDGER — `/developer/tasks` and `/developer/runs`. Its own
+# module for the same reason as the agent lifecycle above: `developer_router`'s
+# contract is "nothing here is a write", and these are writes. Reads are gated on
+# `view_observation` (this IS the observability surface), writes on
+# `record_agent_runs`, so a read permission never authorizes a write.
+api_router.include_router(developer_runs_router)
+# TASK-AWARE CONTEXT — `POST /developer/context`. Its own module because
+# `developer_router`'s contract is "every handler is a GET", which is what makes
+# its read-only guarantee checkable at a glance. This is a POST because its
+# input is a task in prose, NOT because it writes: it reads State through
+# `read_only_state`, which never folds, rebuilds or disposes. It calls the same
+# `orchestration.context.build_grounded_context` that `/chat` calls, so an agent
+# and a founder are grounded in one organization rather than two.
+api_router.include_router(developer_context_router)
 

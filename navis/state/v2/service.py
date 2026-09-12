@@ -373,6 +373,57 @@ class StateService:
             await self._dispose(org_id)
         return await self.rebuild_org(org_id)
 
+    async def read_only_state(self, org_id: uuid.UUID) -> OrganizationalState | None:
+        """The stored projection, or None. NEVER writes, NEVER folds, NEVER rebuilds.
+
+        WHY A THIRD READ EXISTS. The other two both mutate on some path, and
+        neither can be talked out of it:
+
+          * `incremental_update` folds new memory and SAVES the result — that is
+            its job, and `/context`, `/brief` and `/knowledge/home` want it;
+          * `get_state` serves cache, but a snapshot that is absent, corrupt or
+            version-drifted sends it through `_dispose` (a DELETE) and
+            `rebuild_org` (a SAVE).
+
+        Both are correct for a human session, which is entitled to spend the
+        organization's compute to see something current. They are wrong for a
+        READ contract that promises a machine caller it changes nothing: an
+        agent asking "what does this organization know?" must not be able to
+        trigger a full fold of the org's memory as a side effect of asking, and
+        must not be able to delete a snapshot by asking at the wrong moment.
+
+        NOT A SECOND STATE READER. It reads through `SnapshotRepository.latest`
+        and `_deserialize` — the same two `get_state` uses, in the same order,
+        with the same version gate — and simply stops where `get_state` would
+        begin to write. StateService remains the sole interface to State.
+
+        RETURNS None RATHER THAN REBUILDING, and the caller must be able to tell
+        that apart from "an organization with nothing in it". None means "there
+        is no usable snapshot at the current projection version" — a real state,
+        and the honest answer to a question that refused to pay for a better one.
+        """
+        wm = await self.snapshots.watermark_only(
+            org_id, projection_version=PROJECTION_VERSION
+        )
+        if wm is not None:
+            cached = _cache_get(org_id, PROJECTION_VERSION, wm[1])
+            if cached is not None:
+                metrics.incr("state.read_only.warm_hit")
+                return cached
+
+        snap = await self.snapshots.latest(org_id, projection_version=PROJECTION_VERSION)
+        state = self._deserialize(snap)
+        if state is not None:
+            _cache_put(state)
+            metrics.incr("state.read_only.hit")
+            return state
+        # Deliberately NOT `_dispose`d, even when the row is present and
+        # unusable. Disposing is a repair, repairs are writes, and a read
+        # contract that quietly repairs is a read contract that lies. The next
+        # `get_state` on the human path will dispose it.
+        metrics.incr("state.read_only.miss")
+        return None
+
     # --- internals -----------------------------------------------------------
 
     def _deserialize(self, snap) -> OrganizationalState | None:

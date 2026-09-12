@@ -475,6 +475,62 @@ async def observation_history(
     ).all()
 
 
+async def list_signals(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    *,
+    signal_type: str | None = None,
+    entity_id: str | None = None,
+    reasoning_version: int | None = None,
+    limit: int = 200,
+) -> Sequence[ReasoningSignalRecord]:
+    """This ORGANIZATION's stored conclusions. The listing read.
+
+    THE READ THAT DID NOT EXIST. `resolve_signals` answers "which conclusion is
+    this id?" and `observations_at` answers "what did these ids look like at
+    watermark W" — both take ids the caller already holds. Nothing could ask
+    "what has this organization concluded?", so Reasoning had real rows and no
+    way to enumerate them, on either the web edge or the Developer boundary.
+
+    IDENTITY ROWS, exactly like `resolve_signals` returns. `confidence`,
+    `severity` and `why` on these rows are the FIRST observation of each
+    conclusion (see `ReasoningSignalRecord`), NOT its current value. A caller
+    reporting them as current rebuilds the very defect the observation table was
+    split out to remove — pair this with `observations_at` at the snapshot you
+    mean. This function deliberately does not do that join itself: which
+    snapshot is "current" is the caller's question, and answering it here would
+    make one read semantics into two.
+
+    `org_id` is a required filter and the first predicate, for the same reason it
+    is on every other read in this module: a signal id is deterministic and
+    travels through Execution/Observation/Learning payloads, so a query keyed on
+    anything else could reach another tenant's row.
+
+    `signal_type` and `entity_id` are FILTERS applied on top of that predicate,
+    never scope. An unrecognised value matches nothing rather than widening.
+
+    Ordered by logical time (newest conclusion first) with the signal id as a
+    total-order tiebreak, so the same stored rows always page identically. NOT
+    ordered by severity: that column is the first observation's, and ranking a
+    list on a value this function documents as stale would be the same mistake
+    one layer up.
+    """
+    stmt = select(ReasoningSignalRecord).where(
+        ReasoningSignalRecord.organization_id == org_id
+    )
+    if signal_type:
+        stmt = stmt.where(ReasoningSignalRecord.signal_type == signal_type)
+    if entity_id:
+        stmt = stmt.where(ReasoningSignalRecord.entity_id == entity_id)
+    if reasoning_version is not None:
+        stmt = stmt.where(ReasoningSignalRecord.reasoning_version == reasoning_version)
+    stmt = stmt.order_by(
+        ReasoningSignalRecord.state_as_of.desc().nulls_last(),
+        ReasoningSignalRecord.signal_id.asc(),
+    ).limit(max(1, int(limit)))
+    return (await db.scalars(stmt)).all()
+
+
 async def resolve_signals(
     db: AsyncSession, org_id: uuid.UUID, signal_ids: Iterable[uuid.UUID | str]
 ) -> dict[str, ReasoningSignalRecord]:

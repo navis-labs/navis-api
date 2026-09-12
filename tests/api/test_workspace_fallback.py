@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from navis.api.workspace_fallback import (
     build_workspace_context,
     connected_source_labels,
+    source_health,
 )
 from navis.identity.models import IntegrationProvider
 
@@ -200,10 +201,31 @@ async def test_a_failing_source_does_not_take_the_whole_fallback_down():
 # ── The honest empty state ─────────────────────────────────────────────
 
 
+def _integration(provider, *, is_active=True, auth_state="ok",
+                 last_attempt_at=None, last_success_at=None, last_failure_reason=None):
+    """An `integrations` ROW, not a bare provider value.
+
+    `source_health` selects whole rows now, because health lives in columns
+    beside the provider. Before 0050 this helper did not need to exist: the
+    query was `select(Integration.provider)` and a provider enum WAS the row.
+    """
+    return SimpleNamespace(
+        provider=provider,
+        is_active=is_active,
+        auth_state=auth_state,
+        last_attempt_at=last_attempt_at,
+        last_success_at=last_success_at,
+        last_failure_reason=last_failure_reason,
+    )
+
+
 async def test_connected_sources_are_named():
     """"Gmail is connected but hasn't synced" is actionable. "Not enough
     memory" is not — it names an internal concept the founder can't act on."""
-    db = _FakeDB([IntegrationProvider.GMAIL, IntegrationProvider.GOOGLE_CALENDAR])
+    db = _FakeDB([
+        _integration(IntegrationProvider.GMAIL),
+        _integration(IntegrationProvider.GOOGLE_CALENDAR),
+    ])
     assert await connected_source_labels(db, ORG) == ["Gmail", "Google Calendar"]
 
 
@@ -213,5 +235,51 @@ async def test_no_connected_sources_returns_empty():
 
 
 async def test_duplicate_provider_rows_are_deduped():
-    db = _FakeDB([IntegrationProvider.GMAIL, IntegrationProvider.GMAIL])
+    db = _FakeDB([
+        _integration(IntegrationProvider.GMAIL),
+        _integration(IntegrationProvider.GMAIL),
+    ])
     assert await connected_source_labels(db, ORG) == ["Gmail"]
+
+
+# ── Source health: intent, auth and ingestion are three different facts ──
+
+
+async def test_a_disconnected_source_is_absent_from_labels_but_present_in_health():
+    """"You turned Slack off" and "you never connected Slack" are different
+    explanations for the same silence, and only the row can tell them apart."""
+    db = _FakeDB([_integration(IntegrationProvider.SLACK, is_active=False)])
+    assert await connected_source_labels(db, ORG) == []
+
+    db = _FakeDB([_integration(IntegrationProvider.SLACK, is_active=False)])
+    health = await source_health(db, ORG)
+    assert [(h.source, h.connected) for h in health] == [("slack", False)]
+
+
+async def test_a_revoked_grant_is_still_connected_but_not_healthy():
+    """THE BUG 0050 CLOSES. `is_active` is the user's intent and stays true when
+    Google rejects a refresh token — so a source that ingests nothing keeps
+    reporting itself as connected. Health has to come from `auth_state`."""
+    rows = [_integration(
+        IntegrationProvider.GMAIL,
+        auth_state="reconsent_required",
+        last_failure_reason="google refresh rejected (invalid_grant)",
+    )]
+    # Still named as connected: the user does want Gmail. That is not a bug.
+    assert await connected_source_labels(_FakeDB(list(rows)), ORG) == ["Gmail"]
+
+    (health,) = await source_health(_FakeDB(list(rows)), ORG)
+    assert health.connected is True
+    assert health.auth_state == "reconsent_required"
+    assert "invalid_grant" in health.last_failure_reason
+
+
+async def test_health_does_not_dedupe_because_each_row_is_a_credential():
+    """Two Google accounts are two grants, and one can die while the other
+    works. Collapsing them by label would hide the broken one."""
+    db = _FakeDB([
+        _integration(IntegrationProvider.GMAIL),
+        _integration(IntegrationProvider.GMAIL, auth_state="reconsent_required"),
+    ])
+    health = await source_health(db, ORG)
+    assert [h.auth_state for h in health] == ["ok", "reconsent_required"]

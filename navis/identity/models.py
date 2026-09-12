@@ -7,9 +7,11 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum as SAEnum,
     ForeignKey,
+    Index,
     String,
     UniqueConstraint,
 )
@@ -129,15 +131,68 @@ class Session(UUIDPrimaryKey, Timestamped, Base):
     user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
 
+class IntegrationAuthState(str, enum.Enum):
+    """AUTHENTICATION HEALTH — deliberately NOT `is_active`.
+
+    The two answer different questions and must never be merged again:
+
+        is_active   the USER'S INTENT. True from the moment somebody clicks
+                    Connect until they click Disconnect. Says nothing about
+                    whether the credential still works.
+
+        auth_state  whether the stored grant CAN STILL BE USED. Moved only by
+                    the sync path and the OAuth callback, never by a person.
+
+    A source can perfectly well be `is_active=True, auth_state=reconsent_required`
+    — the user still wants Gmail connected, Google just rejected the refresh
+    token. That is the exact state the old schema could not express, which is why
+    a dead grant was retried forever and reported as connected.
+
+    The vocabulary is not new. `RECONSENT_REQUIRED` is named after
+    `navis.signals.google.oauth.ReconsentRequired` (raised on `invalid_grant`)
+    and `SlackReconsentRequired`; `REVOKED` after Slack's `tokens_revoked`.
+    """
+
+    #: The grant works, or has not yet been shown not to.
+    OK = "ok"
+    #: The refresh token was rejected — revoked, expired, or rotated out. The
+    #: user must re-authorise. Terminal until they do: nothing but a new OAuth
+    #: grant clears it, which is why the dispatch loop stops retrying it.
+    RECONSENT_REQUIRED = "reconsent_required"
+    #: The provider told us the token is gone (Slack `tokens_revoked`). Same
+    #: remedy as re-consent; kept distinct because the provider SAID so rather
+    #: than us inferring it from a refusal, and an operator reading the row
+    #: should be able to tell a reported revocation from a deduced one.
+    REVOKED = "revoked"
+
+
+#: The closed vocabulary, as the CHECK constraint spells it. Sorted so Alembic's
+#: autogenerate does not see a difference against `0050_integration_health`.
+_AUTH_STATE_VALUES = ", ".join(f"'{s.value}'" for s in sorted(IntegrationAuthState, key=lambda s: s.value))
+
+
 class Integration(UUIDPrimaryKey, Timestamped, Base):
     """An OAuth-connected signal source for an org (Gmail, Slack, Calendar...).
 
     Tokens are stored encrypted-at-rest in production; here we keep the shape.
+
+    THREE INDEPENDENT FACTS, and conflating any two of them is the bug 0050
+    exists to fix:
+
+        is_active                      does the user want this connected?
+        auth_state                     does the credential still work?
+        last_attempt_at/last_success_at  is data actually arriving?
+
+    Read them together to answer "is this source healthy". Reading `is_active`
+    alone answers only whether somebody once clicked Connect.
     """
 
     __tablename__ = "integrations"
     __table_args__ = (
         UniqueConstraint("organization_id", "provider", "external_account", name="uq_org_provider_account"),
+        CheckConstraint(f"auth_state IN ({_AUTH_STATE_VALUES})", name="ck_integrations_auth_state"),
+        # The dispatch gate's predicate: active rows that are not known-dead.
+        Index("ix_integrations_active_auth_state", "is_active", "auth_state"),
     )
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
@@ -155,6 +210,28 @@ class Integration(UUIDPrimaryKey, Timestamped, Base):
     refresh_token: Mapped[str | None] = mapped_column(String, nullable=True)
     token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     scopes: Mapped[str | None] = mapped_column(String, nullable=True)
+    #: THE USER'S INTENT, and nothing else. Set True on connect, False on
+    #: disconnect. An auth failure must NOT move this — see `auth_state`.
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: Authentication health. See `IntegrationAuthState`.
+    auth_state: Mapped[str] = mapped_column(
+        String(24), nullable=False, default=IntegrationAuthState.OK.value, server_default="ok"
+    )
+    #: When a sync was last TRIED. Distinguishes "healthy and quiet" from "not
+    #: being reached at all" — a source the scheduler has stopped visiting looks
+    #: identical to a working one if you only record successes.
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: When data last actually ARRIVED. Staleness is computed from this and from
+    #: nothing else. NULL means it has never succeeded, which is a real state for
+    #: a freshly-connected source and must not be forged into a timestamp.
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: What went wrong last, in words an operator can act on. Truncated and
+    #: scrubbed by the writer — a provider error message is a classic place for a
+    #: token or a credentialled URL to appear.
+    last_failure_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     # Provider-specific sync cursors (Gmail historyId, Slack cursor, etc.)
+    #
+    # HEALTH DOES NOT LIVE HERE, deliberately. This blob is advisory-locked per
+    # integration for cursor read-modify-write (`navis/signals/locking.py`), and
+    # health is written on the failure path where the cursor does NOT move.
     sync_state: Mapped[dict] = mapped_column(JSONB, default=dict)
