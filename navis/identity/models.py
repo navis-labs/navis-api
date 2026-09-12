@@ -32,6 +32,47 @@ class Role(str, enum.Enum):
     ADMIN = "admin"
 
 
+class ApplicationRole(str, enum.Enum):
+    """What a member may do on the APPLICATION surface — organizational
+    intelligence, decisions, actions, member administration.
+
+    Says nothing about Developer. A member with `application_role=ADMIN` and
+    `developer_role=None` administers the Application product and cannot
+    register an agent or mint a credential.
+    """
+
+    OWNER = "owner"
+    ADMIN = "admin"
+    MEMBER = "member"
+    VIEWER = "viewer"
+
+
+class DeveloperRole(str, enum.Enum):
+    """What a member may do on the DEVELOPER surface — agents, credentials,
+    MCP/SDK access, runs, telemetry.
+
+    Says nothing about Application. There is no `member` here and no
+    `developer` in `ApplicationRole`: the two are not one ladder with different
+    labels, and a shared vocabulary would invite the coupling the surface split
+    exists to remove.
+    """
+
+    OWNER = "owner"
+    ADMIN = "admin"
+    DEVELOPER = "developer"
+    VIEWER = "viewer"
+
+
+#: Closed vocabularies as the CHECK constraints spell them. Sorted so Alembic's
+#: autogenerate sees no difference against `0051_surface_rbac_columns`.
+_APPLICATION_ROLE_VALUES = ", ".join(
+    f"'{r.value}'" for r in sorted(ApplicationRole, key=lambda r: r.value)
+)
+_DEVELOPER_ROLE_VALUES = ", ".join(
+    f"'{r.value}'" for r in sorted(DeveloperRole, key=lambda r: r.value)
+)
+
+
 class IntegrationProvider(str, enum.Enum):
     GMAIL = "gmail"
     GOOGLE_CALENDAR = "google_calendar"
@@ -41,12 +82,49 @@ class IntegrationProvider(str, enum.Enum):
     DRIVE = "drive"
 
 
+class OrganizationKind(str, enum.Enum):
+    """What an organization IS — a shared company, or one person's own space.
+
+    A TENANT EITHER WAY. Both kinds are ordinary `organizations` rows and are
+    isolated by the same `organization_id` predicate; this does not introduce a
+    second tenancy system, and no query gains a branch because of it.
+
+    What differs is product meaning, and it is deliberately narrow:
+
+        company   the default and, today, every existing row. Multi-member,
+                  invitable, SSO/SCIM-eligible, may enable Application and/or
+                  Developer.
+
+        personal  one person's own space. Exactly one member, not invitable,
+                  not SSO-eligible, Developer-oriented. Nothing is classified
+                  this way yet — see 0051 for why signup's auto-created orgs
+                  are NOT retroactively personal.
+    """
+
+    COMPANY = "company"
+    PERSONAL = "personal"
+
+
+#: The closed vocabulary as the CHECK constraint spells it. Sorted so Alembic's
+#: autogenerate sees no difference against `0051_surface_rbac_columns`.
+_ORG_KIND_VALUES = ", ".join(f"'{k.value}'" for k in sorted(OrganizationKind, key=lambda k: k.value))
+
+
 class Organization(UUIDPrimaryKey, Timestamped, Base):
     __tablename__ = "organizations"
+    __table_args__ = (
+        CheckConstraint(f"kind IN ({_ORG_KIND_VALUES})", name="ck_organizations_kind"),
+    )
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     slug: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: NOT NULL with a server default, so every existing row and every caller
+    #: that does not mention `kind` continues to produce a company — which is
+    #: what they all are today.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=OrganizationKind.COMPANY.value, server_default="company"
+    )
 
     memberships: Mapped[list["Membership"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
@@ -90,7 +168,17 @@ class Membership(UUIDPrimaryKey, Timestamped, Base):
     """A user's seat in an org, with a role. The tenancy join row."""
 
     __tablename__ = "memberships"
-    __table_args__ = (UniqueConstraint("user_id", "organization_id", name="uq_user_org"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "organization_id", name="uq_user_org"),
+        CheckConstraint(
+            f"application_role IS NULL OR application_role IN ({_APPLICATION_ROLE_VALUES})",
+            name="ck_memberships_application_role",
+        ),
+        CheckConstraint(
+            f"developer_role IS NULL OR developer_role IN ({_DEVELOPER_ROLE_VALUES})",
+            name="ck_memberships_developer_role",
+        ),
+    )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
@@ -112,6 +200,20 @@ class Membership(UUIDPrimaryKey, Timestamped, Base):
         nullable=False,
         default=Role.FOUNDER,
     )
+
+    #: PER-SURFACE AUTHORIZATION. NOT YET READ BY ANYTHING.
+    #:
+    #: `role` above remains the sole authorization input until the dual-read
+    #: phase; these two are storage only, and every existing row has them NULL.
+    #: When they do become authoritative, NULL keeps its meaning literally —
+    #: "no access to that surface" — which is what an Application-only member
+    #: looks like on the Developer side and vice versa.
+    #:
+    #: They are deliberately NOT derived from `role`. `founder` today implies
+    #: both surfaces, and writing that inference into a column would make the
+    #: coupling permanent in data rather than removable in code.
+    application_role: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    developer_role: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="memberships")
     organization: Mapped["Organization"] = relationship(back_populates="memberships")
