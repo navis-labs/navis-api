@@ -19,21 +19,40 @@
 #   docker compose logs -f worker
 
 services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: navis
+      POSTGRES_PASSWORD: navis
+      POSTGRES_DB: navis
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U navis"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    ports:
+      - "5432:5432"
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
     # Broker (db 2) + results (db 3) + cache/events (db 0) live here. AOF so a
     # restart does not drop queued tasks that acks_late has not yet confirmed.
-    command: ["redis-server", "--appendonly", "yes"]
+    # Listens on 6380 (not Redis's default 6379) so container-internal and
+    # host-facing addresses match — one port everywhere, no translation.
+    command: ["redis-server", "--port", "6380", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-p", "6380", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5
     ports:
-      - "6380:6379"
+      - "6380:6380"
 
   api:
     build: .
@@ -41,10 +60,12 @@ services:
     env_file: [.env]
     environment:
       # Compose networking: override the host-facing values from .env.
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/2
-      CELERY_RESULT_BACKEND: redis://redis:6379/3
+      DATABASE_URL: postgresql://navis:navis@db:5432/navis
+      REDIS_URL: redis://redis:6380/0
+      CELERY_BROKER_URL: redis://redis:6380/2
+      CELERY_RESULT_BACKEND: redis://redis:6380/3
     depends_on:
+      db: {condition: service_healthy}
       redis: {condition: service_healthy}
     ports:
       - "8000:8000"
@@ -61,10 +82,12 @@ services:
     restart: unless-stopped
     env_file: [.env]
     environment:
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/2
-      CELERY_RESULT_BACKEND: redis://redis:6379/3
+      DATABASE_URL: postgresql://navis:navis@db:5432/navis
+      REDIS_URL: redis://redis:6380/0
+      CELERY_BROKER_URL: redis://redis:6380/2
+      CELERY_RESULT_BACKEND: redis://redis:6380/3
     depends_on:
+      db: {condition: service_healthy}
       redis: {condition: service_healthy}
     # --pool=prefork is REQUIRED. `run_async` keeps ONE event loop per process for
     # the lifetime of the worker (asyncpg pools bind to the loop that created
@@ -91,10 +114,12 @@ services:
     restart: unless-stopped
     env_file: [.env]
     environment:
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/2
-      CELERY_RESULT_BACKEND: redis://redis:6379/3
+      DATABASE_URL: postgresql://navis:navis@db:5432/navis
+      REDIS_URL: redis://redis:6380/0
+      CELERY_BROKER_URL: redis://redis:6380/2
+      CELERY_RESULT_BACKEND: redis://redis:6380/3
     depends_on:
+      db: {condition: service_healthy}
       redis: {condition: service_healthy}
     # EXACTLY ONE beat instance, ever. Two schedulers double-fire every task;
     # the relays are idempotent so it would not corrupt data, but it doubles
@@ -110,5 +135,6 @@ services:
       - beat-schedule:/tmp
 
 volumes:
+  db-data:
   redis-data:
   beat-schedule:
