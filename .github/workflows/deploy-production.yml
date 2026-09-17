@@ -1,0 +1,39 @@
+name: Deploy production
+
+# main is production. Code reaches it only through a development -> main pull
+# request, so anything deployed here has already run in staging.
+#
+# The human approval gate is NOT in this file — it is the "Required reviewers"
+# protection rule on the `production` GitHub Environment. Keeping it there means
+# it cannot be bypassed by editing a workflow in a pull request.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # rollback: run this on a previous commit
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # Re-run on the merge commit. The merge result is not the same code as either
+  # side of the PR, and this is the last gate before customer traffic.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    uses: ./.github/workflows/deploy.yml
+    secrets: inherit
+    with:
+      environment: production
+      # ---- EDIT THESE to match your AWS account ----
+      aws-region: ap-south-1
+      ecr-repository: navis-api-prod
+      ecs-cluster: navis-prod
+      api-service: navis-api-prod
+      worker-service: navis-worker-prod
+      beat-service: navis-beat-prod
+      migration-subnets: subnet-REPLACE_ME_A,subnet-REPLACE_ME_B
+      migration-security-groups: sg-REPLACE_ME
