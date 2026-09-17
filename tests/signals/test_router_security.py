@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 
 from navis.identity.models import IntegrationProvider
+from navis.signals import oauth_state as OS
 from navis.signals import router as R
 
 
@@ -32,7 +33,12 @@ class FakeRedis:
 # ---- P1: OAuth state (random, server-side, single-use, attribution from store only) ----
 
 async def test_oauth_state_is_random_and_resolves_attribution(monkeypatch):
-    monkeypatch.setattr(R, "redis_client", FakeRedis())
+    # Patch the module that OWNS the implementation. The helpers moved to
+    # navis.signals.oauth_state so the Microsoft connector could share the
+    # exact CSRF primitive rather than grow a second copy of it; the router
+    # re-exports them under the original names, which is why the calls below
+    # still go through `R`.
+    monkeypatch.setattr(OS, "redis_client", FakeRedis())
     org, user = uuid.uuid4(), uuid.uuid4()
     state = await R._create_oauth_state(org_id=org, user_id=user, provider="gmail")
     assert state and ":" not in state and len(state) >= 32   # opaque, not org:user
@@ -42,7 +48,7 @@ async def test_oauth_state_is_random_and_resolves_attribution(monkeypatch):
 
 
 async def test_oauth_state_is_single_use(monkeypatch):
-    monkeypatch.setattr(R, "redis_client", FakeRedis())
+    monkeypatch.setattr(OS, "redis_client", FakeRedis())
     state = await R._create_oauth_state(org_id=uuid.uuid4(), user_id=uuid.uuid4(), provider="gmail")
     await R._consume_oauth_state(state)                       # first use ok
     with pytest.raises(HTTPException) as exc:                 # replay rejected
@@ -51,7 +57,7 @@ async def test_oauth_state_is_single_use(monkeypatch):
 
 
 async def test_oauth_state_invalid_and_missing_rejected(monkeypatch):
-    monkeypatch.setattr(R, "redis_client", FakeRedis())
+    monkeypatch.setattr(OS, "redis_client", FakeRedis())
     for bad in (None, "", "never-issued-state"):
         with pytest.raises(HTTPException) as exc:
             await R._consume_oauth_state(bad)

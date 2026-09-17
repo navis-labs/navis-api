@@ -13,9 +13,11 @@ import uuid
 from navis.identity.authz import Principal, get_principal
 from navis.identity.dependencies import CurrentContext, get_current_context
 from navis.identity.google_auth import GoogleAuthError, GoogleAuthService
+from navis.identity.microsoft_auth import MicrosoftAuthError, MicrosoftAuthService
 from navis.identity.models import Membership, Organization, User
 from navis.identity.schemas import (
     GoogleAuthRequest,
+    MicrosoftAuthRequest,
     LoginRequest,
     MeOut,
     OrganizationOut,
@@ -151,6 +153,97 @@ async def google_login(
     # Emit ORG_CREATED for brand-new users so the orchestration layer bootstraps
     # lifecycle/onboarding/entitlements. Emit AFTER commit — the org row must be
     # durable before subscribers try to read it (commit-before-publish pattern).
+    if is_new_user and org_id is not None:
+        await event_bus.publish(
+            DomainEvent(
+                type=EventType.ORG_CREATED,
+                org_id=org_id,
+                source="identity",
+                payload={"organization_id": str(org_id), "user_id": str(user.id)},
+            )
+        )
+
+    return TokenPair(
+        access_token=access,
+        refresh_token=refresh,
+        is_new_user=is_new_user,
+        onboarding_completed=onboarding_completed,
+    )
+
+
+@router.post("/microsoft", response_model=TokenPair)
+async def microsoft_login(
+    data: MicrosoftAuthRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+) -> TokenPair:
+    """Microsoft (Entra ID) SSO login — authorization code only.
+
+    The exact mirror of `POST /auth/google`: same TokenPair, same routing
+    flags, same throttle gate. Two things differ, and both are deliberate.
+
+    IDENTITY SCOPES ONLY (`openid profile email offline_access User.Read`).
+    The connector's mailbox consent is a separate app-registration flow behind
+    a separate feature flag — see navis.signals.microsoft_router. Signing in
+    and handing over an inbox are two decisions a founder makes at two
+    different moments, and merging them would ask for mailbox access at the
+    login screen.
+
+    ACCOUNT LINKING IS GATED ON VERIFICATION. Entra's `email` claim is
+    attacker-controlled for personal Microsoft accounts, so
+    `IdentityService.microsoft_signin` links to an existing account only when
+    Entra asserts domain ownership via `xms_edov`. See that method for the full
+    reasoning.
+
+    Frontend routing logic (unchanged from the Google route):
+      is_new_user=True or onboarding_completed=False  ->  /onboarding
+      onboarding_completed=True                        ->  /dashboard
+    """
+    throttle = LoginThrottle(redis_client)
+    ip = _client_ip(request)
+
+    # SSO gate: the email is unknown until Entra verifies the credential, so
+    # the IP counter is the only thing checkable up front. Same generic 401 the
+    # password path uses — no enumeration, no lock-state leak.
+    if await throttle.is_ip_locked(ip):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, _GENERIC_AUTH_ERROR)
+
+    ms_svc = MicrosoftAuthService()
+    if not ms_svc.configured:
+        # A specific 503 rather than a generic 401: this is our misconfiguration,
+        # not a bad credential, and telling the user "sign-in failed" would send
+        # them retrying something that cannot work.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Microsoft sign-in is not configured on this deployment.",
+        )
+
+    try:
+        identity = await ms_svc.verify_code(data.code)
+    except MicrosoftAuthError as exc:
+        # Bogus/expired code or Entra unreachable — count it as a failure so a
+        # flood cannot burn Entra's token-endpoint quota or our CPU.
+        await throttle.record_ip_failure(ip)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
+
+    svc = IdentityService(db)
+    try:
+        user, org_id, is_new_user, onboarding_completed = await svc.microsoft_signin(
+            email=identity.email,
+            microsoft_sub=identity.microsoft_sub,
+            tenant_id=identity.tenant_id,
+            full_name=identity.full_name,
+            email_verified=identity.email_verified,
+        )
+    except AuthError as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
+
+    access, refresh = await svc.issue_tokens(user, org_id)
+    await db.commit()
+
+    # Emit ORG_CREATED for brand-new users so orchestration bootstraps
+    # lifecycle/onboarding/entitlements. AFTER commit — the org row must be
+    # durable before subscribers read it (commit-before-publish).
     if is_new_user and org_id is not None:
         await event_bus.publish(
             DomainEvent(

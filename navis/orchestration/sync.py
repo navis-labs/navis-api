@@ -30,6 +30,14 @@ from navis.signals.drive import DriveClient, DriveConnector
 from navis.signals.gmail import GmailClient, GmailConnector
 from navis.signals.google.oauth import TokenManager
 from navis.signals.google.transport import GoogleTransport
+from navis.signals.microsoft.oauth import TokenManager as MicrosoftTokenManager
+from navis.signals.microsoft.transport import GraphTransport
+from navis.signals.onedrive import OneDriveClient, OneDriveConnector
+from navis.signals.outlook import OutlookClient, OutlookConnector
+from navis.signals.outlook_calendar import (
+    OutlookCalendarClient,
+    OutlookCalendarConnector,
+)
 from navis.signals.locking import integration_advisory_lock
 from navis.signals.sync import SignalSyncService
 
@@ -48,11 +56,49 @@ def _drive_client(t: GoogleTransport) -> Any:
     return DriveClient(t)
 
 
+def _outlook_client(t: GraphTransport) -> Any:
+    return OutlookClient(t)
+
+
+def _outlook_calendar_client(t: GraphTransport) -> Any:
+    return OutlookCalendarClient(t)
+
+
+def _onedrive_client(t: GraphTransport) -> Any:
+    return OneDriveClient(t)
+
+
 _REGISTRY: dict[IntegrationProvider, tuple[WorkspaceConnector, Any]] = {
     IntegrationProvider.GMAIL: (GmailConnector(), _gmail_client),
     IntegrationProvider.GOOGLE_CALENDAR: (CalendarConnector(), _calendar_client),
     IntegrationProvider.DRIVE: (DriveConnector(), _drive_client),
+    # Microsoft 365. TEAMS is deliberately absent — no connector exists, and an
+    # unmapped provider simply cannot be synced (see `_capability_for`), which
+    # is the fail-closed direction.
+    IntegrationProvider.OUTLOOK: (OutlookConnector(), _outlook_client),
+    IntegrationProvider.OUTLOOK_CALENDAR: (
+        OutlookCalendarConnector(),
+        _outlook_calendar_client,
+    ),
+    IntegrationProvider.ONEDRIVE: (OneDriveConnector(), _onedrive_client),
 }
+
+# Which vendor's transport + token lifecycle a provider needs. Separate from
+# `_REGISTRY` because that maps a provider to the code that reads its DATA,
+# while this maps it to the code that authenticates the call — and the second
+# is per-SUITE where the first is per-resource.
+#
+# The two token managers are NOT interchangeable: Entra rotates refresh tokens
+# on every refresh and Google does not, so pointing a Microsoft row at the
+# Google manager would keep using a token Microsoft has already invalidated and
+# the integration would die silently ~90 days later. Hence an explicit map
+# rather than a default with an override.
+_MICROSOFT_PROVIDERS: frozenset[IntegrationProvider] = frozenset({
+    IntegrationProvider.OUTLOOK,
+    IntegrationProvider.OUTLOOK_CALENDAR,
+    IntegrationProvider.ONEDRIVE,
+    IntegrationProvider.TEAMS,
+})
 
 # Which entitlement a connector's ingestion consumes (T-14). Separate from
 # `_REGISTRY` on purpose: that maps a provider to the code that talks to it, this
@@ -71,6 +117,13 @@ _CAPABILITY: dict[IntegrationProvider, Capability] = {
     IntegrationProvider.GOOGLE_MEET: Capability.CALENDAR,
     IntegrationProvider.DRIVE: Capability.DRIVE,
     IntegrationProvider.SLACK: Capability.SLACK,
+    # Each Microsoft source consumes its OWN entitlement rather than sharing
+    # its Google counterpart's, because an org can be licensed for Gmail and
+    # not for Outlook. TEAMS is absent on purpose: it has no connector, and a
+    # provider missing from this map cannot be synced at all.
+    IntegrationProvider.OUTLOOK: Capability.OUTLOOK,
+    IntegrationProvider.OUTLOOK_CALENDAR: Capability.OUTLOOK_CALENDAR,
+    IntegrationProvider.ONEDRIVE: Capability.ONEDRIVE,
 }
 
 
@@ -78,15 +131,34 @@ def _capability_for(provider: IntegrationProvider) -> Capability | None:
     return _CAPABILITY.get(provider)
 
 
+def _transport_for(integration: Integration):
+    """Build the (transport, token_manager) pair this integration authenticates with.
+
+    Google keeps the exact pair it always had; Microsoft rows get the Graph
+    transport and the Entra token manager. Both managers expose the same
+    surface (`token_provider()`, `invalidate()`, `last_token`), which is what
+    lets `sync_integration` below stay vendor-agnostic — including the block
+    that persists a rotated refresh token.
+    """
+    if integration.provider in _MICROSOFT_PROVIDERS:
+        token_manager = MicrosoftTokenManager(integration)
+        transport = GraphTransport(
+            token_manager.token_provider(), on_auth_failure=token_manager.invalidate
+        )
+        return transport, token_manager
+    token_manager = TokenManager(integration)
+    transport = GoogleTransport(
+        token_manager.token_provider(), on_auth_failure=token_manager.invalidate
+    )
+    return transport, token_manager
+
+
 def _build_client(integration: Integration):
     entry = _REGISTRY.get(integration.provider)
     if entry is None:
         return None, None, None
     connector, client_factory = entry
-    token_manager = TokenManager(integration)
-    transport = GoogleTransport(
-        token_manager.token_provider(), on_auth_failure=token_manager.invalidate
-    )
+    transport, token_manager = _transport_for(integration)
     client = client_factory(transport)
     return connector, client, (transport, token_manager)
 

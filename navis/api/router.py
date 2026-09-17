@@ -45,6 +45,7 @@ from navis.observation.router import router as observation_router
 from navis.observation.webhooks.router import router as observation_webhooks_router
 from navis.organization.router import router as organization_router
 from navis.signals.read_router import router as signals_read_router
+from navis.signals.microsoft_router import router as signals_microsoft_router
 from navis.signals.router import router as signals_router
 
 api_router = APIRouter()
@@ -53,6 +54,7 @@ api_router.include_router(identity_admin_router)
 api_router.include_router(scim_router)
 api_router.include_router(organization_router)
 api_router.include_router(signals_router)
+api_router.include_router(signals_microsoft_router)
 api_router.include_router(signals_read_router)
 api_router.include_router(identity_resolution_router)
 api_router.include_router(brief_router)

@@ -18,13 +18,16 @@ from navis.identity.tokens import TokenRevocationService
 from navis.organization.contract import OnboardingStage, stage_index
 from navis.organization.repository import OrganizationRepository
 from navis.platform.config import settings
-from navis.platform.monitoring import get_request_id
+from navis.platform.monitoring import get_logger, get_request_id
 from navis.platform.security import (
     create_access_token,
     create_refresh_token,
     hash_password,
     verify_password,
 )
+
+
+logger = get_logger("identity.service")
 
 
 class AuthError(Exception):
@@ -181,6 +184,157 @@ class IdentityService:
             actor_id=user.id,
             target_id=str(user.id),
             metadata={"method": "google", "request_id": get_request_id()},
+        )
+
+        return user, org_id, is_new_user, onboarding_completed
+
+    async def microsoft_signin(
+        self,
+        *,
+        email: str,
+        microsoft_sub: str,
+        tenant_id: str | None,
+        full_name: str | None,
+        email_verified: bool,
+    ) -> tuple[User, uuid.UUID | None, bool, bool]:
+        """Find-or-create a user identified by their Microsoft (Entra) account.
+
+        Returns the same 4-tuple as `google_signin`:
+          (user, org_id, is_new_user, onboarding_completed)
+
+        Behavior:
+          • Existing user with microsoft_sub match  -> fast path, no writes.
+          • Existing user with email match          -> link, but ONLY when the
+            IdP asserts the email is verified (see below).
+          • Unknown email                           -> create User + Org + Membership.
+
+        ── The linking rule, and why it is stricter than Google's ──────────
+
+        `google_signin` links on an email match unconditionally, which is safe
+        because Google only ever asserts an email it verified. Entra does not:
+        for a PERSONAL Microsoft account the holder can set the `email` claim
+        to any address they choose, including one belonging to somebody else's
+        company. Linking on that would let anyone create a free Microsoft
+        account carrying a founder's work address, sign in, and land inside
+        that founder's existing Navis account with all its memory, decisions
+        and connected mailboxes. That is account takeover, not a convenience
+        bug, and it is the single reason this method exists rather than
+        `google_signin` being generalised.
+
+        So an unverified identity may create a NEW account, but may never
+        attach itself to an EXISTING one.
+
+        ── Why an unverified collision REFUSES instead of branching off ────
+
+        The seam note on the frontend says "create a separate account and let
+        the user link deliberately from within the product". That is the right
+        intent and it is not reachable here: `users.email` is UNIQUE, so a
+        second account with the same address cannot exist. Rather than silently
+        weakening the constraint — or worse, linking anyway — the sign-in is
+        refused with an instruction the user can act on. A founder who is told
+        to sign in the way they always have loses ten seconds; a founder whose
+        account was taken over loses the company's operating memory.
+        """
+        email = normalize_email(email)
+        is_new_user = False
+
+        # 1. Look up by microsoft_sub first — the immutable Entra identifier,
+        #    and the only lookup that is safe regardless of email verification.
+        user = await self.db.scalar(
+            select(User).where(User.microsoft_sub == microsoft_sub)
+        )
+
+        # 2. Fall back to email, which is where the trust question bites.
+        if user is None:
+            existing_by_email = await self.db.scalar(
+                select(User).where(User.email == email)
+            )
+            if existing_by_email is not None:
+                if not email_verified:
+                    logger.warning(
+                        "refused microsoft link on unverified email sub=%s tenant=%s",
+                        microsoft_sub, tenant_id,
+                    )
+                    raise AuthError(
+                        "This email is already registered. Microsoft did not verify "
+                        "that you own it, so we cannot connect the two automatically. "
+                        "Sign in the way you did before, then link Microsoft from "
+                        "your account settings."
+                    )
+                user = existing_by_email
+
+        if user is not None:
+            # Backfill so future lookups hit the fast path.
+            if user.microsoft_sub != microsoft_sub:
+                user.microsoft_sub = microsoft_sub
+            if tenant_id and user.microsoft_tid != tenant_id:
+                user.microsoft_tid = tenant_id
+            if not user.is_active:
+                raise AuthError("account disabled")
+            if not user.full_name and full_name:
+                user.full_name = full_name
+            await self.db.flush()
+        else:
+            # Brand-new user — create User + Org + Membership atomically.
+            is_new_user = True
+            try:
+                async with self.db.begin_nested():  # SAVEPOINT: rolls back only on conflict
+                    user = User(
+                        email=email,
+                        full_name=full_name,
+                        microsoft_sub=microsoft_sub,
+                        microsoft_tid=tenant_id,
+                        # Only claim verification when Entra actually asserted
+                        # it. A personal account that set its own email arrives
+                        # here unverified, and marking it verified would let it
+                        # satisfy any future check that trusts this flag.
+                        is_verified=email_verified,
+                        is_active=True,
+                    )
+                    self.db.add(user)
+                    await self.db.flush()
+            except IntegrityError:
+                raise AuthError("email already registered")
+
+            org_name = full_name or email.split("@")[0]
+            org = await OrgLifecycleSeam(self.db).create(name=org_name)
+            await self.db.flush()
+
+            membership = Membership(user_id=user.id, organization_id=org.id, role=Role.FOUNDER)
+            self.db.add(membership)
+            await self.db.flush()
+
+            await AuditService(self.db).record(
+                AuditAction.SIGNUP,
+                org_id=org.id,
+                actor_id=user.id,
+                target_id=str(org.id),
+                metadata={"method": "microsoft_sso"},
+            )
+
+        membership = await self.primary_membership(user)
+        org_id = membership.organization_id if membership else None
+
+        onboarding_completed = False
+        if org_id is not None:
+            onboarding_row = await OrganizationRepository(self.db).get_onboarding(org_id)
+            if onboarding_row is not None:
+                current_stage = OnboardingStage(onboarding_row.stage)
+                onboarding_completed = (
+                    stage_index(current_stage) >= stage_index(OnboardingStage.PROFILE_COMPLETE)
+                )
+
+        await AuditService(self.db).record(
+            AuditAction.SSO_LOGIN,
+            org_id=org_id,
+            actor_id=user.id,
+            target_id=str(user.id),
+            metadata={
+                "method": "microsoft",
+                "tenant_id": tenant_id,
+                "email_verified": email_verified,
+                "request_id": get_request_id(),
+            },
         )
 
         return user, org_id, is_new_user, onboarding_completed

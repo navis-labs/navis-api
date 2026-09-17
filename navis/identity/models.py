@@ -37,6 +37,27 @@ class IntegrationProvider(str, enum.Enum):
     SLACK = "slack"
     NOTION = "notion"
     DRIVE = "drive"
+    # ---- Microsoft 365 (Entra) family ----
+    # One row per RESOURCE, not one per grant, exactly as the Google family
+    # works: a single Entra consent covers all of them, but the sync
+    # orchestrator dispatches per `Integration.provider` and the frontend's
+    # Connections page matches cards on the provider string. Aliasing
+    # outlook_calendar back onto the outlook row would make Calendar report
+    # the mailbox's sync timestamp as its own.
+    #
+    # These values are members of a NATIVE PostgreSQL enum — adding one needs
+    # `ALTER TYPE ... ADD VALUE` (migration 0046), which is why they must be
+    # deployed a release ahead of any code that writes them.
+    #
+    # TEAMS exists here so the enum, the capability vocabulary and the
+    # entitlement wire format are complete and stable. There is deliberately
+    # no Teams connector yet: reading channel messages needs Microsoft's
+    # Protected APIs approval. An unmapped provider cannot be synced (see
+    # `_CAPABILITY` in orchestration/sync.py), so the member is inert.
+    OUTLOOK = "outlook"
+    OUTLOOK_CALENDAR = "outlook_calendar"
+    ONEDRIVE = "onedrive"
+    TEAMS = "teams"
 
 
 class Organization(UUIDPrimaryKey, Timestamped, Base):
@@ -64,6 +85,15 @@ class User(UUIDPrimaryKey, Timestamped, Base):
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     # Set when the user signs in with Google instead of a password.
     google_sub: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    # Set when the user signs in with Microsoft (Entra) instead of a password.
+    # `microsoft_sub` is the `oid` claim — stable per user and, unlike the email,
+    # not something the account holder can change.
+    microsoft_sub: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    # The Entra tenant the user authenticated against (`tid`). Kept because it
+    # is the difference between a work/school account and a personal Microsoft
+    # account, and only the former can have a domain anybody verified. Not
+    # indexed: it is read alongside an already-resolved user, never searched.
+    microsoft_tid: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Access tokens issued (iat) before this instant are rejected — the bulk-revoke
     # lever for deactivation and membership removal. NULL = no bulk revocation.
     tokens_valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

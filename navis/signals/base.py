@@ -44,6 +44,19 @@ class SignalSource(str, enum.Enum):
     SLACK = "slack"
     NOTION = "notion"
     CRM = "crm"
+    # ---- Microsoft 365 ----
+    # Provenance only. Note there are NO new SignalEventType members for these:
+    # the source says which vendor the fact came from, the event type says what
+    # HAPPENED, and "an email arrived" is the same verb in Outlook as in Gmail.
+    # Every consumer that branches on the verb therefore treats an Outlook
+    # message exactly as it treats a Gmail one, with no new code path — which
+    # is the whole point of the lane model on the frontend.
+    #
+    # `signal_events.source` is a String(32), so these need no migration.
+    OUTLOOK = "outlook"
+    OUTLOOK_CALENDAR = "outlook_calendar"
+    ONEDRIVE = "onedrive"
+    TEAMS = "teams"
 
 
 class SignalEventType(str, enum.Enum):

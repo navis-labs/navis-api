@@ -29,6 +29,28 @@ class Capability(str, enum.Enum):
     CALENDAR = "calendar"
     DRIVE = "drive"
     SLACK = "slack"
+    # Microsoft 365 sources. Separate capabilities from their Google
+    # counterparts rather than a shared `mail` / `calendar` cap, because
+    # entitlement is a commercial decision made per connector: an org can be
+    # licensed for Gmail and not for Outlook. Feature gates that mean "any mail
+    # source" resolve the lane on the frontend and then check that connector's
+    # cap, so nothing here has to know about lanes.
+    #
+    # These are what the Connections page filters cards on. A capability that
+    # is true is a promise that the founder can connect the thing NOW, which is
+    # why TEAMS is granted by no plan below — the member exists so the wire
+    # format is complete, not because there is anything behind it yet.
+    OUTLOOK = "outlook"
+    OUTLOOK_CALENDAR = "outlook_calendar"
+    ONEDRIVE = "onedrive"
+    # No TEAMS member. Reading Teams channel messages needs Microsoft's
+    # Protected APIs approval, so there is no connector behind it — and a
+    # granted source capability renders a Connect card, which would leave a
+    # founder with a card that can never reach a connected state.
+    #
+    # It belongs here in the same change that lands the connector. Adding it
+    # early would also force an exception into PLAN_CAPABILITIES' invariant
+    # that ENTERPRISE grants every capability, which is worth preserving.
     # Pipeline
     MEMORY = "memory"
     STATE = "state"
@@ -98,18 +120,28 @@ STAGE_EVENT: dict[OnboardingStage, str] = {
 }
 
 # Plan -> the capabilities it grants by default (entitlements seed from this).
+#
+# The Microsoft sources mirror their Google counterparts exactly — outlook
+# wherever gmail appears, outlook_calendar wherever calendar does, onedrive
+# wherever drive does. Same product, different vendor; pricing the two
+# differently is a decision nobody has made, and making it implicitly here
+# would strand every Microsoft org on a plan that reads their mail but not
+# their calendar.
 PLAN_CAPABILITIES: dict[Plan, frozenset[Capability]] = {
     Plan.FREE: frozenset({
         Capability.GMAIL, Capability.CALENDAR, Capability.MEMORY, Capability.STATE,
+        Capability.OUTLOOK, Capability.OUTLOOK_CALENDAR,
     }),
     Plan.PRO: frozenset({
         Capability.GMAIL, Capability.CALENDAR, Capability.DRIVE, Capability.MEMORY,
         Capability.STATE, Capability.REASONING, Capability.DECISION,
+        Capability.OUTLOOK, Capability.OUTLOOK_CALENDAR, Capability.ONEDRIVE,
     }),
     Plan.TEAM: frozenset({
         Capability.GMAIL, Capability.CALENDAR, Capability.DRIVE, Capability.SLACK,
         Capability.MEMORY, Capability.STATE, Capability.REASONING, Capability.DECISION,
         Capability.EXECUTION, Capability.INTELLIGENCE,
+        Capability.OUTLOOK, Capability.OUTLOOK_CALENDAR, Capability.ONEDRIVE,
     }),
     Plan.ENTERPRISE: frozenset(Capability),
 }

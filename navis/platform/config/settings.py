@@ -119,6 +119,26 @@ class Settings(BaseSettings):
     # connect. Frontend surface filters (15 days) sit on top of this.
     gmail_onboard_lookback_days: int = 30
     gmail_max_history_pages: int = 200
+    # Microsoft Graph capture (Outlook mail + calendar, OneDrive). One set of
+    # caps for the whole suite rather than three, because all three connectors
+    # drive the SAME mechanism — a Graph delta enumeration — and the numbers
+    # that matter are properties of that mechanism, not of the resource.
+    #
+    # Mirrors the Google caps in intent: the onboarding backfill is bounded and
+    # LOUD when it hits the cap (never silently truncated), and exceeding the
+    # page-drain cap raises rather than advancing a partial cursor, because a
+    # cursor that jumps past undrained pages skips those items forever.
+    #
+    # The mail lookback matches gmail_onboard_lookback_days so a founder who
+    # connects Outlook and a founder who connects Gmail see the same horizon —
+    # a different window would make the two suites disagree about what counts
+    # as a slipping commitment on day one.
+    microsoft_onboard_item_cap: int = 500
+    microsoft_onboard_lookback_days: int = 30
+    microsoft_max_sync_pages: int = 200
+    # How far forward a calendar full sync reaches. Graph's calendarView needs
+    # an explicit end; Google's does not, which is why this has no Google twin.
+    microsoft_calendar_window_days: int = 60
     # Slack capture: the signing secret verifies inbound Events API webhooks (HMAC-SHA256);
     # the timestamp window rejects replayed captures. Backfill caps bound onboarding REST
     # polling. Scope version anchors re-consent when the read-only scope set changes.
@@ -180,6 +200,31 @@ class Settings(BaseSettings):
     slack_client_id: str | None = None
     slack_client_secret: str | None = None
     slack_redirect_uri: str | None = None
+
+    # ---- Microsoft 365 / Entra ID OAuth ----
+    # One multi-tenant app registration serving TWO distinct consent screens,
+    # which is why there are two redirect URIs rather than one:
+    #
+    #   microsoft_redirect_uri         the CONNECTOR grant (Mail/Calendar/Files)
+    #   microsoft_signin_redirect_uri  the IDENTITY grant (openid/profile/email)
+    #
+    # Collapsing them would put mailbox scopes on the sign-in screen, which is
+    # the single worst moment to ask for them — the frontend keeps the two
+    # behind separate feature flags for exactly this reason.
+    #
+    # `microsoft_tenant` is the authority segment. "common" accepts both work/
+    # school and personal accounts; set it to a tenant GUID to lock the
+    # deployment to one organisation. Note that personal accounts are the case
+    # where the `email` claim can be UNVERIFIED — see identity/microsoft_auth.
+    #
+    # Every value defaults to None, so an environment that has not configured
+    # Microsoft behaves exactly as it does today: the connect route reports
+    # "not configured" instead of building a half-formed authorization URL.
+    microsoft_client_id: str | None = None
+    microsoft_client_secret: str | None = None
+    microsoft_tenant: str = "common"
+    microsoft_redirect_uri: str | None = None
+    microsoft_signin_redirect_uri: str | None = None
 
     # ---- Gmail push (authenticated Cloud Pub/Sub) ----
     # Defined HERE rather than read straight from os.environ so they load from .env

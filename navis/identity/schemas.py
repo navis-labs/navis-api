@@ -81,6 +81,24 @@ class GoogleAuthRequest(BaseModel):
         return self
 
 
+class MicrosoftAuthRequest(BaseModel):
+    """Body for POST /auth/microsoft.
+
+    Authorization code ONLY — deliberately no id_token fallback.
+
+    The Google route keeps an id_token path for backward compatibility and
+    verifies its signature properly before trusting it. A new route has no
+    legacy to carry, and accepting a browser-supplied id_token means accepting
+    a token from an untrusted hop, which has to be signature-verified against
+    Entra's rotating JWKS to be safe. The code flow has no such hop: the server
+    fetches the token from the issuer itself over TLS using the client secret.
+    One path, and it is the safe one.
+    """
+
+    code: str = Field(..., min_length=1, description="OAuth2 authorization code")
+
+
+
 class TokenPair(BaseModel):
     access_token: str
     refresh_token: str
