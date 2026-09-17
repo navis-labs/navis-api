@@ -31,7 +31,7 @@ async def test_set_plan_emits_plan_changed_once_with_payload_and_audit():
         events.append(kw)
 
     billing = BillingService(repo, ent, audit=audit, publisher=publisher)
-    await billing.set_plan(ORG_A, Plan.PRO, actor_id=ACTOR)
+    await billing.set_plan(ORG_A, Plan.PRO, actor_id=ACTOR, billing_authorized=True)
 
     # event emitted exactly once, correct payload
     assert len(events) == 1
@@ -46,7 +46,7 @@ async def test_set_plan_emits_plan_changed_once_with_payload_and_audit():
     assert audit.records[0][0] == "org.plan.pro"
 
     # no-op re-assert of the same plan: no duplicate event, no duplicate audit
-    await billing.set_plan(ORG_A, Plan.PRO, actor_id=ACTOR)
+    await billing.set_plan(ORG_A, Plan.PRO, actor_id=ACTOR, billing_authorized=True)
     assert len(events) == 1
     assert len(audit.records) == 1
 
@@ -54,7 +54,7 @@ async def test_set_plan_emits_plan_changed_once_with_payload_and_audit():
 async def test_set_plan_without_publisher_is_safe():
     # Default construction (publisher=None) must never error on a real change.
     billing = BillingService(FakeOrgRepo(), EntitlementService(FakeOrgRepo()))
-    await billing.set_plan(ORG_A, Plan.ENTERPRISE)  # no raise, no event
+    await billing.set_plan(ORG_A, Plan.ENTERPRISE, billing_authorized=True)  # no raise, no event
 
 
 def test_plan_changed_event_type_exists():

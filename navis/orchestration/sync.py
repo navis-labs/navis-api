@@ -17,8 +17,11 @@ from typing import Any
 from sqlalchemy import select
 
 from navis.identity.models import Integration, IntegrationProvider
+from navis.orchestration.runtime_policy import scheduled_work_allowed
+from navis.organization.contract import Capability
 from navis.platform.database import session_scope
-from navis.platform.monitoring import get_logger
+from navis.platform.monitoring import get_logger, org_context
+from navis.platform.monitoring.metrics import metrics
 from navis.platform.queue import celery_app, run_async
 from navis.signals.base import SignalContext, WorkspaceConnector
 from navis.signals.calendar import CalendarClient, CalendarConnector
@@ -50,6 +53,29 @@ _REGISTRY: dict[IntegrationProvider, tuple[WorkspaceConnector, Any]] = {
     IntegrationProvider.GOOGLE_CALENDAR: (CalendarConnector(), _calendar_client),
     IntegrationProvider.DRIVE: (DriveConnector(), _drive_client),
 }
+
+# Which entitlement a connector's ingestion consumes (T-14). Separate from
+# `_REGISTRY` on purpose: that maps a provider to the code that talks to it, this
+# maps a provider to the permission to do so at all, and Slack has the second
+# without the first (its capture is webhook-driven, not polled).
+#
+# A provider absent from this map CANNOT BE SYNCED — `_capability_for` returns
+# None and `sync_integration` refuses. That is the fail-closed direction: an
+# unmapped connector is one nobody has decided the entitlement for yet, and
+# guessing would let a future connector run outside the plan that pays for it.
+# GOOGLE_MEET maps to CALENDAR because Meet records are derived from calendar
+# events rather than fetched from a separate grant.
+_CAPABILITY: dict[IntegrationProvider, Capability] = {
+    IntegrationProvider.GMAIL: Capability.GMAIL,
+    IntegrationProvider.GOOGLE_CALENDAR: Capability.CALENDAR,
+    IntegrationProvider.GOOGLE_MEET: Capability.CALENDAR,
+    IntegrationProvider.DRIVE: Capability.DRIVE,
+    IntegrationProvider.SLACK: Capability.SLACK,
+}
+
+
+def _capability_for(provider: IntegrationProvider) -> Capability | None:
+    return _CAPABILITY.get(provider)
 
 
 def _build_client(integration: Integration):
@@ -89,29 +115,54 @@ async def sync_integration(integration: Integration) -> dict:
                     logger.error("integration %s has no user_id; cannot emit tenant-safe signals", fresh.id)
                     return {"error": "missing user_id"}
 
-                ctx = SignalContext(
-                    org_id=fresh.organization_id, user_id=fresh.user_id, integration_id=fresh.id
-                )
-                cursor = (fresh.sync_state or {}).get("cursor") or {}
+                # ── ENTITLEMENT GATE (T-14) ──────────────────────────────────
+                # Asked HERE rather than in the beat task because all three sync
+                # producers converge on this function — the scheduled fan-out, the
+                # Pub/Sub push, and the manual /integrations/google/sync route — so
+                # one check covers every producer instead of three that can drift.
+                # Both inputs come from the FRESHLY RE-READ row inside the advisory
+                # lock, so neither the tenant nor the connector is taken from the
+                # caller's stale argument.
+                capability = _capability_for(fresh.provider)
+                if capability is None:
+                    logger.error(
+                        "no capability mapped for provider %s; refusing to sync integration %s",
+                        fresh.provider, fresh.id,
+                    )
+                    return {"skipped": "no_capability_mapping"}
+                if not await scheduled_work_allowed(
+                    db, fresh.organization_id, capability, task="sync_integration"
+                ):
+                    return {"skipped": "not_entitled"}
 
-                outcome = await SignalSyncService(db).sync(ctx, connector, client, cursor)
+                # Tenant log context, bound from the FRESHLY RE-READ row — never
+                # from the caller's argument and never from a task payload (T-21).
+                # Everything below, including the connector's own logging, now
+                # carries org_id as a structured field.
+                with org_context(fresh.organization_id):
+                    ctx = SignalContext(
+                        org_id=fresh.organization_id, user_id=fresh.user_id, integration_id=fresh.id
+                    )
+                    cursor = (fresh.sync_state or {}).get("cursor") or {}
 
-                # Persist cursor + refreshed token in the SAME transaction.
-                if not outcome.failed:
-                    state = dict(fresh.sync_state or {})
-                    state["cursor"] = outcome.cursor
-                    fresh.sync_state = state
-                    if token_manager.last_token and token_manager.last_token.refreshed:
-                        fresh.access_token = token_cipher.encrypt(
-                            token_manager.last_token.access_token
-                        )
-                        fresh.token_expires_at = token_manager.last_token.expires_at
-                        # Google rotated the refresh token -> persist the NEW one, else the
-                        # next refresh uses a dead token and the integration silently breaks.
-                        if token_manager.last_token.refresh_token:
-                            fresh.refresh_token = token_cipher.encrypt(
-                                token_manager.last_token.refresh_token
+                    outcome = await SignalSyncService(db).sync(ctx, connector, client, cursor)
+
+                    # Persist cursor + refreshed token in the SAME transaction.
+                    if not outcome.failed:
+                        state = dict(fresh.sync_state or {})
+                        state["cursor"] = outcome.cursor
+                        fresh.sync_state = state
+                        if token_manager.last_token and token_manager.last_token.refreshed:
+                            fresh.access_token = token_cipher.encrypt(
+                                token_manager.last_token.access_token
                             )
+                            fresh.token_expires_at = token_manager.last_token.expires_at
+                            # Google rotated the refresh token -> persist the NEW one, else the
+                            # next refresh uses a dead token and the integration silently breaks.
+                            if token_manager.last_token.refresh_token:
+                                fresh.refresh_token = token_cipher.encrypt(
+                                    token_manager.last_token.refresh_token
+                                )
     finally:
         await transport.aclose()
 
@@ -138,6 +189,17 @@ async def ensure_watch_for_integration(integration: Integration) -> dict:
     connector, client, handles = _build_client(integration)
     if connector is None or handles is None or not integration.user_id:
         return {"skipped": True}
+
+    # A watch is a standing instruction to Google to push into this deployment on
+    # the org's behalf, so it needs the same entitlement the ingestion does — and
+    # renewing one for a suspended tenant would keep that push alive indefinitely.
+    capability = _capability_for(integration.provider)
+    async with session_scope() as db:
+        if capability is None or not await scheduled_work_allowed(
+            db, integration.organization_id, capability, task="renew_watch"
+        ):
+            return {"skipped": True, "reason": "not_entitled"}
+
     transport, _ = handles
     ctx = SignalContext(integration.organization_id, integration.user_id, integration.id)
     try:
@@ -212,100 +274,179 @@ async def _renew_all_watches() -> dict:
 
 
 async def _sync_account(provider: str, email: str | None, history_id: str | None) -> dict:
-    """Webhook-triggered: sync the specific mailbox the push notification named."""
+    """Webhook-triggered: sync the specific mailbox the push notification named.
+
+    THE MAILBOX ADDRESS IS A SELECTOR, NOT A CREDENTIAL. The caller has already
+    been authenticated as Google (signals/router.py verifies the push JWT before
+    this task is ever enqueued); `email` only says WHICH connected mailbox the
+    notification concerns. Organization scope is never taken from it — it is read
+    from the resolved `Integration` row, and `sync_integration` re-reads that row
+    inside its own transaction before building the `SignalContext`.
+
+    Both guards below fail CLOSED, because the alternative in each case is doing
+    real work against an arbitrarily-chosen tenant.
+    """
     if not email:
-        # A push without a mailbox cannot be routed to a tenant. Never guess: the old
-        # unordered single-row pick could sync an arbitrary org's integration. The periodic
-        # beat sync covers any real backlog, so dropping the notification is safe.
-        logger.warning("pubsub sync: notification without emailAddress provider=%s", provider)
-        return {"matched": False}
+        # `if email:` used to be optional here, so a push whose payload carried no
+        # `emailAddress` dropped the filter entirely and `db.scalar` returned SOME
+        # active integration — a full sync run against a tenant picked by whatever
+        # order the planner happened to produce. Without the address there is no
+        # mailbox to sync, so there is nothing to do.
+        logger.warning("pubsub sync: no mailbox address in the notification; refusing")
+        metrics.incr("signals.pubsub.unresolved", labels={"reason": "no_address"})
+        return {"matched": False, "reason": "no_address"}
+
     async with session_scope() as db:
-        integrations = (
+        matches = (
             await db.scalars(
-                select(Integration)
-                .where(
+                select(Integration).where(
                     Integration.provider == IntegrationProvider(provider),
-                    Integration.external_account == email,
                     Integration.is_active.is_(True),
+                    Integration.external_account == email,
                 )
-                .order_by(Integration.id)  # deterministic across redeliveries
             )
         ).all()
-    if not integrations:
+
+    if not matches:
         logger.warning("pubsub sync: no integration for %s/%s", provider, email)
-        return {"matched": False}
-    # (organization_id, provider, external_account) is unique PER ORG, so the same mailbox
-    # can be connected by more than one org. Each integration syncs its OWN org with its OWN
-    # token (self-scoped — no cross-tenant read), so sync every match; the old arbitrary
-    # single pick silently starved the other org's push path until the next beat sync.
-    results = [await sync_integration(i) for i in integrations]
-    if len(results) == 1:
-        return results[0]
-    return {"matched": True, "synced": len(results), "results": results}
+        metrics.incr("signals.pubsub.unresolved", labels={"reason": "no_match"})
+        return {"matched": False, "reason": "no_match"}
+    if len(matches) > 1:
+        # Two organizations have connected the SAME mailbox. `uq_org_provider_account`
+        # permits this (it is unique per org, not globally), and a notification names
+        # only the address, so nothing in the message says which tenant it is for.
+        #
+        # Deliberately NOT resolved by picking newest/lowest-id: that would silently
+        # attribute one organization's mail to whichever row won, and the tie-break
+        # is a product decision about what sharing a mailbox even means. Refusing is
+        # the honest answer and the scheduled poll still syncs BOTH tenants, so no
+        # mail is lost — only the push acceleration is.
+        logger.error(
+            "pubsub sync: %s/%s maps to %d active integrations across %d organization(s); "
+            "refusing to guess which tenant this notification belongs to",
+            provider, email, len(matches), len({m.organization_id for m in matches}),
+        )
+        metrics.incr("signals.pubsub.unresolved", labels={"reason": "ambiguous_tenant"})
+        return {"matched": False, "reason": "ambiguous_tenant"}
+
+    return await sync_integration(matches[0])
+
+
+def _slack_install_narrower(envelope: dict):
+    """Disambiguate a shared workspace by the INSTALL the event was delivered to.
+
+    Slack's Events API envelope names the authorized bot alongside the team:
+    `authorizations[].user_id` is the bot user id of the install Slack delivered
+    to, and `api_app_id` is the app. Both are recorded at install time by
+    `slack.oauth.install_fields` into `sync_state['slack']` — so when two
+    organizations have genuinely distinct installs in one workspace, the event
+    itself says which one it belongs to and we do not have to refuse.
+
+    This is a NARROWER, never a chooser: it returns the subset whose persisted
+    install identity matches, and `resolve_owning_integration` re-asserts
+    uniqueness on whatever comes back. If the envelope carries no bot identity, or
+    the identity matches several tenants, the subset stays ambiguous and the
+    caller still fails closed.
+
+    The envelope is authenticated (the HMAC was verified before this task was
+    enqueued), so these fields are Slack's assertion, not a caller's. They still
+    only ever SELECT among integrations we already persisted — they can never
+    introduce an organization.
+    """
+    authorizations = envelope.get("authorizations") or []
+    bot_user_ids = {
+        a.get("user_id") for a in authorizations if isinstance(a, dict) and a.get("user_id")
+    }
+    app_id = envelope.get("api_app_id")
+
+    def _narrow(rows):
+        if not bot_user_ids and not app_id:
+            return []  # nothing to narrow WITH -> leave the ambiguity intact
+        matched = []
+        for r in rows:
+            state = (r.sync_state or {}).get("slack") or {}
+            if bot_user_ids and state.get("bot_user_id") in bot_user_ids:
+                matched.append(r)
+            elif not bot_user_ids and app_id and state.get("app_id") == app_id:
+                matched.append(r)
+        return matched
+
+    return _narrow
 
 
 async def _process_slack_event(team_id: str | None, envelope: dict) -> dict:
     """Webhook-triggered: resolve the Slack install, map the event, ingest. Runs out of band
-    (the webhook already ACKed). Reuses the connector ingestion path (batch+fallback+DLQ)."""
+    (the webhook already ACKed). Reuses the connector ingestion path (batch+fallback+DLQ).
+
+    TENANT RESOLUTION IS THE FIRST THING THAT HAPPENS AND IT FAILS CLOSED.
+
+    This used to be `db.scalar(...)`, which returns the FIRST row of an unordered
+    result set. `uq_org_provider_account` is unique per organization, so two
+    organizations connecting the same workspace both match — and the planner, not
+    the data, decided which tenant the messages were ingested as. Reproduced
+    before this change: two rows, one `db.scalar`, `SignalContext.org_id` came
+    back as whichever row was first, and the event was captured, mapped and
+    ingested under it.
+
+    Mirrors `_sync_account` (the Gmail push path), which already refused this way.
+    """
+    from navis.identity.org_service import AmbiguityReason, resolve_owning_integration
     from navis.signals.base import SignalSource
     from navis.signals.slack.events import events_from_envelope
 
     if not team_id:
-        return {"matched": False}
+        metrics.incr("slack.event.unresolved", labels={"reason": AmbiguityReason.NO_ACCOUNT})
+        return {"matched": False, "reason": AmbiguityReason.NO_ACCOUNT}
     inner_type = (envelope.get("event") or {}).get("type") or envelope.get("type")
     async with session_scope() as db:
-        integrations = (
-            await db.scalars(
-                select(Integration)
-                .where(
-                    Integration.provider == IntegrationProvider.SLACK,
-                    Integration.external_account == team_id,
-                    Integration.is_active.is_(True),
-                )
-                .order_by(Integration.id)  # deterministic across redeliveries
+        integration, reason = await resolve_owning_integration(
+            db,
+            provider=IntegrationProvider.SLACK,
+            external_account=team_id,
+            narrow=_slack_install_narrower(envelope),
+        )
+        if reason == AmbiguityReason.AMBIGUOUS_TENANT:
+            # Two organizations have connected the SAME workspace and the envelope
+            # carried no install identity that separates them. Refusing is the
+            # honest answer: nothing in the message says which tenant it is for,
+            # and attributing it to either one writes another company's
+            # conversations into their memory, state and brief — irreversibly,
+            # because Memory is append-only.
+            logger.error(
+                "slack event: team=%s maps to multiple organizations and the envelope "
+                "carries no install identity; refusing to guess which tenant this is for",
+                team_id,
             )
-        ).all()
-        if not integrations:
+            metrics.incr("slack.event.unresolved", labels={"reason": reason})
+            return {"matched": False, "reason": reason}
+        if integration is None or not integration.user_id:
             logger.warning("slack event: no active integration for team=%s", team_id)
-            return {"matched": False}
+            metrics.incr(
+                "slack.event.unresolved",
+                labels={"reason": reason or AmbiguityReason.NO_MATCH},
+            )
+            return {"matched": False, "reason": reason or AmbiguityReason.NO_MATCH}
 
         # M-1: workspace disconnect / token revocation -> deactivate (don't keep hitting Slack
-        # with a dead token; that failure rate is what trips Slack's 95% auto-disable). The
-        # revocation is a WORKSPACE-level fact, so every org's row for this team is dead.
+        # with a dead token; that failure rate is what trips Slack's 95% auto-disable).
         if inner_type in ("app_uninstalled", "tokens_revoked"):
-            for integ in integrations:
-                integ.is_active = False
-            logger.warning(
-                "slack %s for team=%s; %d integration(s) deactivated",
-                inner_type, team_id, len(integrations),
+            integration.is_active = False
+            logger.warning("slack %s for team=%s; integration deactivated", inner_type, team_id)
+            return {"matched": True, "deactivated": True}
+
+        # Tenant log context from the RESOLVED integration row (T-21) — bound only
+        # after the resolution above proved exactly one organization owns this
+        # workspace, so an ambiguous event never stamps a tenant onto its logs.
+        with org_context(integration.organization_id):
+            ctx = SignalContext(integration.organization_id, integration.user_id, integration.id)
+            slack_state = (integration.sync_state or {}).get("slack") or {}
+            events = events_from_envelope(
+                ctx, envelope,
+                our_bot_id=slack_state.get("bot_id"), our_bot_user_id=slack_state.get("bot_user_id"),
             )
-            return {"matched": True, "deactivated": len(integrations)}
-
-        # Tenancy guard: (organization_id, provider, external_account) is unique PER ORG, so
-        # two orgs CAN hold active rows for one team_id. Event CONTENT must never be ingested
-        # under an arbitrarily-picked org (cross-tenant injection). Fail CLOSED on ambiguity —
-        # a dropped event is recoverable (Slack backfill); a misattributed one is not.
-        if len(integrations) > 1:
-            logger.error(
-                "slack event: %d active integrations for team=%s — ambiguous tenant, dropped",
-                len(integrations), team_id,
-            )
-            return {"matched": False, "ambiguous": True}
-
-        integration = integrations[0]
-        if not integration.user_id:
-            logger.warning("slack event: integration %s has no user_id", integration.id)
-            return {"matched": False}
-
-        ctx = SignalContext(integration.organization_id, integration.user_id, integration.id)
-        slack_state = (integration.sync_state or {}).get("slack") or {}
-        events = events_from_envelope(
-            ctx, envelope,
-            our_bot_id=slack_state.get("bot_id"), our_bot_user_id=slack_state.get("bot_user_id"),
-        )
-        if not events:
-            return {"matched": True, "captured": 0}  # unmapped verb — captured nothing, by design
-        outcome = await SignalSyncService(db).ingest_events(ctx, SignalSource.SLACK, events)
+            if not events:
+                return {"matched": True, "captured": 0}  # unmapped verb — captured nothing, by design
+            outcome = await SignalSyncService(db).ingest_events(ctx, SignalSource.SLACK, events)
     return {"matched": True, "captured": outcome.ingested, "duplicates": outcome.duplicates,
             "dead_lettered": outcome.dead_lettered}
 

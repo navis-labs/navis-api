@@ -51,3 +51,41 @@ def test_pointer_payload_surfaces_optional_lineage_from_metadata():
     p = SignalIngestionService._pointer_payload(e)
     assert p["connector_version"] == "gmail-2.3"
     assert p["sync_run_id"] == "run-abc"
+
+
+# ---- Every routed event MUST have a memory subscriber ----------------------
+#
+# The gap this pins: routing by actual event_type sends a real calendar meeting
+# out as CalendarEventUpdated, but Memory only subscribed to CREATED — so the
+# canonical Calendar record was published to a bus with ZERO handlers and
+# silently dropped. Only the Meet-derived copy (SIGNAL_INGESTED fallback)
+# survived, carrying no status, no organizer and no join link.
+
+
+def test_every_routed_bus_event_has_a_memory_subscriber():
+    import navis.memory.service  # noqa: F401 — registers the subscribers
+    from navis.platform.events import event_bus
+    from navis.signals.service import _BUS_EVENT_FOR_TYPE
+
+    routed = set(_BUS_EVENT_FOR_TYPE.values()) | {EventType.SIGNAL_INGESTED}
+    unhandled = {e.value for e in routed if not event_bus._handlers.get(e)}
+
+    assert not unhandled, (
+        f"signals route to these bus events but nothing consumes them: {sorted(unhandled)}. "
+        "A signal published to a handler-less bus event never becomes memory."
+    )
+
+
+def test_calendar_update_and_cancel_reach_memory():
+    """The specific regression: a real meeting arrives as UPDATED, and a
+    cancellation as CANCELLED. Both must have a handler, or the MEETING
+    payload's `status` field can never reach 'cancelled'."""
+    import navis.memory.service  # noqa: F401
+    from navis.platform.events import event_bus
+
+    for evt in (
+        EventType.CALENDAR_EVENT_CREATED,
+        EventType.CALENDAR_EVENT_UPDATED,
+        EventType.CALENDAR_EVENT_CANCELLED,
+    ):
+        assert event_bus._handlers.get(evt), f"no memory subscriber for {evt.value}"

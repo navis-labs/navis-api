@@ -1,66 +1,50 @@
-"""Capability-based model routing — the ONE HOME for "which provider for this capability".
+"""Provider-independent model routing.
 
-Callers declare a CAPABILITY (reasoning, extraction, embedding, structured output, tool calling,
-...), never a vendor or model name. The router maps capability -> a concrete provider using a
-static, config-aware preference list. It is:
+Tasks declare a TIER (fast vs deep); the router maps tier → a concrete provider,
+choosing the cheapest model that fits. Because everything goes through MLProvider,
+swapping the underlying vendor changes nothing for callers.
 
-  * capability-based — callers never name Claude/Azure/Gemini; only a Capability.
-  * DETERMINISTIC — a pure function of (capability, configured providers). No randomness, no
-    clock, no health/runtime state; the same inputs always pick the same provider. (Health-aware
-    failover is the gateway's concern, deliberately kept OUT of this pure policy layer.)
-  * SEPARATE FROM CONSTRUCTION — it constructs nothing and reads no secrets; it asks the
-    registry which providers are configured and delegates building to `get_provider`.
-
-  fast    -> cheapest capable model         deep/accurate -> strongest model
-Everything goes through MLProvider, so swapping the underlying vendor changes nothing here.
+  fast  → GPT-4o-mini (Azure)  /  Claude Haiku   — summaries, drafts
+  deep  → Claude Sonnet/Opus   /  GPT-4o          — briefs, explanations
 """
 from __future__ import annotations
 
 import enum
 
 from navis.ml.providers.base import MLProvider
-from navis.ml.providers.registry import (
-    configured_providers,
-    get_embedding_provider,
-    get_provider,
-)
+from navis.ml.providers.registry import get_provider
 
 
-class Capability(str, enum.Enum):
-    """What a caller needs — never a model name. New capabilities plug in by adding a row to
-    `_CAPABILITY_PREFERENCE`; callers and providers are untouched."""
-
-    REASONING = "reasoning"
-    EXTRACTION = "extraction"
-    CLASSIFICATION = "classification"
-    EMBEDDING = "embedding"
-    LONG_CONTEXT = "long_context"
-    STRUCTURED_OUTPUT = "structured_output"
-    TOOL_CALLING = "tool_calling"
+class Tier(str, enum.Enum):
     FAST = "fast"
-    ACCURATE = "accurate"
+    DEEP = "deep"
 
 
-# Per-capability provider-NAME preference (most-capable first). EMPTY BY DESIGN: a capability
-# routes to the deployment's configured-default order until there is EVIDENCE (from the
-# evaluation layer, Phase 10) that a specific vendor serves it better. This keeps routing
-# backward-compatible (the same operational default as today) and free of unjustified vendor
-# opinions — inventing a vendor ranking here silently changes production routing. Provider
-# strings, when added, appear ONLY here (never in business logic), e.g. gated on a benchmark:
-#   _CAPABILITY_PREFERENCE = {Capability.LONG_CONTEXT: ("claude", "gemini", "azure")}
-_CAPABILITY_PREFERENCE: dict[Capability, tuple[str, ...]] = {}
+class Task(str, enum.Enum):
+    SUMMARY = "summary"
+    DRAFT = "draft"
+    BRIEF_NARRATIVE = "brief_narrative"
+    EXPLANATION = "explanation"
+    RECOMMENDATION = "recommendation"
 
 
-def route(capability: Capability) -> MLProvider:
-    """Capability -> concrete MLProvider. DETERMINISTIC: the first provider in the capability's
-    static preference that is configured, else the first configured provider (deterministic when
-    nothing is set). Constructs nothing itself — `get_provider` (registry) owns construction."""
-    if capability is Capability.EMBEDDING:
-        # One home for embedding-provider selection: the registry's pinned resolver (Azure-or-
-        # deterministic), so stored vector model/version can never drift via the router.
-        return get_embedding_provider()
-    configured = configured_providers()  # e.g. ("azure", "deterministic")
-    for name in _CAPABILITY_PREFERENCE.get(capability, ()):
-        if name in configured:
-            return get_provider(name)
-    return get_provider(configured[0])  # first configured (deterministic if nothing is set)
+TASK_TIER: dict[Task, Tier] = {
+    Task.SUMMARY: Tier.FAST,
+    Task.DRAFT: Tier.FAST,
+    Task.BRIEF_NARRATIVE: Tier.DEEP,
+    Task.EXPLANATION: Tier.DEEP,
+    # Prioritization weighs urgency vs impact across the whole context — deep tier.
+    Task.RECOMMENDATION: Tier.DEEP,
+}
+
+
+def provider_for(task: Task) -> MLProvider:
+    """Resolve the provider for a task's tier (deterministic default when offline)."""
+    # The configured provider already encodes the vendor; tier influences the model
+    # the generation layer requests. We return the active provider; deep/fast model
+    # choice is expressed via the provider's own fast/deep models where available.
+    return get_provider()
+
+
+def tier_for(task: Task) -> Tier:
+    return TASK_TIER[task]

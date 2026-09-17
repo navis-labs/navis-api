@@ -59,6 +59,13 @@ class MemoryRecord(Base):
         # memory_id) fold order, regardless of entity_type — so it needs an org+time index
         # WITHOUT entity_type in the lead (the type-led index above can't serve that order).
         Index("ix_mem_org_time", "organization_id", "event_timestamp", "memory_id"),
+        # ...and it RESUMES in (created_at, memory_id) OBSERVATION order, which is a
+        # different question needing a different index. Event time is not
+        # observation-monotone — a calendar meeting's event_timestamp is its START —
+        # so the fold order cannot double as a cursor. Without this the keyset read
+        # in `MemoryReader.observed_since` plans as a seq scan plus a sort on the
+        # hot path of every brief. See migration 0044.
+        Index("ix_mem_org_observed", "organization_id", "created_at", "memory_id"),
         # Provenance / replay-by-signal.
         Index("ix_mem_signal", "source_signal_event_id"),
     )

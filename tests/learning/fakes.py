@@ -102,7 +102,12 @@ def outcome_payload(
     signals: list[str] | None = None,
     decision_id: uuid.UUID = DECISION,
     occurred_at: str = "2026-06-01T12:00:00+00:00",
+    provider_reference: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """An OUTCOME_OBSERVED payload, shaped exactly as `ObservationService._emit`
+    publishes it — including the nested `payload` block that carries the cause
+    fields (action_type / error / failure_kind / reason)."""
     return {
         "outcome_id": outcome_id,
         "org_id": str(org_id),
@@ -112,7 +117,9 @@ def outcome_payload(
         "reasoning_signal_ids": signals or ["sig-A", "sig-B"],
         "reasoning_version": 1,
         "state_watermark": "wm-9",
+        "provider_reference": provider_reference if provider_reference is not None else {},
         "occurred_at": occurred_at,
+        "payload": payload if payload is not None else {},
     }
 
 

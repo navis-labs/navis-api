@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from navis.identity.authz import Principal, get_principal
 from navis.organization.contract import Capability
 from navis.organization.service import OrganizationService
-from navis.platform.config import settings
 from navis.platform.database import get_session
 
 
@@ -29,11 +28,12 @@ def require_capability(capability: Capability):
         # future principal kind introduces a null org, instead of silently granting FREE.
         if getattr(principal, "org_id", None) is None:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "principal has no organization")
-        # Non-production bypass: pre-launch dev/staging always grants capabilities so
-        # the full pipeline (decision, execution, intelligence) is exercisable without
-        # per-org plan-bumping. Production still enforces the entitlement check below.
-        if not settings.is_production:
-            return principal
+        # No environment branch. This guard previously returned the principal
+        # unchecked whenever `settings.is_production` was False — and ENVIRONMENT
+        # defaults to development when unset, so a production deployment missing one
+        # env var served every gated route to every org. The gate is now the same
+        # code in every environment; dev breadth comes from the plan an org is
+        # actually provisioned with (OrganizationService.bootstrap).
         if not await OrganizationService(db).can_use(principal.org_id, capability):
             raise HTTPException(
                 status.HTTP_402_PAYMENT_REQUIRED,

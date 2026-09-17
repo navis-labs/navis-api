@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.dependencies import CurrentContext, get_current_context
+from navis.identity.throttle import rate_limit
 from navis.intelligence.repository import IntelligenceRepository
 from navis.organization.contract import Capability
 from navis.organization.guards import require_capability
@@ -45,7 +46,14 @@ async def list_insights(
     return {"insights": [_serialize(r) for r in rows]}
 
 
-@router.post("/project", dependencies=[Depends(require_capability(Capability.INTELLIGENCE))])
+@router.post(
+    "/project",
+    dependencies=[
+        Depends(require_capability(Capability.INTELLIGENCE)),
+        # T-23: a full re-projection over the org's learning history.
+        Depends(rate_limit("pipeline", "rate_limit_pipeline_per_window")),
+    ],
+)
 async def project(
     ctx: CurrentContext = Depends(get_current_context),
     db: AsyncSession = Depends(get_session),

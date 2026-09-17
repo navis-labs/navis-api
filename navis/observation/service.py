@@ -22,6 +22,24 @@ from navis.platform.monitoring import get_logger
 
 logger = get_logger("observation")
 
+# `_SUCCESS_HINT` lived here and has been REMOVED, along with the `success` and
+# `subject_ref` fields it fed into OUTCOME_OBSERVED.
+#
+# It was a fact->label mapping — outcome_type -> a 0.0/0.5/1.0 score — described
+# in its own comment as back-compat for a "not-yet-rewired" Learning subscriber.
+# Learning was rewired: `learning.attribution.classify` maps outcome_type to a
+# LearningResult itself, and nothing anywhere reads `success` or `subject_ref`
+# (verified across navis/ and tests/). They were dead fields.
+#
+# Dead is not the reason to delete them; MISLEADING is. Observation's one law is
+# that it records what happened and never what it was worth — the outcome table
+# is asserted to carry no success/confidence/score column. Emitting a success
+# SCORE in the event broke that law on the way out, and the two mappings had
+# already drifted: this table scored ACTION_EXECUTED 0.5 while Learning's
+# classifier calls it NEUTRAL. A second, stale opinion about what an outcome
+# means is exactly what the boundary exists to prevent.
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -42,8 +60,6 @@ class ObservationService:
         if repo is not None:
             self.repo = repo
         else:
-            if db is None:
-                raise ValueError("ObservationService requires `db` when `repo` is not provided")
             from navis.observation.repository import OutcomeRepository
 
             self.repo = OutcomeRepository(db)
@@ -92,10 +108,34 @@ class ObservationService:
     async def record_from_execution(
         self, event: DomainEvent, outcome_type: OutcomeType, source_event_id: str
     ) -> Outcome | None:
-        if event.org_id is None:  # an outcome without a tenant is unrecordable
-            return None
         p = event.payload or {}
         outcome_block = p.get("outcome") or {}
+        # WHAT THE PAYLOAD CARRIES, and why each field is here.
+        #
+        # `failure_kind` is the stable classification Execution computed at the
+        # point of failure (execution/contract.py::FailureKind). Without it every
+        # failure was one undifferentiated `action_failed` and the only way to
+        # tell "the org lost its entitlement" from "Gmail was down" was to sniff
+        # substrings out of `error`.
+        #
+        # `reason` is the human's own words when they rejected a proposal. It is
+        # the single most informative field Observation can hold — a person
+        # saying why they said no — and it was previously discarded with the rest
+        # of the rejection event.
+        #
+        # Keys are omitted rather than stored as None so a reader can distinguish
+        # "not applicable to this outcome type" from "applicable but absent".
+        #
+        # `action_type` now follows that rule too. It was unconditional, which
+        # was harmless while every event here came from Execution — and became
+        # wrong the moment DECISION_DISMISSED arrived, because a dismissed
+        # decision has no action and stamping `action_type: null` on it asserts
+        # that it did and the value went missing.
+        payload: dict = {}
+        for key in ("action_type", "error", "failure_kind", "reason"):
+            value = p.get(key)
+            if value is not None:
+                payload[key] = value
         return await self.record(
             org_id=event.org_id,
             source_event_id=source_event_id,
@@ -106,15 +146,42 @@ class ObservationService:
             reasoning_version=p.get("reasoning_version"),
             state_watermark=p.get("state_watermark"),
             provider_reference=outcome_block.get("provider_reference", {}),
-            payload={"action_type": p.get("action_type"), "error": p.get("error")},
+            payload=payload,
         )
 
-    async def record_from_webhook(self, webhook) -> Outcome | None:
-        """Map a provider webhook to an outcome by its provider_reference, inheriting
-        the lineage of the original action's outcome. Unknown references are ignored."""
-        prior = await self.repo.by_provider_external_id(webhook.provider, webhook.external_id)
+    async def record_from_webhook(self, webhook, *, org_id: uuid.UUID) -> Outcome | None:
+        """Map a provider webhook to an outcome WITHIN a known organization.
+
+        `org_id` IS THE TENANT AND IT IS NOT NEGOTIABLE HERE. It is resolved by the
+        caller from a persisted `Integration` row (the connected account the
+        notification named) and passed in already trusted — the same shape as the
+        Gmail push and Slack event paths, where orchestration resolves the tenant
+        and hands the domain a `SignalContext` it does not get to second-guess.
+
+        THE DEFECT THIS REPLACES. This method used to take no organization at all:
+        it called `by_provider_external_id(provider, external_id)` with no org
+        filter — a scan across EVERY tenant's outcomes, `ORDER BY occurred_at DESC
+        LIMIT 1` — and then adopted `prior.organization_id` as the answer. So the
+        tenant was decided by whichever organization happened to hold the most
+        recent row matching an id supplied in the request body. Two tenants sharing
+        an external id (a shared mailbox), or a caller who could guess one, chose
+        the victim. The lookup is now scoped, so a reference belonging to another
+        organization simply does not match.
+
+        Returns None — recording nothing, publishing nothing — when the reference
+        is unknown WITHIN this organization. That is deliberate: an unmatched
+        reference has no lineage to inherit, and inventing an outcome without one
+        would put an unattributable fact into an append-only log that Learning
+        consumes and cannot retract.
+        """
+        prior = await self.repo.by_provider_external_id(
+            webhook.provider, webhook.external_id, org_id=org_id
+        )
         if prior is None:
-            logger.warning("webhook %s ref=%s matched no prior outcome", webhook.provider, webhook.external_id)
+            logger.warning(
+                "webhook %s ref=%s matched no prior outcome in org=%s",
+                webhook.provider, webhook.external_id, org_id,
+            )
             return None
         return await self.record(
             org_id=prior.organization_id,
@@ -135,6 +202,33 @@ class ObservationService:
         await self._emit(outcome)
 
     async def _emit(self, o: Outcome) -> None:
+        """THE OBSERVATION CONTRACT — the stable shape downstream may consume.
+
+        Every field is a FACT or a LINEAGE POINTER. There is deliberately no
+        score, label, confidence or judgement: what an outcome is worth is
+        Learning's question, and answering it here would put a second opinion in
+        the system that could drift from Learning's (which is exactly what the
+        removed `success` hint had already done).
+
+            outcome_id            deterministic; the consumer's dedupe key
+            org_id                the owning organization, from the persisted row
+            outcome_type          WHAT happened, from the OutcomeType vocabulary
+            execution_id          WHICH action this is about
+            decision_id           WHAT Navis decided
+            reasoning_signal_ids  WHY it decided that
+            reasoning_version     which reasoning produced it
+            state_watermark       the world state it was decided against
+            provider_reference    the external object, for correlating webhooks
+            occurred_at           reality time, so a consumer never calls now()
+            payload               action_type, and cause fields where they apply
+                                  (error / failure_kind / reason)
+
+        `provider_reference` and `payload` are new to this event. Both were
+        already ON the outcome row and simply were not published, so a consumer
+        had to re-read the database to answer "which message was that?" or "why
+        did it fail?" — and Learning is explicitly forbidden from reading any
+        other module's tables.
+        """
         await self._publish(
             DomainEvent(
                 type=EventType.OUTCOME_OBSERVED,
@@ -150,12 +244,10 @@ class ObservationService:
                     "reasoning_signal_ids": o.reasoning_signal_ids,
                     "reasoning_version": o.reasoning_version,
                     "state_watermark": o.state_watermark,
+                    "provider_reference": o.provider_reference or {},
                     # Reality time, so Learning can record occurred_at without now().
                     "occurred_at": o.occurred_at.isoformat() if o.occurred_at else None,
-                    # No success/subject_ref: the fact->label mapping is Learning's, and
-                    # Learning already consumes outcome_type + lineage directly
-                    # (learning/attribution.learning_event_values) — the old hint's own
-                    # retirement condition. Observation publishes facts only.
+                    "payload": o.payload or {},
                 },
             )
         )

@@ -28,6 +28,23 @@ class GmailProvider(Provider):
             raise ProviderValidationError("send_email requires 'to'")
         if not payload.get("subject"):
             raise ProviderValidationError("send_email requires 'subject'")
+        # An email with no body is never a thing a human meant to send. The
+        # proactive proposer used to emit exactly that — `{"to": <them>,
+        # "subject": <the decision title>, "body": ""}` — so one click on a
+        # "Commitment slipping: I'll get you the deck by Friday" card sent that
+        # sentence, as a subject line, with an empty body, to the person who
+        # said it. Validation lives HERE (not only at the proposer) because
+        # this is the last gate before Google: any future producer of a
+        # send_email payload inherits the guarantee for free.
+        #
+        # ProviderValidationError is non-retryable by contract, so a malformed
+        # row fails once, dead-letters with this message, and never reaches
+        # Gmail — not on this attempt and not on any retry.
+        if not str(payload.get("body") or "").strip():
+            raise ProviderValidationError(
+                "send_email requires a non-empty 'body' — refusing to send a "
+                "blank email"
+            )
 
     async def execute(self, payload: dict[str, Any]) -> ProviderResult:
         if self._sender is None:
@@ -45,25 +62,17 @@ class GmailProvider(Provider):
         return "sent"
 
 
-def build_gmail_sender(transport) -> Sender:
-    """Production sender: POST a message via the Google transport (WRITE scope).
-
-    Reuses signals' GoogleTransport pattern (read-only import — Signals unchanged).
-    The integration must carry a `gmail.send` scope; until that is provisioned and
-    this sender injected into GmailProvider, execution stays dry-run.
-    """
-    import base64
-    from email.message import EmailMessage
-
-    _BASE = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
-
-    async def _send(payload: dict[str, Any]) -> str:
-        msg = EmailMessage()
-        msg["To"] = payload["to"]
-        msg["Subject"] = payload.get("subject", "")
-        msg.set_content(payload.get("body", ""))
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        resp = await transport.request("POST", _BASE, json={"raw": raw})
-        return resp.get("id", "")
-
-    return _send
+# `build_gmail_sender` lived here and has been DELETED. It was a second, complete
+# implementation of the send path — its own MIME encoding, its own URL, reached
+# by nothing — and it was missing every guarantee the real sender provides:
+#
+#   * no deterministic Message-ID, so no duplicate protection at all;
+#   * no `rfc822msgid:` pre-check, so a retry after a timeout sent twice;
+#   * no integration resolution, so no organization scoping and no capability-
+#     first grant selection;
+#   * no reconsent translation, so a dead token retried as a transient failure.
+#
+# It is exactly the shape a future engineer would reach for when wiring "the
+# Gmail sender", and adopting it would have silently removed duplicate-send
+# protection. The one real sender is `providers/_senders.gmail_sender`, wired in
+# `production_providers()`. A dead path that looks live is worse than no path.

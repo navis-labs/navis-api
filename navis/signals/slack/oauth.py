@@ -27,18 +27,52 @@ SLACK_AUTHORIZE_URL = "https://slack.com/oauth/v2/authorize"
 SLACK_ACCESS_URL = "https://slack.com/api/oauth.v2.access"
 SLACK_AUTH_TEST_URL = "https://slack.com/api/auth.test"
 
-# Read-only, least privilege — no admin, no write/chat scopes (decision: capture only).
+# Least privilege, and still no admin scopes. `chat:write` is the ONE write scope, added when
+# Slack became an EXECUTION connector rather than a capture-only one: `chat.postMessage`
+# cannot be called without it, so before this every Slack install was structurally unable to
+# send and the `send_slack` action could never have worked in any deployment.
 SLACK_SCOPES = [
     "channels:history", "groups:history", "im:history", "mpim:history",
     "channels:read", "groups:read", "users:read", "reactions:read", "files:read",
+    "chat:write",
 ]
 # An install MUST grant all of these or it cannot capture reality — reject a partial grant at
 # onboarding rather than silently running blind on some channel types.
+#
+# `chat:write` is deliberately NOT required. Capture is the product's floor and sending is a
+# capability on top of it: a workspace admin who will not grant write must still be able to
+# install Navis and get every read feature. An install without it stays fully functional and
+# `slack_write_granted` is what refuses the send, with a reconnect instruction — exactly how
+# the Gmail read-only→send migration is handled.
 _REQUIRED_SCOPES = {
     "channels:history", "groups:history", "im:history", "mpim:history",
     "channels:read", "groups:read", "users:read", "reactions:read", "files:read",
 }
-SLACK_SCOPE_VERSION = "v1"
+# Bumped with the scope set: installs sealed at v1 predate `chat:write` and cannot send.
+SLACK_SCOPE_VERSION = "v2"
+
+# The scope `chat.postMessage` requires. `chat:write.public` additionally allows posting to a
+# public channel the bot has NOT joined; it is not requested — posting only where the founder
+# has actually invited Navis is the least-privilege default.
+SLACK_WRITE_SCOPES = ("chat:write",)
+
+
+def slack_write_granted(scopes: str | None) -> bool:
+    """True iff the stored scope string permits posting a message.
+
+    Mirrors `gmail_send_granted` / `calendar_write_granted`, and exists for the same reason:
+    every workspace installed before `chat:write` was requested keeps all of its read features
+    working, and the sender fails LOUD with a reconnect instruction BEFORE calling Slack rather
+    than surfacing a bare `missing_scope` from deep inside a worker retry.
+
+    Slack stores scopes COMMA-separated (`_validate_scopes` splits the same way) — unlike
+    Google's space-separated string. Splitting on the wrong delimiter would read the whole grant
+    as one unrecognised scope and refuse every send.
+    """
+    if not scopes:
+        return False
+    granted = {s.strip() for s in scopes.split(",")}
+    return any(s in granted for s in SLACK_WRITE_SCOPES)
 
 
 class SlackOAuthError(Exception):

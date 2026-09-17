@@ -219,9 +219,36 @@ async def _on_signal_pointer(event: DomainEvent) -> None:
         await IdentityResolutionService(db).ingest_signal(uuid.UUID(event_id))
 
 
+# EVERY calendar pointer, not just CREATED — and that is not a widening, it is
+# the list this module always claimed to have.
+#
+# `SignalIngestionService` routes by the ACTUAL event_type, so a calendar signal
+# arrives as one of THREE bus events, and `CalendarConnector._event_type` only
+# returns CREATED when `raw["created"] == raw["updated"]` — an event never touched
+# since it was made. Every edited or re-synced event is UPDATED, and a deletion is
+# CANCELLED. Subscribing to CREATED alone therefore dropped the normal case.
+#
+# Measured against production on 2026-08-21, this was not a corner case: all NINE
+# calendar signals were `calendar.event.updated`, every one carried a populated
+# `attendees` array with `email` keys, all nine were captured AFTER this
+# subscriber went live — and `identity_aliases` held 48 rows, every one of them
+# `provider='gmail'`. Not a single calendar attendee had ever entered the identity
+# graph, so a person you only ever MEET (never email) was invisible to
+# `/identity/persons/*` and to the chat scheduling agent that reads them.
+#
+# `memory.service` subscribes to all four and always did; the docstring above
+# promising "the SAME pointer events Memory consumes" was describing that list,
+# not this one. These two lines make the sentence true.
+#
+# Purely additive: `_calendar_aliases` emits aliases and NO co-observation pairs,
+# so this can only ever append alias rows — it cannot create a link edge and
+# therefore cannot merge two people. Inserts are idempotent on the deterministic
+# PK, so re-delivery and replay converge.
 for _evt in (
     EventType.GMAIL_RECEIVED,
     EventType.CALENDAR_EVENT_CREATED,
+    EventType.CALENDAR_EVENT_UPDATED,
+    EventType.CALENDAR_EVENT_CANCELLED,
     EventType.MEETING_COMPLETED,
     EventType.SLACK_MESSAGE_RECEIVED,
     EventType.SIGNAL_INGESTED,

@@ -5,11 +5,37 @@ imports `settings`.
 """
 from __future__ import annotations
 
+import enum
 from functools import lru_cache
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Environment(str, enum.Enum):
+    """The deployment environment. A CLOSED set, deliberately.
+
+    `is_production` gates four independent controls — production config checks,
+    field-encryption fail-fast, OAuth-token-encryption fail-fast, and the default
+    plan a new org is provisioned with. It was previously a free-form string
+    compared with `== "production"`, so `ENVIRONMENT=prod`, a trailing space, or a
+    misspelling silently took the PERMISSIVE branch of all of them at once:
+    credentials stored unencrypted and the startup safety net skipped — with no
+    error and no log line.
+
+    It deliberately no longer gates authorization. Entitlement resolution and the
+    capability guard used to consult it and grant everything outside production,
+    which made a single missing env var equivalent to disabling the capability
+    boundary. Authorization now depends only on org state, never on deployment.
+
+    Making it an enum means an unrecognised value fails at import, before the
+    process can serve a request. Wrong config now cannot masquerade as dev.
+    """
+
+    DEVELOPMENT = "development"
+    STAGING = "staging"
+    PRODUCTION = "production"
 
 
 class Settings(BaseSettings):
@@ -34,7 +60,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://localhost/navis"
 
     # ---- Redis ----
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = "redis://localhost:6380/0"
     # Failure-domain separation (Phase 6): cache and the event stream can be split
     # onto independent Redis instances later WITHOUT code change — each defaults to
     # `redis_url`. A cache outage then can't take down event mirroring, and vice versa.
@@ -85,6 +111,13 @@ class Settings(BaseSettings):
     # the cursor — silently stopping mid-drain would skip messages forever (the cursor
     # would jump past unread history pages).
     gmail_onboard_message_cap: int = 500
+    # Onboarding backfill window (in days). full_sync passes this as
+    # Gmail's `q=newer_than:{N}d` query so we only pull recent mail —
+    # older messages stay in the user's inbox but never enter our
+    # signal log, memory, or state. Prevents the dashboard from
+    # surfacing 3-week-old threads as "slipping commitments" on first
+    # connect. Frontend surface filters (15 days) sit on top of this.
+    gmail_onboard_lookback_days: int = 30
     gmail_max_history_pages: int = 200
     # Slack capture: the signing secret verifies inbound Events API webhooks (HMAC-SHA256);
     # the timestamp window rejects replayed captures. Backfill caps bound onboarding REST
@@ -105,7 +138,39 @@ class Settings(BaseSettings):
     azure_openai_endpoint: str | None = None
     azure_openai_api_key: str | None = None
     azure_openai_deployment: str | None = None
+    # Embeddings live behind their OWN Azure deployment (chat and embedding
+    # models are different SKUs in Azure — one deployment cannot serve both).
+    # Leave unset to fall back to the deterministic hash-based embedder, which
+    # keeps chat working offline without touching Azure at all. When set, this
+    # value MUST be the deployment name in your Azure OpenAI resource, not the
+    # underlying model name — Azure routes by deployment. The model column in
+    # `memory_embeddings` will be recorded as this string, so changing it will
+    # transparently invalidate old embeddings (the version-and-model index
+    # keeps them isolated — no bad hits, just a re-embed on the next backfill).
+    azure_openai_embed_deployment: str | None = None
     azure_openai_api_version: str = "2024-12-01-preview"
+
+    # ---- Embedding read pin (migration control) ----
+    # Retrieval reads a SPECIFIC (model, version) index. Writes go to whatever
+    # the configured embedding provider produces. Keeping the two independent is
+    # what makes a re-embed safe: the new index is built to completion in the
+    # background while every query keeps hitting the old, complete one.
+    #
+    # Both unset (the default) => reads follow writes, i.e. exactly today's
+    # behaviour. During a migration, pin reads to the CURRENT index first, then
+    # switch the write provider, backfill, verify, and finally move the pin.
+    # Rollback is moving the pin back — the old vectors are never deleted.
+    #
+    # `embedding_read_model` must name an index that exists: either the
+    # deterministic embedder's model or the configured Azure embed deployment.
+    embedding_read_model: str | None = None
+    embedding_read_version: int | None = None
+
+    # ---- Embedding backfill ----
+    # Records claimed per keyset page, and texts per provider embed call. The
+    # embed batch is bounded well under Azure's 2048-inputs-per-request limit.
+    embedding_backfill_page_size: int = 500
+    embedding_backfill_batch_size: int = 128
 
     # ---- OAuth ----
     google_client_id: str | None = None
@@ -115,6 +180,22 @@ class Settings(BaseSettings):
     slack_client_id: str | None = None
     slack_client_secret: str | None = None
     slack_redirect_uri: str | None = None
+
+    # ---- Gmail push (authenticated Cloud Pub/Sub) ----
+    # Defined HERE rather than read straight from os.environ so they load from .env
+    # like the rest of config AND can be validated at startup. A real exported env
+    # var still wins (pydantic-settings reads the environment first), so production
+    # secret managers are unaffected.
+    #
+    # `topic` is what `GmailConnector.create_watch` registers with Google; the other
+    # three are what `verify_pubsub_request` checks on every push. They are a SET:
+    # registering a topic without pinning the audience and the pushing identity would
+    # open an authenticated-looking endpoint that verifies almost nothing, so
+    # `_enforce_production_safety` refuses that combination.
+    google_pubsub_topic: str | None = None       # projects/<p>/topics/<t>
+    google_pubsub_audience: str | None = None    # the push endpoint URL Google signs for
+    google_pubsub_sa_email: str | None = None    # push service account (email claim)
+    google_pubsub_sub: str | None = None         # push service account (stable OIDC `sub`)
     # Where OAuth callbacks bounce the browser after finishing the
     # code exchange. This is a FRONTEND URL (not a Google redirect_uri —
     # that stays pointed at the backend callback so client_secret stays
@@ -123,8 +204,17 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:3000"
 
     # ---- Background tasks ----
-    celery_broker_url: str = "redis://localhost:6379/2"
-    celery_result_backend: str = "redis://localhost:6379/3"
+    celery_broker_url: str = "redis://localhost:6380/2"
+    celery_result_backend: str = "redis://localhost:6380/3"
+    # When True, POST /actions/{id}/approve schedules an INLINE execution
+    # pass (asyncio.create_task) alongside the Celery enqueue. This lets
+    # meeting scheduling work end-to-end WITHOUT a running Celery worker
+    # — the approve endpoint returns immediately, and the execution
+    # (real Google Calendar events.insert) runs in the same FastAPI
+    # process seconds later. Suitable for local dev / demos. In
+    # production, run a real Celery worker and set this to False so
+    # retry / rate-limiting / dead-letter policies are honoured.
+    execution_inline_fallback: bool = True
 
     # ---- Feature flags ----
     enable_google_auth: bool = True
@@ -136,13 +226,26 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # ---- Environment ----
-    environment: str = "development"  # development | staging | production
+    # Validated against the Environment enum below — an unknown value is a startup
+    # error, never a silent downgrade to permissive behaviour.
+    environment: Environment = Environment.DEVELOPMENT
 
     # ---- Database pool ----
     db_pool_size: int = 10
     db_max_overflow: int = 20
     db_pool_recycle_seconds: int = 300  # Neon drops idle conns ~5m; recycle below that
     db_pool_timeout_seconds: int = 30
+    # Liveness-check every pooled connection before handing it out. It costs a
+    # FULL EXTRA ROUND TRIP per checkout, which is invisible on a local database
+    # and dominant on a remote one: measured against the production Neon
+    # endpoint, `SELECT 1` on a fresh session went 2689ms -> 1457ms with this
+    # off — 1232ms, 46% of the checkout cost, paid by every HTTP request.
+    #
+    # `db_pool_recycle_seconds` (above) is the real protection: it retires
+    # connections before Neon's ~5m idle drop, so pre-ping was guarding a window
+    # recycling already closes. Left configurable because a deployment with an
+    # unreliable network path may legitimately want to trade the latency back.
+    db_pool_pre_ping: bool = False
     # Server-side cap: a single statement may not run longer than this. Prevents a
     # runaway query from pinning a pooled connection forever (reliability at scale).
     db_statement_timeout_seconds: float = 30.0
@@ -156,6 +259,30 @@ class Settings(BaseSettings):
     # — extended on each new failure). Redis-backed; fails OPEN if Redis is unavailable.
     login_max_attempts: int = 5
     login_lockout_seconds: int = 15 * 60
+
+    # ---- Per-ORGANIZATION rate limits on expensive routes (T-23) ----
+    # Tenant isolation for shared compute: `/chat` alone embeds a query, runs a
+    # full-scan vector search over the org's corpus, folds state and calls an LLM,
+    # and had NO throttle of any kind — one organization could exhaust the DB pool,
+    # the Redis pool, the LLM quota and the API event loop for everyone else.
+    #
+    # Counted per (bucket, organization) in a fixed window, so the limit a tenant
+    # spends is its own. Deliberately NOT tiered by plan: the product contract does
+    # not define per-plan request quotas, and inventing them here would put a
+    # commercial policy in an availability control. These are capacity guards.
+    #
+    # Generous by default — a demo must not trip them — and every value is
+    # overridable per deployment.
+    rate_limit_enabled: bool = True
+    rate_limit_window_seconds: int = 60
+    # Conversational AI: retrieval + generation, the most expensive request.
+    rate_limit_chat_per_window: int = 30
+    # Whole-pipeline recomputes (brief build, action proposal, intelligence
+    # projection) — heavier than chat but driven by a button, not a conversation.
+    rate_limit_pipeline_per_window: int = 12
+    # Context assembly + connector-backed reads: cheaper, but still vector search
+    # and/or an outbound provider call per request.
+    rate_limit_read_per_window: int = 120
 
     # ---- Storage (S3) ----
     aws_region: str = "us-east-1"
@@ -208,9 +335,71 @@ class Settings(BaseSettings):
             return self.jwt_public_key
         return self.secret_key
 
+    @field_validator("environment", mode="before")
+    @classmethod
+    def _normalize_environment(cls, value: object) -> object:
+        """Accept ` Production ` / `PRODUCTION`, reject `prod`.
+
+        Case and surrounding whitespace are deployment noise and are forgiven.
+        Anything else is rejected with the allowed values named, because the
+        alternative — guessing — is what made this fail open. Notably `prod` is
+        NOT accepted: silently treating an abbreviation as production would be
+        the same class of guess in the opposite direction.
+        """
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().lower()
+        allowed = {e.value for e in Environment}
+        if normalized not in allowed:
+            raise ValueError(
+                f"ENVIRONMENT={value!r} is not recognised. "
+                f"Use one of: {', '.join(sorted(allowed))}. "
+                "This gates encryption enforcement, entitlements and the "
+                "production config checks — it must never be guessed."
+            )
+        return normalized
+
     @property
     def is_production(self) -> bool:
-        return self.environment.lower() == "production"
+        """True only in production.
+
+        Compares by VALUE rather than enum identity. The field is validated at
+        startup so it can only hold one of three values, but pydantic does not
+        re-validate plain attribute assignment — and tests monkeypatch this
+        attribute with a raw string. An identity check would quietly report
+        "not production" for `settings.environment = "production"`, which is the
+        same fail-open this enum exists to remove, just moved to runtime.
+        """
+        env = self.environment
+        value = env.value if isinstance(env, Environment) else str(env).strip().lower()
+        return value == Environment.PRODUCTION.value
+
+    def relaxed_controls(self) -> list[str]:
+        """Security/billing controls NOT enforced in this environment.
+
+        Surfaced at startup so a machine running with development defaults says
+        so out loud. An unset ENVIRONMENT still defaults to development — the
+        remaining fail-open path — and this is what makes that visible instead
+        of silent. Empty in production.
+        """
+        if self.is_production:
+            return []
+        return [
+            "production config safety checks (SECRET_KEY strength, DEBUG, /docs)",
+            "field-encryption fail-fast (PII may be stored unencrypted if keys are unset)",
+            "OAuth-token-encryption fail-fast (tokens may be stored plaintext if keys are unset)",
+            # Entitlement ENFORCEMENT is no longer relaxed anywhere — the gate is the
+            # same code in every environment. What is still relaxed is the plan a new
+            # org is seeded with, which grants breadth through real entitlement rows
+            # the gate then evaluates normally.
+            "plan defaults / seeded entitlements (new orgs get ENTERPRISE, not FREE)",
+            # Likewise not an authorization relaxation: the inline pass runs the
+            # SAME claim/authorize/execute code the worker runs, just on the API
+            # event loop and outside the rate limiter and retry budget. Named here
+            # because a developer should know side effects can fire from the web
+            # process without a worker running.
+            "execution worker isolation (approved actions may run inline on the API loop)",
+        ]
 
     @property
     def db_is_pooled(self) -> bool:
@@ -232,6 +421,75 @@ class Settings(BaseSettings):
             problems.append("DATABASE_URL points at localhost")
         if self.show_docs:
             problems.append("SHOW_DOCS should be False (do not expose /docs publicly)")
+        # A wildcard origin is never a deliberate production choice. Starlette
+        # returns `Access-Control-Allow-Origin: *` for it, which makes every
+        # unauthenticated response readable by any site on the internet, and with
+        # `allow_headers=["*"]` a preflight for `Authorization` also succeeds — so
+        # any origin may call the API on behalf of anyone holding a token. Verified
+        # empirically before adding this check.
+        if any(o == "*" for o in self.cors_origins_list):
+            problems.append(
+                "CORS_ORIGINS must not contain '*' — name the frontend origins explicitly"
+            )
+        if not self.cors_origins_list:
+            problems.append("CORS_ORIGINS must name at least one frontend origin")
+        # SIGNAL-CRYPTO-002. Production storage was verified free of legacy
+        # plaintext in TASK 6.4.1, and this switch is what keeps it that way: with
+        # it off, an untagged token is silently trusted again and encryption-at-rest
+        # can regress unnoticed (which is exactly how it regressed the first time).
+        #
+        # Deliberately coupled to ENVIRONMENT rather than defaulted to True: turning
+        # it on where tokens have NOT been migrated would break those integrations,
+        # so it must stay an explicit per-environment decision. Requiring it here
+        # means the operator who sets ENVIRONMENT=production is told, at that
+        # moment, that this is the other half of the same change.
+        if not self.signals_reject_legacy_plaintext:
+            problems.append(
+                "SIGNALS_REJECT_LEGACY_PLAINTEXT must be true in production "
+                "(run navis.signals.token_backfill.reencrypt_legacy_tokens first, "
+                "then confirm zero plaintext tokens)"
+            )
+        # EXECUTION_INLINE_FALLBACK. The setting's own docstring already states the
+        # contract — "In production, run a real Celery worker and set this to
+        # False" — and nothing enforced it, while the default is True. Left on, the
+        # approve endpoint schedules `asyncio.create_task(_execute())` and the
+        # provider call (a real Gmail send, a real Calendar write) runs on the API
+        # process's event loop, sharing it with every other tenant's requests.
+        #
+        # It is not only a latency concern. The inline pass bypasses the worker's
+        # operational envelope: the per-provider rate limiter, the retry budget,
+        # dead-lettering and stale-execution recovery all live on the Celery path.
+        # A tenant approving a batch would run unthrottled side effects inside the
+        # web process, and a process restart mid-flight loses the pass with no
+        # lease to recover from.
+        #
+        # A startup refusal rather than a silent override, for the same reason as
+        # every other check here: a production box that quietly behaved like
+        # development is exactly the failure this function exists to prevent.
+        if self.execution_inline_fallback:
+            problems.append(
+                "EXECUTION_INLINE_FALLBACK must be false in production "
+                "(run a Celery worker; the inline pass bypasses rate limiting, "
+                "retries and dead-lettering, and executes on the API event loop)"
+            )
+        # Gmail push is all-or-nothing. Registering a Pub/Sub topic makes Google POST
+        # to the public webhook, and that endpoint can only authenticate the push if it
+        # knows BOTH the audience Google signs for and which service account is allowed
+        # to send it. Half-configured is the dangerous state — it looks provisioned
+        # while pinning nothing — so it is a startup error rather than a runtime
+        # surprise. Configuring none of them is fine: the endpoint then refuses every
+        # request (503) and ingestion runs on the polling schedule.
+        if self.google_pubsub_topic:
+            if not self.google_pubsub_audience:
+                problems.append(
+                    "GOOGLE_PUBSUB_TOPIC is set but GOOGLE_PUBSUB_AUDIENCE is not — "
+                    "push tokens could not be audience-verified"
+                )
+            if not (self.google_pubsub_sa_email or self.google_pubsub_sub):
+                problems.append(
+                    "GOOGLE_PUBSUB_TOPIC is set but neither GOOGLE_PUBSUB_SA_EMAIL nor "
+                    "GOOGLE_PUBSUB_SUB is — the pushing service account would not be pinned"
+                )
         if problems:
             raise ValueError("Insecure production config: " + "; ".join(problems))
         return self
@@ -261,9 +519,32 @@ class Settings(BaseSettings):
         return "sslmode=require" in self.database_url or "neon.tech" in self.database_url
 
 
+class ConfigurationError(RuntimeError):
+    """Startup configuration is invalid. Carries the reasons, never the values."""
+
+
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    """Build the settings singleton, converting a validation failure into a message
+    that CANNOT carry configuration values.
+
+    pydantic's `ValidationError` renders `input_value=` alongside the reason — the
+    whole settings dict, truncated to a fixed head and tail. That truncation is a
+    length accident, not a redaction: which fields land inside the window depends on
+    field order, so a future field could put a key or password into a message that
+    is printed by the process supervisor, shipped to log aggregation and pasted into
+    tickets. Re-raising with only the reason strings removes the possibility rather
+    than relying on where the ellipsis falls.
+    """
+    from pydantic import ValidationError
+
+    try:
+        return Settings()
+    except ValidationError as exc:
+        reasons = "; ".join(
+            str(e.get("msg", "")).replace("Value error, ", "") for e in exc.errors()
+        )
+        raise ConfigurationError(f"invalid configuration: {reasons}") from None
 
 
 settings = get_settings()

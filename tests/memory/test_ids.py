@@ -44,3 +44,25 @@ def test_entity_id_groups_facts_about_one_entity():
     e1 = entity_id(ORG_A, "person", "Alice@Acme.com")
     e2 = entity_id(ORG_A, "person", "alice@acme.com ")  # case + whitespace normalized
     assert e1 == e2
+
+
+# ── Entity-scoped reads are what make expansion possible (TASK 7.5.1) ──────
+
+
+def test_entity_id_is_computable_from_an_email_alias():
+    """Ask's context expansion turns a resolved identity into memory rows WITHOUT
+    a search: it computes the entity id from the person's email and reads by id.
+
+    That only works because the natural key for a person IS the email and the
+    derivation is pure. If this ever stops holding, the expansion silently
+    fetches nothing and entity questions quietly get worse — so it is pinned.
+    """
+    a = entity_id(ORG_A, "person", "alice@acme.com")
+    b = entity_id(ORG_A, "person", "ALICE@Acme.com")
+    assert a == b, "email natural keys are case-insensitive"
+    assert entity_id(ORG_B, "person", "alice@acme.com") != a, "tenant-isolated"
+    # Each type the expansion asks for is a DIFFERENT entity, so one alias
+    # produces several ids rather than colliding into one.
+    ids = {entity_id(ORG_A, t, "alice@acme.com")
+           for t in ("person", "relationship", "commitment")}
+    assert len(ids) == 3

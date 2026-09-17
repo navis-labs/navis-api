@@ -65,7 +65,13 @@ class StateSnapshot(Base):
     projection_version: Mapped[int] = mapped_column(Integer, primary_key=True)
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    # Cursor into Memory: everything up to (and including) this point is folded in.
+    # OBSERVATION cursor into Memory: every record Navis had observed up to (and
+    # including) this point is folded in. `watermark_timestamp` is
+    # `memory_records.created_at` — when the fact was LEARNED — not
+    # `event_timestamp`, which is when it happened and can be in the future for a
+    # calendar meeting. Bounded by wall clock by construction; see
+    # `state/v2/models.py::Watermark`. (projection_version 2 onward; version 1
+    # rows carry an event-time cursor and are ignored by `latest()`.)
     watermark_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     watermark_memory_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

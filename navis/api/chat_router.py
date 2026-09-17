@@ -1,0 +1,2335 @@
+"""Ask Navis — the ORCHESTRATION entry point above the pipeline.
+
+Ask is not another layer in BUSINESS SYSTEMS → SIGNALS → MEMORY → STATE →
+CONTEXT → REASONING/ML → INTELLIGENCE → DECISION → EXECUTION → OBSERVATION →
+LEARNING → ADAPTIVE. It sits above it: a question arrives, this module works out
+what organizational reality answering it requires, asks the layers that own that
+reality, and hands the model an already-grounded bundle to put into words.
+
+  question
+    → classify()                     ONE routing decision (reasoning.routing)
+    → _resolve_question_subject()    the EXISTING identity graph decides WHO
+         ambiguous → clarification, never a guess
+    → _state_groundings()            State ├─ scope_for  → Grounding(state)
+                                           └─ reasoning  → Grounding(reasoning)
+    → ContextBuilder.build(retrieval_query=<resolved aliases>)
+         MemoryRetriever (vector + rerank)  → Grounding(memory)
+         learning_groundings()              → Grounding(learning)
+         intelligence_groundings()          → Grounding(intelligence)
+         _compose: conclusions, State, evidence — budgeted to _CONTEXT_TOKEN_BUDGET
+    → generation.explanation | recommendation | summary
+    → MLProvider (Claude / Azure / Gemini / DeterministicProvider fallback)
+    → ChatResponse { content, citations[+lineage], entity, stateWatermark }
+
+THE LLM IS NOT THE SOURCE OF ORGANIZATIONAL TRUTH. It receives a GroundedContext
+and nothing else — no raw rows, no tools, no way to reach a side effect — and its
+job is to explain what Memory/State/Reasoning/Intelligence already concluded.
+Every enrichment above is best-effort: losing one costs the answer some depth,
+never the turn.
+
+No canned strings. No fabricated citations. No invented importance: when the org
+has nothing on a question we say so rather than manufacture a reason.
+
+Command intents (schedule / reschedule / cancel / email) skip the answer path
+entirely and run their own deterministic agents, which end in a REQUESTED
+ExecutionRequest a human still has to approve. Chat never executes anything.
+"""
+from __future__ import annotations
+
+import asyncio
+import re
+import uuid
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from typing import Any, Literal
+
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from navis.api.workspace_fallback import (
+    build_workspace_context,
+    connected_source_labels,
+)
+from navis.execution.models import ActionType, ExecutionOrigin
+from navis.execution.service import ExecutionService
+from navis.identity.authz import Principal
+from navis.identity.throttle import rate_limit
+from navis.identity_resolution.search import search_persons
+from navis.organization.contract import Capability
+from navis.organization.guards import require_capability
+from navis.organization.service import OrganizationService
+from navis.ml.generation.narratives import explanation, recommendation, summary
+from navis.ml.rag.context_builder import ContextBuilder, estimate_tokens
+from navis.ml.rag.grounding import Grounding, GroundedContext
+from navis.ml.rag.time_window import parse_time_window
+from navis.platform.database import get_session
+from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import metrics, timed
+from navis.memory.envelope import EntityType
+from navis.memory.lineage import classifications_by_entity
+from navis.reasoning.calendar_ops import (
+    CalendarOpsAgent,
+    CalendarOpsClarification,
+    CalendarOpsContext,
+    MeetingMutationProposal,
+)
+from navis.reasoning.calendar_query import CalendarQueryAgent, CalendarQueryContext
+from navis.reasoning.email_ops import (
+    EmailClarification,
+    EmailOpsAgent,
+    EmailOpsContext,
+    EmailProposal,
+)
+from navis.reasoning.routing import ChatRoute, classify
+from navis.reasoning.scheduling import (
+    Clarification,
+    ScheduledProposal,
+    SchedulingAgent,
+    SchedulingContext,
+)
+from navis.reasoning.scheduling.contract import ChatTurn, PendingScheduling
+from navis.reasoning.v2 import run_reasoning_v2
+from navis.state.v2 import (
+    MorningBrief,
+    OrganizationalState,
+    StateService,
+    scope_for,
+)
+from navis.state.v2.scope import EntityRef, ScopedView
+
+logger = get_logger("api.chat_router")
+
+router = APIRouter(tags=["chat"])
+
+
+# ── Wire shapes (match src/lib/types.ts NavisChatMessage) ───────────────────
+
+
+class ChatCitation(BaseModel):
+    # "intelligence" and "learning" are additions: a persisted insight and an
+    # outcome aggregate were both being reported as "episodic", i.e. as a
+    # remembered email. The frontend's `formatMemoryType` falls through to the
+    # raw string for an unknown value, so an older client degrades to showing the
+    # word rather than breaking — see the handoff note in the task report.
+    type: Literal["episodic", "semantic", "state", "decision", "intelligence", "learning"]
+    source: str
+    detail: str | None = None
+    # Drill-down for a DERIVED citation, as the producing layer recorded it:
+    # "memory:<uuid>", "signal:<uuid>", "reasoning_signal:<uuid>",
+    # "learning_event:<id>", "state_watermark:<id>", "learning_version:<n>".
+    # Empty for a fact that is already its own lowest level (a memory record) or
+    # that recorded no lineage. Never synthesised.
+    lineage: list[str] = Field(default_factory=list)
+
+
+class ChatEntity(BaseModel):
+    """The person this question resolved to, via the identity graph.
+
+    Present only when `identity_resolution` folded the question's subject to
+    exactly ONE canonical person. Absent when the question named nobody we know,
+    and absent when it named several — an ambiguous subject is reported as a
+    `person_disambiguation` clarification instead, never silently narrowed here.
+
+    `canonical_id` is the identity-graph id (the smallest alias uuid in the
+    equivalence class), the same one `/identity/persons/lookup` returns, so a
+    client can navigate from an answer to the person it is about.
+    """
+
+    canonical_id: str
+    display_name: str | None = None
+    email: str | None = None
+
+
+class ScheduledMeetingPayload(BaseModel):
+    """Structured meeting payload attached to a schedule_meeting proposal.
+
+    Mirrors the fields the ScheduleMeetingProposalCard renders. Kept
+    separate from the executor's opaque `payload` so the frontend has a
+    typed contract to render against — the executor still receives the
+    dict via `structured_payload` -> ExecutionRequest.payload.
+    """
+
+    attendee_email: str
+    attendee_name: str | None = None
+    start: str  # ISO 8601 with offset
+    end: str
+    time_zone: str
+    duration_minutes: int
+    title: str
+    description: str | None = None
+    source_signal_event_id: str | None = None
+    thread_id: str | None = None
+    assumptions: list[str] = Field(default_factory=list)
+
+
+class ChatActionProposal(BaseModel):
+    id: str
+    label: str
+    channel: Literal[
+        "call",
+        "draft_email",
+        "send_email",
+        "schedule_meeting",
+        # Cancelling an existing meeting is its own channel: the governance
+        # policy for removing a meeting is not the policy for booking one.
+        "cancel_meeting",
+        "send_slack",
+        "open_decision",
+        "open_thread",
+        "delegate_to",
+        "cancel",
+    ]
+    primary: bool = False
+    estimatedDurationMinutes: int | None = None
+    decisionId: str | None = None
+    href: str | None = None
+    # Real-execution wiring — populated on structured schedule_meeting
+    # proposals so the frontend can approve through the canonical
+    # /actions/{id}/approve pipeline and poll GET /actions/{id} for
+    # status transitions. `execution_status` is a snapshot at proposal
+    # time; the frontend polls for authoritative updates.
+    execution_id: str | None = None
+    execution_status: str | None = None
+    action_type: str | None = None
+    structured_payload: ScheduledMeetingPayload | None = None
+
+
+class ChatClarification(BaseModel):
+    """Structured follow-up when the scheduling agent needs more input.
+
+    Mirrors `reasoning.scheduling.contract.Clarification` on the wire so
+    the frontend renders one clarification component regardless of which
+    slot needs disambiguation. `datetime` = both date+time missing;
+    `scope` = calendar-connection issue (frontend shows Reconnect CTA
+    ONLY on scope, never on datetime/date/time asks).
+    """
+
+    field: Literal[
+        "attendee",
+        "date",
+        "datetime",
+        "time",
+        "duration",
+        "person_disambiguation",
+        # "which of these existing meetings did you mean?" — the calendar-ops
+        # disambiguation. `options` carries {event_id, label, start, end}; the
+        # frontend echoes the picked `event_id` back as
+        # `pending_calendar_event_id` on the next turn.
+        "event",
+        "scope",
+    ]
+    question: str
+    options: list[dict] = Field(default_factory=list)
+    resolved: dict = Field(default_factory=dict)
+
+
+class ChatRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    user_id: str | None = None  # legacy client field; ignored (auth from token)
+    # Optional context the scheduling agent uses for pronoun resolution.
+    # Frontend sends these opportunistically — every field is optional so
+    # existing callers (and the mock layer) keep working unchanged.
+    active_signal_id: uuid.UUID | None = None
+    thread_id: str | None = Field(None, max_length=256)
+    recent_turns: list[ChatTurn] = Field(default_factory=list, max_length=6)
+    time_zone: str | None = Field(None, max_length=64)
+    # Pending scheduling state echoed back from the LAST turn's
+    # `ChatResponse.clarification.resolved`. The scheduling agent merges
+    # THIS turn's utterance INTO this pending state so multi-turn flows
+    # ("Fix meeting with X" → clarify → "tomorrow at 3 PM") preserve the
+    # attendee and any previously-given slots. None on a fresh request.
+    pending_scheduling: PendingScheduling | None = None
+    # Same echo-back mechanism as `pending_scheduling`, for the other two
+    # multi-turn flows. `pending_calendar_event_id` carries the meeting the user
+    # picked from a disambiguation list; `pending_email` carries whatever the
+    # email agent had resolved (to / subject / body) when it asked for the rest.
+    pending_calendar_event_id: str | None = Field(None, max_length=1024)
+    pending_email: dict[str, Any] | None = None
+
+
+class ChatResponse(BaseModel):
+    id: str
+    role: Literal["assistant"] = "assistant"
+    intent: Literal["question", "command", "navigate"]
+    content: str
+    createdAt: str
+    citations: list[ChatCitation] = Field(default_factory=list)
+    actionProposals: list[ChatActionProposal] = Field(default_factory=list)
+    suggestedActions: list[str] = Field(default_factory=list)
+    decisionId: str | None = None
+    # Populated ONLY when the scheduling agent needs more information.
+    # The frontend renders this inline (attendee/date/time/etc. prompt)
+    # and the user's reply feeds back into the next chat turn.
+    clarification: ChatClarification | None = None
+    # Multi-turn state for the calendar-ops and email flows — the frontend
+    # echoes these back on the NEXT request exactly as it already does with
+    # `clarification.resolved` for scheduling.
+    targetEventId: str | None = None
+    pendingEmail: dict[str, Any] | None = None
+    # WHO this answer is about, when the identity graph resolved it. See ChatEntity.
+    entity: ChatEntity | None = None
+    # WHICH snapshot of the organization the answer describes — the memory record
+    # State folded to, the same value `/brief/today` publishes as
+    # `state_watermark`. Null when State was unavailable for this turn (a cold
+    # projection times out at 4s and the answer degrades to memory only), which
+    # is the honest report: no snapshot, no watermark. It is the field that lets a
+    # client tell "the brief and this answer describe the same organization" from
+    # "one of them is stale".
+    stateWatermark: str | None = None
+
+
+# ── Intent detection ────────────────────────────────────────────────────────
+
+_COMMAND_VERBS = re.compile(
+    r"\b(schedule|book|reply|draft|send|delegate|cancel|hand[\s-]?over|"
+    r"loop\s+in|ask|call|invite|dismiss|snooze)\b",
+    re.IGNORECASE,
+)
+_NAVIGATE_VERBS = re.compile(
+    r"\b(show|find|open|view|search|where|list|browse)\b", re.IGNORECASE
+)
+# Prioritization asks — "what should I do first", "what's most urgent", etc.
+# Wire intent stays "question"; internally we route to the `recommendation` generator
+# instead of `explanation`, which is contractually not allowed to prioritize.
+_PRIORITIZE = re.compile(
+    r"\b("
+    r"what\s+should\s+i\s+(?:do|tackle|focus\s+on)"
+    r"|do\s+first"
+    r"|top\s+priorit(?:y|ies)"
+    r"|most\s+(?:important|urgent|pressing)"
+    r"|prioriti[sz]e"
+    r"|biggest\s+(?:thing|priority)"
+    r"|where\s+should\s+i\s+start"
+    r")\b",
+    re.IGNORECASE,
+)
+# "Summarise this week", "give me a recap", "digest of yesterday" — routes to
+# the `summary` generator (structured What happened / Why it matters / What next),
+# not `explanation` (which is why unfocused summaries were dumping raw facts).
+_SUMMARIZE = re.compile(
+    r"\b(summar(?:i[sz]e|y)|recap|digest|tl;?dr|catch\s+me\s+up)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_prioritization(q: str) -> bool:
+    return bool(_PRIORITIZE.search(q))
+
+
+def _is_summarize(q: str) -> bool:
+    return bool(_SUMMARIZE.search(q))
+
+
+def _detect_intent(q: str) -> Literal["question", "command", "navigate"]:
+    if _COMMAND_VERBS.search(q):
+        return "command"
+    if _NAVIGATE_VERBS.search(q):
+        return "navigate"
+    return "question"
+
+
+def _is_meeting_command(q: str) -> bool:
+    # Kept for the fallback (LLM/prose) branch. The scheduling agent
+    # uses the richer `is_scheduling_intent` detector from
+    # `reasoning.scheduling.intent` so misclassifications here don't
+    # accidentally short-circuit real scheduling utterances.
+    return bool(
+        re.search(r"\b(schedule|book|invite|set\s+up)\b", q, re.IGNORECASE)
+        and re.search(r"\b(meet|meeting|call|sync|chat)\b", q, re.IGNORECASE)
+    )
+
+
+# ── Scheduling decision-id (chat-initiated actions) ─────────────────────────
+# ExecutionRequest.decision_id is required (nullable=False). Brief-driven
+# actions get a real Decision UUID from the daily-brief propose bridge;
+# chat-initiated actions have no Decision behind them, so we synthesize a
+# deterministic UUIDv5 derived from the stable "who + when" of the
+# meeting itself. Same (attendee, slot start) -> same decision -> same
+# idempotency key -> retries + double-approve converge to ONE row.
+_CHAT_DECISION_NAMESPACE = uuid.UUID("d3c2b1a0-9e8f-5a6b-8c7d-1f2e3d4c5b6a")
+
+
+def _chat_scheduling_decision_id(
+    org_id: uuid.UUID, attendee_email: str, start_iso: str
+) -> uuid.UUID:
+    key = f"{org_id}|chat_scheduling|{attendee_email.lower()}|{start_iso}"
+    return uuid.uuid5(_CHAT_DECISION_NAMESPACE, key)
+
+
+def _chat_calendar_ops_decision_id(
+    org_id: uuid.UUID, operation: str, event_id: str, new_start_iso: str
+) -> uuid.UUID:
+    """Same determinism as `_chat_scheduling_decision_id`.
+
+    (event, operation, target slot) → one decision → one idempotency key → one
+    ExecutionRequest. Asking twice for the same change converges instead of
+    queueing two mutations of the same event.
+    """
+    key = f"{org_id}|chat_calendar_ops|{operation}|{event_id}|{new_start_iso}"
+    return uuid.uuid5(_CHAT_DECISION_NAMESPACE, key)
+
+
+def _chat_email_decision_id(
+    org_id: uuid.UUID, to: str, subject: str
+) -> uuid.UUID:
+    """Deterministic per (recipient, subject).
+
+    Note the payload — not just this id — feeds the execution idempotency key,
+    so editing the BODY correctly produces a new request rather than silently
+    reusing the old one.
+    """
+    key = f"{org_id}|chat_email|{to.lower()}|{subject.strip().lower()}"
+    return uuid.uuid5(_CHAT_DECISION_NAMESPACE, key)
+
+
+def _join(items: list[str]) -> str:
+    """"a", "a and b", "a, b and c" — used in the honest empty-state message."""
+    if len(items) == 1:
+        return items[0]
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def _is_draft_command(q: str) -> bool:
+    return bool(re.search(r"\b(draft|reply|send|compose)\b", q, re.IGNORECASE))
+
+
+def _is_cancel_command(q: str) -> bool:
+    return bool(re.search(r"\bcancel\b", q, re.IGNORECASE))
+
+
+# ── Response composition ────────────────────────────────────────────────────
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# Bound the State read on the chat path. State is cache-first here (`get_state`,
+# never `incremental_update`), but a cold cache is a full fold over memory_records
+# and was measured at ~13s against a serverless Postgres — unacceptable inside a
+# chat turn. On timeout we degrade to the pre-existing memory-only behaviour
+# rather than making the founder wait. Same `asyncio.wait_for` pattern the signal
+# sync uses to bound a hung connector.
+#
+# This budget expired on 100% of turns in the Phase 3E evaluation, so State and
+# Reasoning were dropped from every answer.
+#
+# The ROOT cause was `pool_pre_ping` spending an extra round trip on every
+# connection checkout against a remote Postgres (see settings.db_pool_pre_ping);
+# removing it took a fresh-session warm `get_state` from 2.7-2.9s to ~1.4s. That
+# fix is real and is the reason this number is not larger.
+#
+# 2.5s was then tried again on principle and measured back at 26/26 timeouts,
+# because the residual is network RTT to a remote database, which no code change
+# removes, and the distribution straddles the boundary:
+#
+#     warm, steady state      p50 1.4s   p95 1.6s
+#     first call in a process     3.9s   (snapshot read + deserialize)
+#     genuinely cold fold         5.4s   (still correctly refused)
+#
+# 4.0s is sized to that measured distribution: it covers the cold-start call that
+# every fresh process pays once, and still refuses a full rebuild. It is a small
+# share of a turn that already spends ~12s in retrieval and generation.
+_REASONING_GROUNDING_TIMEOUT_S = 4.0
+
+# `Grounding.kind` for a fact derived from a ReasoningSignal. The documented
+# vocabulary is memory | state | learning | intelligence; `kind` is a free string
+# with no validation layer, so this needs no change to the ml.rag type.
+_REASONING_KIND = "reasoning"
+# ...and for one scoped State entity (the canonical Context projection).
+_CONTEXT_KIND = "state"
+
+# Kinds that are DERIVED from State rather than retrieved for the question. They
+# are org-wide and present on nearly every turn, so they must never be counted as
+# "retrieval found something" — doing so permanently suppresses the workspace
+# fallback and silently loses raw Calendar/Gmail evidence.
+_DERIVED_KINDS = frozenset({_REASONING_KIND, _CONTEXT_KIND})
+
+# Keep one entity's rendered fact short: the prompt is a budgeted list of many
+# facts, not a record dump. State's full field dict stays out of the LLM.
+_CONTEXT_LABEL_MAX = 120
+# One rendered detail value (an owner, a subject, a timestamp) and the whole
+# rendered line. Both are hard caps, so a pathological field can never turn one
+# State entity into the entire prompt.
+_CONTEXT_DETAIL_MAX = 90
+_CONTEXT_TEXT_MAX = 320
+# How many members of a list-valued field (attendees, participants, owners) are
+# named before the rest are summarised as "+N more". Bounded, and the count is
+# read off the list itself — nothing is estimated.
+_CONTEXT_LIST_ITEMS = 4
+
+# The one token budget for this path — the same value ContextBuilder.build
+# enforces on the retrieval path, so both branches bound the prompt identically.
+_CONTEXT_TOKEN_BUDGET = 1500
+
+
+def _compose_within_budget(
+    base: GroundedContext, extra: list[Grounding]
+) -> GroundedContext:
+    """Append derived facts to the workspace context under the SAME token budget.
+
+    The workspace fallback constructs its GroundedContext directly instead of
+    going through ContextBuilder, so the builder's budget never applied to it.
+    That was harmless while it carried ~12 short facts; adding State (22) and
+    Reasoning (10) pushed the rendered prompt to ~1777 tokens — past the 1500 the
+    retrieval branch enforces. Same policy as ContextBuilder: admit greedily in
+    order, drop the tail, never summarise away a citation.
+
+    `token_estimate` is recomputed here; `dataclasses.replace` alone would have
+    carried the pre-append value forward and under-reported the real prompt size.
+
+    Costs the RENDERED line per fact, matching ContextBuilder — the citation
+    prefix and date are real prompt tokens, and counting `text` alone
+    under-reported every fact by roughly a third.
+    """
+    admitted = list(base.facts)
+    used = estimate_tokens(replace(base, facts=[]).render()) + sum(
+        estimate_tokens(f.render_line(i)) for i, f in enumerate(admitted, 1)
+    )
+    for fact in extra:
+        cost = estimate_tokens(fact.render_line(len(admitted) + 1))
+        if used + cost > _CONTEXT_TOKEN_BUDGET:
+            continue
+        admitted.append(fact)
+        used += cost
+    return replace(base, facts=admitted, token_estimate=used)
+
+
+# ── How one State entity is rendered for the LLM ────────────────────────────
+#
+# Phase 3E.2 established that the State groundings' problem is not their POSITION
+# in the prompt. It is their CONTENT: "{entity_type}: {label} ({reason})" spent a
+# prompt line on a pointer while the fold had already normalised the answer onto
+# `EntityRef.fields` — the commitment's owner and due date, the meeting's
+# attendees and times, the thread's counterparty and direction. Asked "who owns
+# this?", the model held a commitment whose owner was one dict key away and said
+# it could not tell.
+#
+# The rules for what may be rendered:
+#   * EXISTING fields only, read by name off `EntityRef.fields`. Nothing is
+#     computed, inferred, defaulted or joined — an absent field renders nothing
+#     rather than a guess, so a thin entity stays honestly thin.
+#   * A WHITELIST per entity type, never the dict. `fields` is whatever the
+#     connector's payload carried, so dumping it would leak raw connector shape
+#     into the prompt and break the "State carries pointers, not bodies" rule.
+#   * BOUNDED and DETERMINISTIC: fixed field order, clipped values, capped list
+#     members, capped line. Same entity in, same line out, no clock, no model.
+#   * Bodies stay out. A thread's `snippet` and a document's contents are
+#     retrieval's job; State says what EXISTS and who it involves.
+
+# Which field names the human-readable label is taken from, most identifying
+# first. Covers every type State can hold: person(name/email) company(domain)
+# thread(subject) meeting/document(title) channel/project/customer(name)
+# relationship(person_email). Without `person_email`, relationships rendered as
+# bare UUIDs — useless grounding.
+_LABEL_FIELDS_DEFAULT = (
+    "name", "title", "subject", "person_email", "email", "domain", "text",
+)
+# A commitment or a decision IS its text. The default order reaches `subject`
+# first, which labelled every commitment with the SUBJECT LINE OF THE EMAIL it
+# was extracted from: the org's one open promise reached the model as
+# "commitment: Invitation from an unknown sender: Rahul and Abhi @ Mon 17 Aug
+# ..." instead of "We'll connect NavisLabs to your workflow". The subject is
+# still rendered — as `re`, where it belongs.
+_LABEL_FIELDS: dict[str, tuple[str, ...]] = {
+    EntityType.COMMITMENT.value: ("text",) + _LABEL_FIELDS_DEFAULT,
+    EntityType.DECISION.value: ("text",) + _LABEL_FIELDS_DEFAULT,
+}
+
+# The decision-relevant fields per entity type, in render order: (prefix, keys).
+# Two keys means a name/address pair — "Abhi <a@b.com>" when both are present,
+# whichever exists when only one is. An empty prefix renders the value alone.
+_DETAIL_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    # WHO OWES IT, BY WHEN, ABOUT WHAT. `speaker_*` is the promise's owner in
+    # State's own terms — `folds.compute_links` builds the commitment's `owner`
+    # link from exactly this address.
+    EntityType.COMMITMENT.value: (
+        ("owner", ("speaker_name", "speaker_email")),
+        ("status", ("status",)),
+        # Both due fields render: `due_at` only exists when the promise stated a
+        # date, and `due_text` preserves what was actually said ("end of week").
+        ("due", ("due_at",)),
+        ("due stated as", ("due_text",)),
+        ("promised", ("promised_at",)),
+        ("re", ("subject",)),
+    ),
+    EntityType.DECISION.value: (
+        ("status", ("status",)),
+        # "record" (one the org made) vs "request" (one the org owes) — the whole
+        # difference between an answer and an obligation.
+        ("kind", ("kind",)),
+        ("asked by", ("asked_by_name", "asked_by")),
+        ("asked", ("asked_at",)),
+        ("re", ("subject",)),
+    ),
+    # WHEN and WHO — the two things every meeting question asks for, and the
+    # join that answers "which people appear across both meetings and email".
+    EntityType.MEETING.value: (
+        ("starts", ("starts_at",)),
+        ("ends", ("ends_at",)),
+        ("attendees", ("attendees",)),
+        ("status", ("status",)),
+    ),
+    # WHO is on the other side and WHICH WAY it last moved. `direction ==
+    # "inbound"` means they spoke last and nobody has replied — the fact behind
+    # every "still open / unanswered" question.
+    EntityType.THREAD.value: (
+        ("last message from", ("from_name", "from_email")),
+        ("direction", ("direction",)),
+        ("category", ("category",)),
+        ("participants", ("participants",)),
+    ),
+    # The address is what makes a person joinable to a thread, a meeting and a
+    # relationship. `category` says whether this "person" is a newsletter — a
+    # founder must not be told to re-engage noreply@.
+    EntityType.PERSON.value: (
+        ("", ("email",)),
+        ("category", ("category",)),
+    ),
+    EntityType.RELATIONSHIP.value: (
+        ("direction", ("direction",)),
+        ("via", ("via",)),
+        ("category", ("category",)),
+    ),
+    # A company folds from an email domain and carries only that; the label
+    # already shows it, so `_render_details` drops it as a duplicate. Declared
+    # anyway so a future company field lands in a table that already exists.
+    EntityType.COMPANY.value: (
+        ("domain", ("domain",)),
+    ),
+    EntityType.DOCUMENT.value: (
+        ("owners", ("owners",)),
+        ("status", ("status",)),
+    ),
+    EntityType.PROJECT.value: (
+        ("status", ("status",)),
+    ),
+    EntityType.CUSTOMER.value: (
+        ("ref", ("external_ref",)),
+    ),
+    EntityType.CHANNEL.value: (
+        ("visibility", ("visibility",)),
+    ),
+}
+
+
+def _field_text(value: Any) -> str | None:
+    """One field as prompt text, or None when it carries nothing to say.
+
+    Lists are capped at `_CONTEXT_LIST_ITEMS` with the remainder counted, so an
+    80-attendee meeting costs the same bounded number of tokens as a 2-attendee
+    one. Booleans and numbers are deliberately NOT rendered: no field on the
+    whitelist is one, and stringifying `False` would assert a fact the fold
+    never established.
+    """
+    if isinstance(value, str):
+        return value.strip()[:_CONTEXT_DETAIL_MAX] or None
+    if isinstance(value, (list, tuple)):
+        members = [v.strip() for v in value if isinstance(v, str) and v.strip()]
+        if not members:
+            return None
+        shown = ", ".join(m[:_CONTEXT_DETAIL_MAX] for m in members[:_CONTEXT_LIST_ITEMS])
+        extra = len(members) - _CONTEXT_LIST_ITEMS
+        return f"{shown} +{extra} more" if extra > 0 else shown
+    return None
+
+
+def _label_from_fields(entity_type: str, fields: dict[str, Any]) -> str | None:
+    """The entity's human name, or None when State knows no name for it.
+
+    None rather than the entity_id: a caller rendering a signal's subject wants
+    to say nothing rather than quote a uuid at the model.
+    """
+    for key in _LABEL_FIELDS.get(entity_type, _LABEL_FIELDS_DEFAULT):
+        text = _field_text(fields.get(key))
+        if text:
+            return text[:_CONTEXT_LABEL_MAX]
+    return None
+
+
+def _entity_label(entity: "EntityRef") -> str:
+    """A human-readable name for a scoped entity, whatever type it is.
+
+    Deliberately source-agnostic: it reads State's normalised field names, never
+    anything connector-shaped. A new source that folds into the same entity types
+    renders here with no change.
+    """
+    return _label_from_fields(entity.entity_type, entity.fields) or entity.entity_id
+
+
+def _render_details(entity_type: str, fields: dict[str, Any], label: str) -> str:
+    """The whitelisted fields of one entity, as `prefix value; prefix value`.
+
+    A detail equal to the label is dropped rather than repeated — a company
+    whose only field is the domain it is already named after adds no information
+    for the tokens it costs.
+    """
+    parts: list[str] = []
+    for prefix, keys in _DETAIL_FIELDS.get(entity_type, ()):
+        values = [t for t in (_field_text(fields.get(k)) for k in keys) if t]
+        if not values or values[0] == label:
+            continue
+        rendered = values[0] if len(values) == 1 else f"{values[0]} <{values[1]}>"
+        parts.append(f"{prefix} {rendered}" if prefix else rendered)
+    return "; ".join(parts)
+
+
+def _scoped_view_to_groundings(view: ScopedView) -> list[Grounding]:
+    """ScopedView → cited facts. Pure; no I/O, no org lookup of its own.
+
+    Takes the already-org-scoped view rather than an org_id precisely so this
+    cannot fetch the wrong tenant's state: every entity here came from one
+    `OrganizationalState` built for one org.
+
+    Provenance is preserved, not discarded — `source` is the State entity_id (a
+    deterministic, org-scoped identity) and `lineage` carries the entity's
+    `memory_ids` / `signal_ids` so a citation can still be drilled to the raw
+    record. The ScopedView itself never crosses into `navis.ml`.
+    """
+    groundings: list[Grounding] = []
+    for entity in view.entities:
+        citation = view.citations.get(entity.entity_id)
+        occurred_at: datetime | None = None
+        if entity.last_seen:
+            try:
+                occurred_at = datetime.fromisoformat(entity.last_seen)
+            except ValueError:  # non-ISO last_seen — a fact without a date is fine
+                occurred_at = None
+        label = _entity_label(entity)
+        details = _render_details(entity.entity_type, entity.fields, label)
+        groundings.append(
+            Grounding(
+                kind=_CONTEXT_KIND,
+                source=entity.entity_id,
+                # type: label — the decision-relevant fields State already holds
+                # (reason) — the projection's own explanation of why this entity
+                # made the cut ("open, oldest activity").
+                #
+                # An entity whose whitelisted fields are all absent renders
+                # exactly as it always did; nothing is padded to look richer than
+                # the fold actually is.
+                text=(
+                    f"{entity.entity_type}: {label}"
+                    + (f" — {details}" if details else "")
+                    + f" ({entity.reason})"
+                )[:_CONTEXT_TEXT_MAX],
+                occurred_at=occurred_at,
+                lineage=(
+                    tuple(f"memory:{m}" for m in citation.memory_ids)
+                    + tuple(f"signal:{s}" for s in citation.signal_ids)
+                    if citation
+                    else ()
+                ),
+            )
+        )
+    return groundings
+
+
+async def _reset_session(db) -> None:
+    """Return a session to a usable state after best-effort work failed on it.
+
+    `asyncio.wait_for` CANCELS the coroutine it is waiting on. When that
+    coroutine is a multi-statement DB read, the cancellation lands mid
+    transaction and SQLAlchemy marks it invalid — every later statement on that
+    session then raises `PendingRollbackError: Can't reconnect until invalid
+    transaction is rolled back`, whatever it was trying to do.
+
+    That is what turned a soft degradation into a 500: the timeout branch below
+    correctly returned `[]` and logged a warning, but handed the CALLER a
+    poisoned session, and the very next thing `_grounded_answer` does is
+    retrieval. The enrichment failing must cost the answer some context — never
+    the turn.
+
+    Rolling back discards nothing: everything on this path is read-only, and the
+    request session commits only at the end of `get_session`.
+    """
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001 — a cleanup failure must not mask the original
+        logger.exception("chat: could not reset session after failed enrichment")
+
+
+def _reasoning_text(state: OrganizationalState, signal: Any) -> str:
+    """One ReasoningSignal as a cited conclusion, NAMING whom it is about.
+
+    A signal already carries its subject as `(entity_type, entity_id)`, but the
+    id is a uuid, so rendering `title — why` alone dropped the only part a reader
+    can act on. Measured on the real org: four RELATIONSHIP_COOLING signals
+    reached the model as four identical lines, "Relationship cooling — 7 days
+    since the last interaction.", and every answer about who had gone quiet could
+    only say "several relationships".
+
+    The name is resolved through the SAME `_label_from_fields` the ScopedView
+    path uses, against the state the signal was computed from — one definition of
+    what an entity is called, and no second lookup or ranking. A signal with no
+    subject, a subject State no longer holds, or a subject already spelled out in
+    the title (the obligation engines inline it) renders exactly as before.
+    """
+    title, why = signal.title, signal.why
+    if not signal.entity_type or not signal.entity_id:
+        return f"{title} — {why}"
+    raw = state.entities.get(signal.entity_type, {}).get(signal.entity_id)
+    subject = _label_from_fields(signal.entity_type, (raw or {}).get("fields") or {})
+    if not subject or subject in title:
+        return f"{title} — {why}"
+    return f"{title} ({signal.entity_type}: {subject}) — {why}"
+
+
+async def _relevance_evidence(db, org_id: uuid.UUID) -> dict[str, frozenset[str]]:
+    """Organizational-relevance evidence for Reasoning, read at the composition root.
+
+    Reasoning performs no I/O, so the classification sets it decides relevance
+    from are fetched here and handed in (see `reasoning/v2/base.py`).
+
+    Degrades to `{}` on its OWN, rather than inside the caller's try-block: an
+    empty map means UNKNOWN, and every engine's documented response to UNKNOWN is
+    to keep its prior behaviour. Failing this read must therefore cost the answer
+    some precision, never the whole State/Context enrichment.
+    """
+    try:
+        return await classifications_by_entity(
+            db, org_id, entity_type=EntityType.RELATIONSHIP.value
+        )
+    except Exception:  # noqa: BLE001 — precision is never worth failing the turn
+        logger.exception("chat: relevance evidence unavailable org=%s", org_id)
+        metrics.incr("chat.relevance_evidence.failed")
+        # Same contract as `_state_groundings`: degrade without leaving the
+        # caller a session it cannot use.
+        await _reset_session(db)
+        return {}
+
+
+async def _state_groundings(
+    db: AsyncSession, org_id: uuid.UUID
+) -> tuple[list[Grounding], str | None]:
+    """Current organizational understanding, as cited facts for the LLM.
+
+    Returns `(groundings, state_watermark)`. The watermark is the memory record
+    State actually folded to — the same value `/brief/today` publishes — and it
+    is returned rather than logged because it is the only thing that tells a
+    reader WHICH snapshot of the organization an answer describes. `None`
+    whenever State was unavailable, which is honest: no snapshot, no watermark.
+
+    State is read ONCE and feeds the two parallel deterministic read-side
+    computations, exactly as the architecture defines them:
+
+        State ├─ scope_for(...)      -> ScopedView   -> Grounding(kind="state")
+              └─ run_reasoning_v2()  -> Signal[]     -> Grounding(kind="reasoning")
+
+    Context does NOT feed Reasoning and Reasoning never sees the model. What
+    crosses into `navis.ml` is a flat `list[Grounding]` — never a ScopedView,
+    never a ReasoningSignal, never an OrganizationalState.
+
+    Runs in the API layer on purpose: `navis.ml` may not import `navis.state` or
+    `navis.reasoning` and vice versa (both directions are pinned by AST
+    invariants in tests/ml/test_ml_layer.py), so the composition root is the only
+    place allowed to join them. Same argument as `workspace_fallback`.
+
+    Best-effort by construction. State unavailable, slow, or both projections
+    empty all degrade to `[]`, which leaves the memory → workspace-fallback path
+    exactly as it was. Chat must never fail because State is cold.
+    """
+    try:
+        with timed("chat.state_groundings"):
+            state = await asyncio.wait_for(
+                StateService(db).get_state(org_id),
+                timeout=_REASONING_GROUNDING_TIMEOUT_S,
+            )
+            # Policy is intentionally None: it only tunes `brief_max_items`, and
+            # resolving it costs a second round-trip inside a latency-bounded
+            # path. Chat takes the default per-type cap.
+            view = scope_for(state, MorningBrief(), None, as_of=state.as_of)
+            signals = run_reasoning_v2(
+                state, evidence=await _relevance_evidence(db, org_id)
+            )
+    except asyncio.TimeoutError:
+        # Expected on a cold projection — a normal degradation, not an incident.
+        # Logged at warning WITHOUT a traceback so a cold start doesn't emit a
+        # 100-line stack on every first request.
+        logger.warning(
+            "chat: state read exceeded %.1fs, answering without state/reasoning org=%s",
+            _REASONING_GROUNDING_TIMEOUT_S, org_id,
+        )
+        metrics.incr("chat.state_groundings.timeout")
+        await _reset_session(db)
+        return [], None
+    except Exception:  # noqa: BLE001 — enrichment is never worth failing the turn
+        logger.exception("chat: state grounding unavailable org=%s", org_id)
+        metrics.incr("chat.state_groundings.failed")
+        await _reset_session(db)
+        return [], None
+
+    context_groundings = _scoped_view_to_groundings(view)
+    reasoning_groundings = [
+        Grounding(
+            kind=_REASONING_KIND,
+            # The deterministic ReasoningSignal id — a real lineage pointer, so a
+            # citation resolves back to the engine + state watermark that produced it.
+            source=str(s.signal_id),
+            text=_reasoning_text(state, s),
+            occurred_at=s.state_as_of,
+        )
+        for s in signals
+    ]
+    metrics.incr("chat.state_groundings.context", value=len(context_groundings))
+    metrics.incr("chat.state_groundings.reasoning", value=len(reasoning_groundings))
+    watermark = state.watermark.last_memory_id
+    # Context (what IS the case) before Reasoning (what it implies), so a squeezed
+    # token budget keeps the factual layer and drops interpretation first.
+    # Conclusions before the entities they describe. ContextBuilder re-sorts by
+    # kind anyway, but the workspace-fallback path composes this list directly
+    # (`_compose_within_budget`), so the order has to be right at the source too.
+    return (
+        [*reasoning_groundings, *context_groundings],
+        str(watermark) if watermark else None,
+    )
+
+
+# Which truth layer a `Grounding.kind` belongs to on the wire.
+#
+# Report WHICH layer each citation came from instead of stamping every one
+# "episodic". A ScopedView entity, a ReasoningSignal, an organizational insight
+# and a remembered email are four different kinds of claim, and a reader cannot
+# judge an answer without knowing which they are looking at.
+#
+# `reasoning` maps to "state" deliberately: both are the org's current
+# understanding as opposed to raw recall. `intelligence` and `learning` get their
+# own values because they are neither — an insight is a persisted conclusion with
+# its own id and its own page, and an outcome aggregate is a measurement. Calling
+# either "episodic" (which is what happened before) told the reader they were
+# looking at a remembered email.
+#
+# Anything else — retrieved memory, and the raw workspace-fallback facts whose
+# kind is the connector that produced them (`gmail`, `calendar`) — is recall.
+_CITATION_TYPE_BY_KIND: dict[str, str] = {
+    _REASONING_KIND: "state",
+    _CONTEXT_KIND: "state",
+    "intelligence": "intelligence",
+    "learning": "learning",
+}
+
+
+def _citation(
+    kind: str, source: str, text: str, lineage: tuple[str, ...] = ()
+) -> ChatCitation:
+    """One grounded fact as a wire citation, carrying its drill-down.
+
+    `lineage` was previously computed and thrown away. A ScopedView entity is a
+    fold over many memory records, so its `source` (the entity_id) cannot express
+    what it was built from — `_scoped_view_to_groundings` already resolves that
+    into `memory:<id>` / `signal:<id>` pointers, and an insight already carries
+    its supporting reasoning signals and learning events. Dropping all of it left
+    every derived citation a dead end for the frontend, which is exactly the
+    question "what did Navis use to reach this answer?" that it could not answer.
+
+    Nothing is invented here: the tuple is passed through as the producing layer
+    recorded it, and a fact that recorded no lineage ships an empty list.
+    """
+    return ChatCitation(
+        type=_CITATION_TYPE_BY_KIND.get(kind, "episodic"),
+        source=source,
+        detail=(text or "")[:200] or None,
+        lineage=list(lineage),
+    )
+
+
+# ── Question subject → the identity graph ───────────────────────────────────
+#
+# WHY THIS EXISTS. "Why does <person> matter to my organization?" reached exactly
+# one component that had any notion of who <person> is: the embedding model. The
+# name was never resolved to a canonical identity, so the question was answered
+# by cosine similarity over text that happens to contain the string — while
+# `identity_resolution` sat right there, already folding every alias of every
+# person in the org into one canonical id, and already used by the SCHEDULING
+# branch of this very router (`resolve_attendee` -> `search_persons`).
+#
+# This is deliberately NOT a second entity resolver. It is a conservative
+# candidate EXTRACTOR feeding the existing one: pull plausible person tokens out
+# of the question, hand each to `search_persons`, and let the identity graph
+# decide. A token that matches nobody resolves to nothing and changes nothing.
+_EMAIL_IN_QUESTION = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+# A capitalized run of one or two words — the shape a person's name takes in an
+# English question. Sentence-initial words match too; `_NOT_A_NAME` filters the
+# ones that are grammar rather than identity.
+_CAPITALIZED_RUN = re.compile(r"\b([A-Z][a-z]{1,})(?:\s+([A-Z][a-z]{1,}))?\b")
+# Capitalized tokens that are never a person. Question openers dominate because
+# they are sentence-initial and therefore always capitalized. Kept small on
+# purpose: the real filter is the identity graph — a word that matches no person
+# costs one indexed lookup and resolves to nothing.
+_NOT_A_NAME = frozenset(
+    {
+        "who", "what", "when", "where", "why", "how", "which", "whose",
+        "is", "are", "was", "were", "do", "does", "did", "can", "could",
+        "should", "would", "will", "shall", "the", "a", "an", "my", "our",
+        "their", "his", "her", "its", "this", "that", "these", "those",
+        "tell", "show", "give", "find", "list", "explain", "summarise",
+        "summarize", "recap", "navis", "today", "tomorrow", "yesterday",
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+        "sunday", "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+    }
+)
+# How many distinct candidate tokens we are willing to spend a lookup on. Each is
+# one indexed query; a question naming three capitalized things is already
+# unusual and we would rather answer it unscoped than issue a fan-out.
+_MAX_SUBJECT_CANDIDATES = 3
+
+# The routes that end in an ExecutionRequest. Named once so the entitlement gate
+# in `chat()` cannot drift from the set of branches that actually create rows.
+_ACTION_ROUTES = frozenset(
+    {
+        ChatRoute.SCHEDULE_MEETING,
+        ChatRoute.RESCHEDULE_MEETING,
+        ChatRoute.CANCEL_MEETING,
+        ChatRoute.SEND_EMAIL,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _SubjectResolution:
+    """What the identity graph said about the person this question names.
+
+    Exactly one of these holds:
+      * `match` set        — one person, unambiguously
+      * `candidates` set   — several people matched; the AMBIGUITY IS THE ANSWER
+                             and is surfaced as a clarification, never resolved
+                             by picking the first
+      * both empty         — the question names nobody we know; answer unscoped
+    """
+
+    match: Any = None                      # PersonMatch | None
+    candidates: tuple[Any, ...] = ()       # tuple[PersonMatch, ...]
+    query: str | None = None
+
+    @property
+    def ambiguous(self) -> bool:
+        return len(self.candidates) > 1
+
+
+def _subject_candidates(question: str) -> list[str]:
+    """Plausible person tokens in a question, most specific first.
+
+    Literal addresses lead: an email in a question is an unambiguous reference to
+    a person, and it is the one form that needs no guessing at all.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(token: str) -> None:
+        t = token.strip()
+        if len(t) < 2 or t.lower() in seen:
+            return
+        seen.add(t.lower())
+        out.append(t)
+
+    for email in _EMAIL_IN_QUESTION.findall(question):
+        add(email)
+    for first, second in _CAPITALIZED_RUN.findall(question):
+        if first.lower() in _NOT_A_NAME:
+            continue
+        # Try the full run before the bare first name: "Priya Sharma" is a more
+        # specific reference than "Priya", and `search_persons` is a substring
+        # match, so the longer query narrows rather than widens.
+        if second and second.lower() not in _NOT_A_NAME:
+            add(f"{first} {second}")
+        add(first)
+    return out[:_MAX_SUBJECT_CANDIDATES]
+
+
+async def _resolve_question_subject(
+    db: AsyncSession, org_id: uuid.UUID, question: str
+) -> _SubjectResolution:
+    """Ask the EXISTING identity graph who this question is about.
+
+    Org-scoped by `search_persons`, which filters on `org_id` in every statement
+    it runs — the same call the scheduling branch already makes, so a person is
+    resolved identically whether the founder asks about them or schedules with
+    them. No second identity system, no second notion of who someone is.
+
+    Best-effort: identity resolution failing must cost the answer its entity
+    scoping, never the answer. Returns an empty resolution on any error.
+    """
+    candidates = _subject_candidates(question)
+    if not candidates:
+        return _SubjectResolution()
+    try:
+        for token in candidates:
+            result = await search_persons(db, org_id, token)
+            if not result.matches:
+                continue
+            if result.single is not None:
+                return _SubjectResolution(match=result.single, query=token)
+            # Several people carry this name. Do NOT pick one — see the docstring
+            # on `_SubjectResolution`.
+            return _SubjectResolution(candidates=result.matches, query=token)
+    except Exception:  # noqa: BLE001 — scoping is never worth failing the turn
+        logger.exception("chat: identity resolution unavailable org=%s", org_id)
+        metrics.incr("chat.subject_resolution.failed")
+        await _reset_session(db)
+    return _SubjectResolution()
+
+
+def _retrieval_query(question: str, subject: "_SubjectResolution") -> str:
+    """The text RETRIEVAL embeds — the question, plus who it is actually about.
+
+    The founder's question is what the model is shown (`GroundedContext.question`
+    is unchanged); this is only what the vector search looks for. The difference
+    matters because memory records contain a person's ADDRESS far more often than
+    their display name — a thread is `from: abhishek@acme.com`, not "Abhishek" —
+    so embedding the bare question searched for a string the corpus barely holds.
+
+    Appends the canonical aliases the identity graph resolved. Nothing is
+    invented: every token added is an alias already recorded for that person.
+    """
+    if subject.match is None:
+        return question
+    aliases = [a for a in (*subject.match.emails, *subject.match.display_names) if a]
+    if not aliases:
+        return question
+    return f"{question} {' '.join(aliases)}"
+
+
+# ── Context sufficiency for an entity question ──────────────────────────────
+#
+# MEASURED, NOT ASSUMED. Against the live organization, all eight entity-centric
+# questions in the 7.5.1 probe produced a byte-identical 53-fact bundle at
+# ~1450/1500 tokens, of which only 9-11 facts mentioned the subject at all — and
+# the first seven the model read were org-wide insights that never named them.
+# The question-dependent part of the context was the 8 retrieved memory facts:
+# 15% of the bundle, sitting behind 18 derived facts.
+#
+# So the gate asks the only question that matters for an entity turn: did we
+# actually admit anything ABOUT this person? Not a score, not a confidence — a
+# count of facts whose text names one of their known aliases.
+_MIN_SUBJECT_FACTS = 4
+# Which entity types we fetch by id when it did not. Person is who they are;
+# relationship is the interaction history that answers "what is our relationship"
+# and is the type measurably unreachable by ranking; commitment is what is
+# outstanding between us. Meetings and threads already retrieve well by
+# similarity (they carry names and subjects), so they are not fetched here.
+_EXPANSION_ENTITY_TYPES = ("person", "relationship", "commitment")
+# Newest N per entity type. Four covers "the recent moments" without letting one
+# heavily-observed counterparty flood a 1500-token budget.
+_EXPANSION_PER_ENTITY = 4
+
+
+def _subject_terms(subject: "_SubjectResolution | None") -> tuple[str, ...]:
+    """Lower-cased alias strings that count as naming this person."""
+    if subject is None or subject.match is None:
+        return ()
+    return tuple(
+        a.lower()
+        for a in (*subject.match.emails, *subject.match.display_names)
+        if a
+    )
+
+
+def _mentions_subject(text: str, terms: tuple[str, ...]) -> bool:
+    low = (text or "").lower()
+    return any(t in low for t in terms)
+
+
+async def _entity_expansion(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    subject: "_SubjectResolution",
+) -> list[Grounding]:
+    """ONE targeted, deterministic hop: this person's own memory records.
+
+    Runs only when the sufficiency gate above says retrieval did not find enough
+    about the subject, so a question that retrieval already answered costs
+    nothing extra. Exactly one additional round trip, never a loop.
+
+    NOT A SECOND RETRIEVAL SYSTEM. There is no embedding, no scoring and no
+    ranking here — the entity ids are COMPUTED from the aliases the identity
+    graph already resolved (`memory.ids.entity_id` is uuid5 over organization +
+    type + natural key) and the rows are read through Memory's own
+    `records_for_entities`. Same table, same org filter, same provenance.
+
+    Every fact carries its real `memory_id` as the citation source and its
+    signal/integration lineage in `lineage`, so an expanded fact is exactly as
+    traceable as a retrieved one — signal_event → memory_record → citation.
+    """
+    from navis.memory.ids import entity_id as compute_entity_id
+    from navis.memory.lineage import records_for_entities
+    # The pure, model-free renderer that produced every `source_text` in the
+    # corpus. Called HERE rather than inside Memory because a pipeline domain may
+    # not import `navis.ml`; `api` is the composition root that may touch both —
+    # the same argument `_state_groundings` and `workspace_fallback` already make.
+    from navis.ml.embeddings.service import memory_text
+
+    aliases = [a for a in subject.match.emails if a]
+    if not aliases:
+        return []
+    ids = [
+        compute_entity_id(org_id, etype, alias)
+        for alias in aliases
+        for etype in _EXPANSION_ENTITY_TYPES
+    ]
+    try:
+        records = await records_for_entities(
+            db, org_id, ids, per_entity_limit=_EXPANSION_PER_ENTITY
+        )
+    except Exception:  # noqa: BLE001 — expansion is never worth failing the turn
+        logger.exception("chat: entity expansion unavailable org=%s", org_id)
+        metrics.incr("chat.entity_expansion.failed")
+        await _reset_session(db)
+        return []
+
+    metrics.incr("chat.entity_expansion.facts", value=len(records))
+    out: list[Grounding] = []
+    for r in records:
+        text = memory_text(r)
+        if not text:
+            continue  # nothing semantic to say; never render an empty fact
+        out.append(
+            Grounding(
+                # Retrieved evidence, because that is what it is: a memory record.
+                # It reaches the model in the evidence band beside the vector
+                # hits, not in the conclusion band — nothing here is a conclusion.
+                kind="memory",
+                source=str(r.memory_id),
+                text=text,
+                occurred_at=r.event_timestamp,
+                lineage=(
+                    *((f"signal:{r.source_signal_event_id}",)
+                      if r.source_signal_event_id else ()),
+                    # The connected account this fact was captured on — the ONLY
+                    # honest source of a provider claim. Absent when the record
+                    # did not record one; never inferred from the text.
+                    *((f"integration:{r.source_integration_id}",)
+                      if r.source_integration_id else ()),
+                ),
+            )
+        )
+    return out
+
+
+async def _grounded_answer(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    question: str,
+    subject: "_SubjectResolution | None" = None,
+) -> tuple[str, list[ChatCitation], str | None]:
+    """Real LLM answer over org memory. Returns (text, citations).
+
+    Flow: build the grounded context via vector-search retrieval → run the
+    `explanation` generator (versioned prompt → MLProvider). No caller of
+    this function ever sees the raw DB — the whole pipeline enforces the
+    "LLM only ever reads GroundedContext" contract from `navis.ml.rag`.
+
+    Empty-signal state: when the retriever returns zero facts the LLM is
+    NOT called (would fabricate). We surface a truthful "no memory yet"
+    reply so the founder knows to wait for ingestion instead of trusting
+    an invented answer.
+    """
+    # Single wall-clock reading shared by the parser (so "tomorrow" and the
+    # time-window filter agree) and by GroundedContext (so the LLM has an anchor
+    # for relative-date phrasing instead of guessing from training data).
+    now = datetime.now(timezone.utc)
+    window = parse_time_window(question, now=now)
+    since, until = window if window else (None, None)
+    # The org's current organizational understanding, supplied through the seam
+    # ContextBuilder already exposes for exactly this. `extra` ranks AFTER memory
+    # hits under the same unchanged token budget, so reasoning enriches an answer
+    # without displacing the evidence retrieval found.
+    extra, state_watermark = await _state_groundings(db, org_id)
+    terms = _subject_terms(subject)
+    retrieval_query = _retrieval_query(question, subject) if subject else None
+
+    # ── SUFFICIENCY GATE ─────────────────────────────────────────────────
+    # Runs INSIDE the single build, on what retrieval actually returned, so the
+    # decision costs no extra embedding and no second vector scan.
+    #
+    # It judges the RETRIEVAL SLICE only. State, Reasoning, Intelligence and
+    # Learning are org-wide by construction and present on every turn, so
+    # counting them would declare every context sufficient and the gate would
+    # never fire — which is precisely how a 53-fact bundle with 9 facts about the
+    # subject looked "full".
+    #
+    # Not a score and not a confidence: a count of retrieved facts whose text
+    # names one of this person's known aliases, against a fixed threshold.
+    expansion_count = 0
+
+    async def _expand(retrieved: list[Grounding]) -> list[Grounding]:
+        nonlocal expansion_count
+        if not terms:
+            return []
+        found = sum(1 for f in retrieved if _mentions_subject(f.text, terms))
+        if found >= _MIN_SUBJECT_FACTS:
+            return []
+        metrics.incr("chat.context.insufficient")
+        got = await _entity_expansion(db, org_id, subject)  # type: ignore[arg-type]
+        expansion_count = len(got)
+        logger.info(
+            "chat context expanded org=%s retrieved_about_subject=%d expanded=%d",
+            org_id, found, len(got),
+        )
+        return got
+
+    context = await ContextBuilder(db).build(
+        org_id, question, k=8, token_budget=_CONTEXT_TOKEN_BUDGET, extra=extra,
+        since=since, until=until, now=now,
+        retrieval_query=retrieval_query,
+        # What the question is about, so composition can put facts that name the
+        # subject ahead of org-wide boilerplate. See `_compose`.
+        subject_terms=terms,
+        expand=_expand if terms else None,
+    )
+    # The fallback decision is about RETRIEVAL, not about enrichment. State and
+    # reasoning groundings are org-wide and present on almost every turn, so
+    # counting them here would permanently suppress the workspace fallback and
+    # silently lose the raw Calendar/Gmail evidence it exists to provide.
+    if not [f for f in context.facts if f.kind not in _DERIVED_KINDS]:
+        # Memory is empty for this question — but the WORKSPACE may not be.
+        # Memory lags ingestion (extractors run behind the sync); raw Calendar
+        # and Gmail signals do not. Answering "not enough memory" while three
+        # meetings and a dozen threads sit in signal_events was simply wrong.
+        workspace = await build_workspace_context(db, org_id, question, now=now)
+        if workspace.facts:
+            # Compose: raw workspace evidence FIRST, org understanding after it,
+            # bounded by the same budget the retrieval branch uses.
+            context = _compose_within_budget(workspace, extra)
+        elif not extra:
+            sources = await connected_source_labels(db, org_id)
+            if sources:
+                return (
+                    f"I don't have anything to go on yet — {_join(sources)} "
+                    f"{'is' if len(sources) == 1 else 'are'} connected but "
+                    "nothing has synced into this window. Give the first sync "
+                    "a few minutes and ask again.",
+                    [],
+                    state_watermark,
+                )
+            return (
+                "I can't answer that yet — no workspace sources are connected. "
+                "Connect Gmail and Google Calendar from the Sources page and "
+                "I'll answer from your real data, never from guesswork.",
+                [],
+                state_watermark,
+            )
+        # else: no memory, no workspace, but real reasoning signals — `context`
+        # already holds them, so answer from organizational understanding alone.
+    if _is_prioritization(question):
+        generator = recommendation
+    elif _is_summarize(question):
+        generator = summary
+    else:
+        generator = explanation
+    try:
+        narrative = await generator(org_id, context)
+    except Exception:
+        # LLM provider outage / rate limit / config gap. Fall back to a
+        # citations-only response so the user still sees the retrieved
+        # facts even when the model can't stitch them into prose.
+        logger.exception("chat generation failed org=%s", org_id)
+        cited_lines = "\n".join(f"· {f.text}" for f in context.facts[:5])
+        return (
+            "The reasoning model is temporarily unavailable, but here's "
+            f"what your memory has on this:\n\n{cited_lines}",
+            [_citation(f.kind, f.source, f.text, f.lineage) for f in context.facts[:5]],
+            state_watermark,
+        )
+
+    # `detail` carries a human-readable snippet of the cited fact so the frontend
+    # can render preview text instead of a bare memory_id. Look up the snippet
+    # from the context that was fed to the model — that's the exact fact the
+    # citation refers to.
+    fact_by_source = {f.source: f for f in context.facts}
+    citations = [
+        _citation(f.kind, f.source, f.text, f.lineage)
+        for src in narrative.sources[:5]
+        if (f := fact_by_source.get(src)) is not None
+    ]
+    return narrative.text, citations, state_watermark
+
+
+async def _scheduling_response(
+    request_id: str,
+    body: "ChatRequest",
+    p: Principal,
+    db: AsyncSession,
+    now_utc: datetime,
+) -> ChatResponse:
+    """Run the scheduling agent. On Clarification return a clarification
+    ChatResponse (NO ExecutionRequest — the flow is still open). On
+    ScheduledProposal create the canonical ExecutionRequest and return
+    the structured meeting card.
+
+    Never falls through to the RAG grounded-answer path — scheduling
+    intent owns the request end-to-end. Any recoverable error becomes a
+    `scope` clarification.
+    """
+    ctx = SchedulingContext(
+        org_id=p.org_id,
+        user_id=p.subject_id,
+        utterance=body.question,
+        active_signal_id=body.active_signal_id,
+        thread_id=body.thread_id,
+        recent_turns=body.recent_turns or [],
+        time_zone=body.time_zone or "UTC",
+        now=now_utc,
+        pending=body.pending_scheduling,
+    )
+    agent = SchedulingAgent(db)
+    result = await agent.propose(ctx)
+
+    if isinstance(result, Clarification):
+        # Serialize the pending PendingScheduling to a plain dict so the
+        # ChatClarification wire type stays simple (`resolved: dict`).
+        return ChatResponse(
+            id=request_id,
+            intent="command",
+            content=result.question,
+            createdAt=_now_iso(),
+            clarification=ChatClarification(
+                field=result.field,
+                question=result.question,
+                options=result.options,
+                resolved=result.resolved.model_dump(),
+            ),
+        )
+
+    assert isinstance(result, ScheduledProposal)  # narrow the union
+
+    # Every slot resolved + a free time found. Create the canonical
+    # ExecutionRequest. The decision id is deterministic (same attendee
+    # + slot → same decision) so retries / double-approve converge to
+    # a single row via the existing execution-idempotency key.
+    payload = result.to_execution_payload()
+    decision_id = _chat_scheduling_decision_id(
+        p.org_id, result.attendee.email, result.slot.start.isoformat()
+    )
+    # SOURCE-EVENT provenance, not reasoning provenance. Both of these are
+    # `signal_events.id` values — `active_signal_id` is looked up as a
+    # SignalEventRecord by scheduling/context.py, and `source_signal_event_id`
+    # is derived from it — so neither can ever address a row in
+    # `reasoning_signals`.
+    #
+    # They were being written into `reasoning_signal_ids`, which Learning
+    # aggregates on and Intelligence cites as `supporting_reasoning_signal_ids`.
+    # A signal_event id there is a reference that can never resolve, and it
+    # would have keyed a `signal_intelligence` insight to something that is not
+    # a reasoning signal. Nothing recomputes it back into the right namespace.
+    #
+    # `reasoning_signal_ids` stays EMPTY here, and that is the honest answer: a
+    # scheduling request the founder typed was not concluded by any persisted
+    # ReasoningSignal. The email that prompted it is still recorded — beside it,
+    # in its own namespace.
+    source_signal_event_ids: list[str] = []
+    if body.active_signal_id:
+        source_signal_event_ids.append(str(body.active_signal_id))
+    elif result.source_signal_event_id:
+        # Came from the pending state (attendee resolved on a prior turn from
+        # an email context).
+        source_signal_event_ids.append(str(result.source_signal_event_id))
+
+    svc = ExecutionService(db)
+    req, _created = await svc.request(
+        p.org_id,
+        decision_id,
+        ActionType.SCHEDULE_MEETING.value,
+        payload,
+        reasoning_signal_ids=[],
+        source_signal_event_ids=source_signal_event_ids,
+        reasoning_version=None,
+        state_watermark=None,
+        # Explicit, not defaulted: the founder asked for this in the
+        # conversation and is looking at the card right now, so Chat owns
+        # reviewing it. Mislabelling it PROACTIVE would put it back on the
+        # Action Center board as something "Navis noticed".
+        origin=ExecutionOrigin.CHAT,
+    )
+    await db.commit()
+
+    structured = ScheduledMeetingPayload(
+        attendee_email=result.attendee.email,
+        attendee_name=result.attendee.name,
+        start=result.slot.start.isoformat(),
+        end=result.slot.end.isoformat(),
+        time_zone=result.slot.time_zone,
+        duration_minutes=result.slot.duration_minutes,
+        title=result.title,
+        description=result.description,
+        source_signal_event_id=result.source_signal_event_id,
+        thread_id=result.thread_id,
+        assumptions=result.assumptions,
+    )
+    label = f"Schedule with {result.attendee.name or result.attendee.email}"
+    proposal_chip = ChatActionProposal(
+        id=str(req.id),
+        label=label,
+        channel="schedule_meeting",
+        primary=True,
+        estimatedDurationMinutes=result.slot.duration_minutes,
+        execution_id=str(req.id),
+        execution_status=req.status,
+        action_type=ActionType.SCHEDULE_MEETING.value,
+        structured_payload=structured,
+    )
+    cancel_chip = ChatActionProposal(
+        id=f"cancel_{req.id}",
+        label="Not now",
+        channel="cancel",
+        primary=False,
+    )
+    prose = (
+        f"Here's the proposed meeting with "
+        f"{result.attendee.name or result.attendee.email}. Review the "
+        "details below and click Schedule meeting to send the invite."
+    )
+    return ChatResponse(
+        id=request_id,
+        intent="command",
+        content=prose,
+        createdAt=_now_iso(),
+        actionProposals=[proposal_chip, cancel_chip],
+        decisionId=str(decision_id),
+    )
+
+
+async def _calendar_ops_response(
+    request_id: str,
+    body: "ChatRequest",
+    p: Principal,
+    db: AsyncSession,
+    now_utc: datetime,
+    route: ChatRoute,
+) -> ChatResponse:
+    """Reschedule / cancel an EXISTING meeting.
+
+    Same shape as `_scheduling_response`: a Clarification returns without
+    creating anything; a proposal creates the canonical ExecutionRequest and
+    returns a structured card the founder approves through the normal
+    /actions/{id}/approve pipeline. Nothing here touches Google.
+    """
+    operation = "reschedule" if route is ChatRoute.RESCHEDULE_MEETING else "cancel"
+    ctx = CalendarOpsContext(
+        org_id=p.org_id,
+        utterance=body.question,
+        time_zone=body.time_zone or "UTC",
+        now=now_utc,
+        operation=operation,
+        target_event_id=body.pending_calendar_event_id,
+    )
+    result = await CalendarOpsAgent(db).propose(ctx)
+
+    if isinstance(result, CalendarOpsClarification):
+        return ChatResponse(
+            id=request_id,
+            intent="command",
+            content=result.question,
+            createdAt=_now_iso(),
+            # `none` means "nothing to act on" (no matching meeting) —
+            # informational, so it ships as plain prose with NO clarification
+            # box. Rendering it as a prompt would ask the founder to answer a
+            # question that isn't one. Every other field maps 1:1.
+            clarification=(
+                None
+                if result.field == "none"
+                else ChatClarification(
+                    field=result.field,
+                    question=result.question,
+                    options=result.options,
+                    resolved={},
+                )
+            ),
+            targetEventId=result.target_event_id,
+        )
+
+    assert isinstance(result, MeetingMutationProposal)  # narrow the union
+
+    action_type = (
+        ActionType.RESCHEDULE_MEETING
+        if operation == "reschedule"
+        else ActionType.CANCEL_MEETING
+    )
+    payload = result.to_execution_payload()
+    # Deterministic decision id, same rationale as scheduling: the same event +
+    # the same target slot converge on ONE ExecutionRequest, so a repeated ask
+    # (or a double-submitted turn) can never produce two mutations.
+    decision_id = _chat_calendar_ops_decision_id(
+        p.org_id, operation, result.target.event_id,
+        result.new_start.isoformat() if result.new_start else "",
+    )
+    svc = ExecutionService(db)
+    req, _created = await svc.request(
+        p.org_id,
+        decision_id,
+        action_type.value,
+        payload,
+        reasoning_signal_ids=[],
+        reasoning_version=None,
+        state_watermark=None,
+        # Explicit, not defaulted: the founder asked for this in the
+        # conversation and is looking at the card right now, so Chat owns
+        # reviewing it. Mislabelling it PROACTIVE would put it back on the
+        # Action Center board as something "Navis noticed".
+        origin=ExecutionOrigin.CHAT,
+    )
+    await db.commit()
+
+    if operation == "reschedule":
+        structured = ScheduledMeetingPayload(
+            attendee_email=(result.target.attendees or [""])[0],
+            attendee_name=None,
+            start=result.new_start.isoformat(),  # type: ignore[union-attr]
+            end=result.new_end.isoformat(),  # type: ignore[union-attr]
+            time_zone=result.target.time_zone,
+            duration_minutes=payload["duration_minutes"],
+            title=result.target.title,
+            description=None,
+            assumptions=result.assumptions,
+        )
+        label = f"Move “{result.target.title}”"
+        prose = (
+            f"Here's the change to “{result.target.title}”. Review it and "
+            "approve to update the event — attendees get the new time."
+        )
+    else:
+        structured = ScheduledMeetingPayload(
+            attendee_email=(result.target.attendees or [""])[0],
+            attendee_name=None,
+            start=result.target.start.isoformat(),
+            end=result.target.end.isoformat(),
+            time_zone=result.target.time_zone,
+            duration_minutes=max(
+                int((result.target.end - result.target.start).total_seconds() // 60), 1
+            ),
+            title=result.target.title,
+            description=None,
+            assumptions=result.assumptions,
+        )
+        label = f"Cancel “{result.target.title}”"
+        prose = (
+            f"Ready to cancel “{result.target.title}”. Approve and I'll remove "
+            "it and notify the attendees."
+        )
+
+    return ChatResponse(
+        id=request_id,
+        intent="command",
+        content=prose,
+        createdAt=_now_iso(),
+        actionProposals=[
+            ChatActionProposal(
+                id=str(req.id),
+                label=label,
+                channel="schedule_meeting" if operation == "reschedule" else "cancel_meeting",
+                primary=True,
+                execution_id=str(req.id),
+                execution_status=req.status,
+                action_type=action_type.value,
+                structured_payload=structured,
+            ),
+            ChatActionProposal(
+                id=f"dismiss_{req.id}", label="Not now", channel="cancel", primary=False
+            ),
+        ],
+        decisionId=str(decision_id),
+        targetEventId=result.target.event_id,
+    )
+
+
+async def _email_response(
+    request_id: str, body: "ChatRequest", p: Principal, db: AsyncSession
+) -> ChatResponse:
+    """Compose an outbound email into an approvable ExecutionRequest.
+
+    Never invents the message. Missing recipient or body produces a
+    clarification whose `resolved` state the frontend echoes back, so the
+    follow-up answer alone completes the request.
+    """
+    pending = body.pending_email or {}
+    ctx = EmailOpsContext(
+        org_id=p.org_id,
+        utterance=body.question,
+        pending_to=pending.get("to"),
+        pending_subject=pending.get("subject"),
+        pending_body=pending.get("body"),
+    )
+    result = await EmailOpsAgent(db).propose(ctx)
+
+    if isinstance(result, EmailClarification):
+        return ChatResponse(
+            id=request_id,
+            intent="command",
+            content=result.question,
+            createdAt=_now_iso(),
+            clarification=ChatClarification(
+                field=(
+                    "person_disambiguation"
+                    if result.field == "person_disambiguation"
+                    else "attendee"
+                ),
+                question=result.question,
+                options=result.options,
+                resolved={},
+            ),
+            pendingEmail=result.resolved,
+        )
+
+    assert isinstance(result, EmailProposal)  # narrow the union
+
+    payload = result.to_execution_payload()
+    decision_id = _chat_email_decision_id(p.org_id, result.to, result.subject)
+    req, _created = await ExecutionService(db).request(
+        p.org_id,
+        decision_id,
+        ActionType.SEND_EMAIL.value,
+        payload,
+        reasoning_signal_ids=[],
+        reasoning_version=None,
+        state_watermark=None,
+        # Explicit, not defaulted: the founder asked for this in the
+        # conversation and is looking at the card right now, so Chat owns
+        # reviewing it. Mislabelling it PROACTIVE would put it back on the
+        # Action Center board as something "Navis noticed".
+        origin=ExecutionOrigin.CHAT,
+    )
+    await db.commit()
+
+    preview = result.body if len(result.body) <= 400 else result.body[:400] + "…"
+    return ChatResponse(
+        id=request_id,
+        intent="command",
+        content=(
+            f"Ready to send to {result.to_name or result.to}.\n\n"
+            f"Subject: {result.subject}\n\n{preview}"
+        ),
+        createdAt=_now_iso(),
+        actionProposals=[
+            ChatActionProposal(
+                id=str(req.id),
+                label=f"Send to {result.to_name or result.to}",
+                channel="send_email",
+                primary=True,
+                execution_id=str(req.id),
+                execution_status=req.status,
+                action_type=ActionType.SEND_EMAIL.value,
+            ),
+            ChatActionProposal(
+                id=f"dismiss_{req.id}", label="Not now", channel="cancel", primary=False
+            ),
+        ],
+        decisionId=str(decision_id),
+    )
+
+
+def _scope_error_response(request_id: str, message: str) -> ChatResponse:
+    """Uniform failure shape for an operational route that owns its turn.
+
+    Falling through to RAG prose here would answer a DIFFERENT question than the
+    one asked, which is how "cancel the meeting" ended up returning a memory
+    summary.
+    """
+    return ChatResponse(
+        id=request_id,
+        intent="command",
+        content=message,
+        createdAt=_now_iso(),
+        clarification=ChatClarification(
+            field="scope", question=message, resolved={}
+        ),
+    )
+
+
+def _command_response(
+    request_id: str,
+    question: str,
+    llm_text: str,
+    citations: list[ChatCitation],
+) -> ChatResponse:
+    """Structured proposals for command intents — draft / delegate / cancel.
+
+    Scheduling intents no longer land here — they're routed through
+    `_scheduling_response` in the top-level endpoint before this
+    function runs. The static "Open meeting scheduler" chip stays as a
+    last-resort fallback for the rare case where the scheduling agent
+    couldn't run (missing dependencies) — surfaced with a plain link.
+    """
+    now = _now_iso()
+
+    if _is_meeting_command(question):
+        return ChatResponse(
+            id=request_id,
+            intent="command",
+            content=(
+                llm_text
+                + "\n\nOpen the scheduler to pick from your real calendar availability."
+            ),
+            createdAt=now,
+            actionProposals=[
+                ChatActionProposal(
+                    id="open_scheduler",
+                    label="Open meeting scheduler",
+                    channel="schedule_meeting",
+                    primary=True,
+                    estimatedDurationMinutes=30,
+                ),
+                ChatActionProposal(
+                    id="cancel",
+                    label="Cancel",
+                    channel="cancel",
+                    primary=False,
+                ),
+            ],
+            citations=citations,
+        )
+
+    if _is_cancel_command(question):
+        return ChatResponse(
+            id=request_id,
+            intent="command",
+            content=(llm_text if llm_text else "Which one should I cancel?"),
+            createdAt=now,
+            actionProposals=[
+                ChatActionProposal(
+                    id="browse_calendar",
+                    label="Open my calendar",
+                    channel="open_thread",
+                    primary=True,
+                    href="/dashboard",
+                ),
+                ChatActionProposal(
+                    id="cancel",
+                    label="Never mind",
+                    channel="cancel",
+                    primary=False,
+                ),
+            ],
+            citations=citations,
+        )
+
+    if _is_draft_command(question):
+        return ChatResponse(
+            id=request_id,
+            intent="command",
+            content=(
+                llm_text
+                + "\n\nOpen the composer to review the draft and confirm before send."
+            ),
+            createdAt=now,
+            actionProposals=[
+                ChatActionProposal(
+                    id="open_composer",
+                    label="Open in composer",
+                    channel="draft_email",
+                    primary=True,
+                ),
+                ChatActionProposal(
+                    id="cancel",
+                    label="Cancel",
+                    channel="cancel",
+                    primary=False,
+                ),
+            ],
+            citations=citations,
+        )
+
+    return ChatResponse(
+        id=request_id,
+        intent="command",
+        content=llm_text,
+        createdAt=now,
+        citations=citations,
+    )
+
+
+def _derive_suggestions(question: str, citations: list[ChatCitation]) -> list[str]:
+    """Pick 3 follow-ups the user is likely to want next.
+
+    Static chips ("What should I do first? / Who am I keeping waiting? /
+    Summarise this week") were shown on every turn regardless of context —
+    users saw the same three prompts on a calendar question and on a
+    commitment question. We derive from the retrieved citations + question
+    keywords instead. Deterministic, no LLM: prompts must not fabricate.
+    """
+    q = question.lower()
+    detail = " ".join((c.detail or "").lower() for c in citations)
+    picks: list[str] = []
+
+    def add(s: str) -> None:
+        if s not in picks:
+            picks.append(s)
+
+    if any(w in detail for w in ("meet", "call", "sync", "invit", "calendar")):
+        add("What's on my calendar this week?")
+    if any(w in detail for w in ("waiting", "owes", "reply", "response", "pending", "unanswered")):
+        add("Who am I keeping waiting?")
+    if any(w in detail for w in ("commit", "decision", "approve", "invest", "deadline")):
+        add("What's my biggest open commitment?")
+    if any(w in q for w in ("today", "tomorrow", "tomm", "tmrw", "tmr", "coming", "upcoming", "soon")):
+        add("What changed since yesterday?")
+    if any(w in q for w in ("summar", "recap", "week", "digest")):
+        add("What decisions am I still owed?")
+
+    for fallback in ("What should I do first?", "Summarise this week", "Who am I keeping waiting?"):
+        add(fallback)
+    return picks[:3]
+
+
+# ── Explicit mail retrieval ─────────────────────────────────────────────────
+#
+# "about the term sheet", "mentioning Navis", "regarding the invoice" — the ONE
+# free-text narrowing this path accepts, and only when the user marked it with a
+# preposition. Anything else would mean guessing which words of a question are a
+# search term, and a wrong guess silently returns the wrong mail.
+_ABOUT_RE = re.compile(
+    r"\b(?:about|mentioning|regarding|re:|concerning|with\s+the\s+subject)\s+"
+    r"(?P<term>[A-Za-z0-9][\w'&./-]*(?:\s+[A-Za-z0-9][\w'&./-]*){0,3})",
+    re.IGNORECASE,
+)
+# Stop the preposition from swallowing a trailing question word.
+_ABOUT_STOP = frozenset({"me", "us", "it", "this", "that", "them", "him", "her"})
+
+_MAIL_RESULT_LIMIT = 8
+
+
+def _about_term(question: str) -> str | None:
+    m = _ABOUT_RE.search(question)
+    if not m:
+        return None
+    term = " ".join(
+        w for w in m.group("term").split() if w.lower() not in _ABOUT_STOP
+    ).strip(" ?.!,")
+    return term or None
+
+
+async def _email_search_response(
+    request_id: str,
+    body: "ChatRequest",
+    p: Principal,
+    db: AsyncSession,
+    subject: "_SubjectResolution",
+) -> ChatResponse:
+    """Answer an explicit mail-retrieval request from the ORGANIZATION'S OWN
+    captured mail — the same rows `GET /signals/gmail/recent` serves.
+
+    NO LLM. The founder asked to see messages, not to be told about them: the
+    subjects, senders and dates are read off `signal_events` and listed
+    verbatim. A model in this path could only paraphrase facts that are already
+    exact, and every paraphrase is a chance to alter one. Memory/State/Reasoning
+    are not consulted either — this is source retrieval, not organizational
+    understanding, and mixing the two is what made "find the email from X"
+    answer with prose about the organization.
+
+    Reads through `signals.read_router.search_emails`, the SAME function the
+    HTTP route now calls. Chat owns no Gmail query and no Gmail client.
+    """
+    from navis.signals.read_router import search_emails
+
+    # The GMAIL entitlement, enforced exactly as `GET /signals/gmail/*` enforces
+    # it. Chat is gated on MEMORY, which is granted by every plan — without this
+    # an org with Gmail explicitly revoked or kill-switched could read its mail
+    # through the chat box after the dashboard had stopped showing it.
+    if not await OrganizationService(db).can_use(p.org_id, Capability.GMAIL):
+        metrics.incr("chat.email_search.not_entitled")
+        return ChatResponse(
+            id=request_id, intent="question",
+            content=(
+                "I can't read your mail — the email capability isn't enabled "
+                "for this organization."
+            ),
+            createdAt=_now_iso(),
+        )
+
+    senders = tuple(subject.match.emails) if subject.match else ()
+    term = _about_term(body.question)
+    result = await search_emails(
+        db, org_id=p.org_id, senders=senders, text_match=term,
+        limit=_MAIL_RESULT_LIMIT,
+    )
+
+    who = (
+        subject.match.primary_display_name or subject.match.primary_email
+        if subject.match else None
+    )
+    if not result["connected"]:
+        return ChatResponse(
+            id=request_id, intent="question",
+            content=(
+                "Gmail isn't connected yet, so I have no mail to search. "
+                "Connect it from the Sources page and ask again."
+            ),
+            createdAt=_now_iso(),
+        )
+
+    items = result["items"]
+    if not items:
+        # Says what was actually searched for, so "nothing" is a fact about the
+        # query rather than a shrug. Never widened silently to "here's some mail".
+        narrowing = ", ".join(
+            filter(None, [f"from {who}" if who else None, f"about “{term}”" if term else None])
+        )
+        return ChatResponse(
+            id=request_id, intent="question",
+            content=(
+                f"I don't have any captured email {narrowing}."
+                if narrowing else "I don't have any captured email yet."
+            ),
+            createdAt=_now_iso(),
+        )
+
+    lines = []
+    for it in items:
+        when = (it.get("received_at") or "")[:10]
+        sender = it.get("from_name") or it.get("from_email") or "unknown sender"
+        lines.append(
+            f"· {it.get('subject') or '(no subject)'} — {sender}"
+            + (f" · {when}" if when else "")
+        )
+    headline = f"{len(items)} email{'' if len(items) == 1 else 's'}"
+    if who:
+        headline += f" from {who}"
+    if term:
+        headline += f" about “{term}”"
+
+    return ChatResponse(
+        id=request_id,
+        intent="question",
+        content=headline + ":\n\n" + "\n".join(lines),
+        createdAt=_now_iso(),
+        # Provenance is the SIGNAL EVENT, which is what these rows actually are.
+        # `signal:<uuid>` matches the convention `workspace_fallback` already
+        # uses, and the provider claim is honest here in a way it is not for a
+        # derived fact: these rows came off the Gmail connector.
+        citations=[
+            ChatCitation(
+                type="episodic",
+                source=f"signal:{it['event_id']}",
+                detail=(it.get("subject") or "")[:200] or None,
+            )
+            for it in items[:5]
+        ],
+        entity=(
+            ChatEntity(
+                canonical_id=subject.match.canonical_id,
+                display_name=subject.match.primary_display_name,
+                email=subject.match.primary_email,
+            )
+            if subject.match else None
+        ),
+    )
+
+
+def _navigate_response(
+    request_id: str, question: str, llm_text: str, citations: list[ChatCitation]
+) -> ChatResponse:
+    return ChatResponse(
+        id=request_id,
+        intent="navigate",
+        content=llm_text,
+        createdAt=_now_iso(),
+        citations=citations,
+        actionProposals=[
+            ChatActionProposal(
+                id="open_dashboard",
+                label="Open dashboard",
+                channel="open_thread",
+                primary=True,
+                href="/dashboard",
+            ),
+        ],
+        suggestedActions=_derive_suggestions(question, citations),
+    )
+
+
+def _question_response(
+    request_id: str, question: str, llm_text: str, citations: list[ChatCitation]
+) -> ChatResponse:
+    return ChatResponse(
+        id=request_id,
+        intent="question",
+        content=llm_text,
+        createdAt=_now_iso(),
+        citations=citations,
+        suggestedActions=_derive_suggestions(question, citations),
+    )
+
+
+# ── Endpoint ────────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/chat",
+    response_model=ChatResponse,
+    # T-23: the most expensive request in the product — embeds a query, runs a
+    # full-scan vector search over the org's corpus, folds state and calls an LLM.
+    # Counted per authenticated organization so one tenant cannot starve the rest.
+    dependencies=[Depends(rate_limit("chat", "rate_limit_chat_per_window"))],
+)
+async def chat(
+    body: ChatRequest,
+    # CAPABILITY-GATED ON MEMORY, like every other product surface.
+    #
+    # This was `Depends(get_principal)` — authentication only — and it made
+    # `/chat` the single expensive endpoint in the product with no entitlement
+    # gate. Every sibling has one: the signal reads on GMAIL/CALENDAR/DRIVE,
+    # `/decision-memory` and `/memory/people` on DECISION, `/brief/*` and
+    # `/context` on DECISION, `/intelligence/*` on INTELLIGENCE, `/actions/*`
+    # on EXECUTION.
+    #
+    # That gate is also the ONLY place organization LIFECYCLE is enforced —
+    # `authz.principal_cache_evict_org` says so outright ("the capability gate
+    # reads lifecycle from the database on every request"), and
+    # `entitlements._decide` refuses anything that is not TRIAL or ACTIVE
+    # before it looks at plan or kill switch. So a SUSPENDED or CHURNED
+    # organization kept full access to the request this router's own comment
+    # calls "the most expensive request in the product": embed the query,
+    # full-scan the org's vectors, fold state, call the LLM. Suspension stopped
+    # the brief, the signal feeds and the action queue, and left the one
+    # surface that actually spends money running.
+    #
+    # MEMORY is the capability chat consumes — it answers out of the org's
+    # Memory — and it is granted by EVERY plan including FREE
+    # (`PLAN_CAPABILITIES`), so no entitled organization changes behaviour:
+    # this denies suspended/churned tenants, an explicit revocation, and the
+    # `memory` kill switch. Nothing else.
+    #
+    # `require_capability` depends on `get_principal` and FastAPI caches a
+    # dependency per request, so the principal is still resolved exactly once.
+    p: Principal = Depends(require_capability(Capability.MEMORY)),
+    db: AsyncSession = Depends(get_session),
+) -> ChatResponse:
+    """Ask Navis — grounded LLM chat over the org's Memory.
+
+    Scheduling utterances (fresh OR mid-clarification follow-ups) are
+    routed to the reasoning-side scheduling agent BEFORE the general
+    grounded-answer path. Once we're in a scheduling flow we OWN the
+    turn — errors become a `scope` clarification, not a fall-through
+    to RAG prose with confusing episodic/relationship citations.
+    """
+    request_id = f"chat_{uuid.uuid4().hex[:12]}"
+    now_utc = datetime.now(timezone.utc)
+
+    # ONE routing decision, taken in one place. See `reasoning.routing` for why
+    # the previous three-independent-predicates arrangement dropped whole verb
+    # classes ("reschedule", "cancel the meeting", "send email to …") into the
+    # memory-QA path and answered them with "not enough memory".
+    route = classify(
+        body.question,
+        has_pending_scheduling=body.pending_scheduling is not None,
+    )
+    logger.info("chat route=%s org=%s", route.value, p.org_id)
+
+    # ── EXECUTION ENTITLEMENT, asked ONCE before any action route ─────────
+    #
+    # These four routes all end in `ExecutionService.request`, and that service
+    # deliberately checks only `require_spec` — it is the intake for the router,
+    # chat and the proactive proposer alike, so it does not know whose entitlement
+    # to ask about. `POST /actions` carries `require_capability(EXECUTION)` for
+    # exactly this reason; chat reached the same service without it.
+    #
+    # The consequence was not a security hole (approve/reject/cancel are each
+    # gated, and the worker re-checks before every provider call, so nothing could
+    # ever RUN) but a promise the product could not keep: a FREE or PRO
+    # organization — neither plan grants EXECUTION — got a fully rendered
+    # "Schedule meeting" card whose only button returns 402. Rows accumulated in
+    # `execution_requests` that no one in that org could ever approve.
+    #
+    # Asked BEFORE dispatch, not inside the branches: the agents run an LLM
+    # slot-fill and hit Google Calendar, and there is no reason to spend either on
+    # an action that cannot be offered. Returned as prose rather than raised as
+    # 402 because each branch below wraps itself in `except Exception` — an
+    # HTTPException here would be swallowed and reported as "something went
+    # wrong", which is the opposite of what happened.
+    if route in _ACTION_ROUTES and not await OrganizationService(db).can_use(
+        p.org_id, Capability.EXECUTION
+    ):
+        metrics.incr("chat.action.not_entitled")
+        logger.info("chat action route refused, no EXECUTION org=%s route=%s",
+                    p.org_id, route.value)
+        return ChatResponse(
+            id=request_id,
+            intent="command",
+            content=(
+                "I can find this for you, but I can't act on it — taking actions "
+                "isn't enabled for this organization. Ask an admin to check the "
+                "plan, then try again."
+            ),
+            createdAt=_now_iso(),
+        )
+
+    if route is ChatRoute.SCHEDULE_MEETING:
+        try:
+            return await _scheduling_response(
+                request_id, body, p, db, now_utc
+            )
+        except Exception:  # noqa: BLE001 — surface as clarification
+            logger.exception("scheduling handoff failed org=%s", p.org_id)
+            # Scheduling owns this turn. Surface a scope clarification
+            # so the founder sees a real error, not RAG prose that
+            # doesn't answer them.
+            return ChatResponse(
+                id=request_id,
+                intent="command",
+                content=(
+                    "Something went wrong while scheduling. Try again in "
+                    "a moment, or reconnect Google Calendar if this keeps "
+                    "happening."
+                ),
+                createdAt=_now_iso(),
+                clarification=ChatClarification(
+                    field="scope",
+                    question=(
+                        "Something went wrong while scheduling. Try again "
+                        "in a moment."
+                    ),
+                    resolved=(
+                        body.pending_scheduling.model_dump()
+                        if body.pending_scheduling is not None
+                        else {}
+                    ),
+                ),
+            )
+
+    if route in (ChatRoute.RESCHEDULE_MEETING, ChatRoute.CANCEL_MEETING):
+        try:
+            return await _calendar_ops_response(request_id, body, p, db, now_utc, route)
+        except Exception:  # noqa: BLE001
+            logger.exception("calendar-ops handoff failed org=%s", p.org_id)
+            return _scope_error_response(
+                request_id,
+                "I couldn't reach your calendar to make that change. Try again "
+                "in a moment.",
+            )
+
+    if route is ChatRoute.SEND_EMAIL:
+        try:
+            return await _email_response(request_id, body, p, db)
+        except Exception:  # noqa: BLE001
+            logger.exception("email handoff failed org=%s", p.org_id)
+            return _scope_error_response(
+                request_id,
+                "I couldn't prepare that email just now. Try again in a moment.",
+            )
+
+    # Calendar-query intent — questions ABOUT existing meetings
+    # ("what's on my calendar today?", "prepare me for my next
+    # meeting", "how many meetings this week?"). We answer these by
+    # reading Google Calendar directly instead of going through RAG,
+    # which returns "not enough memory" for calendar queries because
+    # events aren't reliably indexed in memory_records.
+    if route is ChatRoute.CALENDAR_QUERY:
+        try:
+            calendar_ctx = CalendarQueryContext(
+                org_id=p.org_id,
+                utterance=body.question,
+                time_zone=body.time_zone or "UTC",
+                now=now_utc,
+            )
+            result = await CalendarQueryAgent(db).answer(calendar_ctx)
+            return ChatResponse(
+                id=request_id,
+                intent="question",
+                content=result.text,
+                createdAt=_now_iso(),
+                suggestedActions=_derive_suggestions(body.question, []),
+            )
+        except Exception:  # noqa: BLE001 — never crash the endpoint
+            logger.exception("calendar-query handoff failed org=%s", p.org_id)
+            # Fall through to the grounded answer, which now degrades through
+            # Calendar/Gmail signals rather than claiming empty memory.
+
+    # ── WHO is this question about? ──────────────────────────────────────
+    #
+    # Resolved BEFORE the mail branch as well as the answer path: "find the
+    # email from Ajeet" needs the identity graph to know which addresses Ajeet
+    # actually sends from, and an ambiguous name must be asked about rather than
+    # narrowed to whichever person the mail happens to match.
+    # Asked BEFORE retrieval, through the existing identity graph, because the
+    # answer changes what we retrieve (see `_retrieval_query`). An ambiguous
+    # subject is a real answer and is returned as one: picking the first of two
+    # people called "Priya" would attribute one person's evidence to another,
+    # which is the single worst thing this endpoint could do.
+    subject = await _resolve_question_subject(db, p.org_id, body.question)
+    if subject.ambiguous:
+        metrics.incr("chat.subject.ambiguous")
+        logger.info(
+            "chat subject ambiguous org=%s candidates=%d", p.org_id,
+            len(subject.candidates),
+        )
+        return ChatResponse(
+            id=request_id,
+            intent="question",
+            content=(
+                f"There are {len(subject.candidates)} people matching "
+                f"“{subject.query}”. Which one do you mean?"
+            ),
+            createdAt=_now_iso(),
+            clarification=ChatClarification(
+                field="person_disambiguation",
+                question=(
+                    f"Which “{subject.query}” do you mean?"
+                ),
+                # The identity graph's own rendering — canonical_id, every known
+                # alias, every observed display name. Nothing added.
+                options=[m.to_dict() for m in subject.candidates],
+            ),
+        )
+
+    # ── EXPLICIT MAIL RETRIEVAL ───────────────────────────────────────────
+    # Dispatched here, AFTER identity resolution and its ambiguity check, so a
+    # sender filter is built from the canonical addresses the graph resolved and
+    # two people with one name are asked about rather than merged.
+    #
+    # Read-only and it stops here: no Memory, no State, no Reasoning, no LLM,
+    # and no path from this branch to ExecutionService. Sending is a different
+    # route (`SEND_EMAIL`), decided earlier and unaffected.
+    if route is ChatRoute.EMAIL_SEARCH:
+        try:
+            return await _email_search_response(request_id, body, p, db, subject)
+        except Exception:  # noqa: BLE001 — this route owns its turn
+            logger.exception("email search failed org=%s", p.org_id)
+            return ChatResponse(
+                id=request_id, intent="question",
+                content=(
+                    "I couldn't reach your mail just now. Try again in a moment."
+                ),
+                createdAt=_now_iso(),
+            )
+
+    intent = _detect_intent(body.question)
+    llm_text, citations, state_watermark = await _grounded_answer(
+        db, p.org_id, body.question, subject
+    )
+
+    if intent == "command":
+        response = _command_response(request_id, body.question, llm_text, citations)
+    elif intent == "navigate":
+        response = _navigate_response(request_id, body.question, llm_text, citations)
+    else:
+        response = _question_response(request_id, body.question, llm_text, citations)
+
+    # Stamp the lineage the three builders above don't take: WHO the answer is
+    # about and WHICH snapshot it describes. Set here rather than threaded
+    # through each builder because it is the same answer to the same two
+    # questions regardless of which prose shape the intent selected.
+    response.stateWatermark = state_watermark
+    if subject.match is not None:
+        response.entity = ChatEntity(
+            canonical_id=subject.match.canonical_id,
+            display_name=subject.match.primary_display_name,
+            email=subject.match.primary_email,
+        )
+
+    # ── One structured trace line per Ask ─────────────────────────────────
+    # IDS AND COUNTS ONLY — never a question, never a fact, never an address.
+    # This is what makes "what did Navis use to reach this answer?" answerable
+    # from the logs without storing anything sensitive: the entity it resolved,
+    # the snapshot it read, and how many citations of each layer survived into
+    # the answer. `request_id` is the same value the response carries.
+    by_type: dict[str, int] = {}
+    for c in citations:
+        by_type[c.type] = by_type.get(c.type, 0) + 1
+    logger.info(
+        "ask request_id=%s org=%s route=%s intent=%s entity=%s watermark=%s "
+        "citations=%d by_type=%s",
+        request_id, p.org_id, route.value, intent,
+        subject.match.canonical_id if subject.match else None,
+        state_watermark, len(citations), by_type,
+    )
+    return response

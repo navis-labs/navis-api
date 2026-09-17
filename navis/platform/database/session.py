@@ -40,7 +40,9 @@ if settings.db_statement_timeout_seconds and settings.db_statement_timeout_secon
 engine = create_async_engine(
     settings.async_database_url,
     echo=settings.debug and settings.log_level.upper() == "DEBUG",
-    pool_pre_ping=True,
+    # See settings.db_pool_pre_ping: this is one extra round trip per checkout,
+    # which `pool_recycle` below already makes redundant against Neon's idle drop.
+    pool_pre_ping=settings.db_pool_pre_ping,
     pool_size=settings.db_pool_size,
     max_overflow=settings.db_max_overflow,
     pool_recycle=settings.db_pool_recycle_seconds,

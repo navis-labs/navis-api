@@ -28,6 +28,10 @@ class DailyBrief(Base):
     state_watermark: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     decisions: Mapped[list] = mapped_column(JSONB, default=list)
+    # The Adaptive PolicySnapshot.policy_version that governed this generation,
+    # or NULL when the org was running on code defaults. Not part of the id —
+    # a policy change replaces the brief for a generation rather than forking it.
+    policy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Cache-write metadata (NOT identity; the deterministic content is `decisions`).
     created_at: Mapped[datetime] = mapped_column(

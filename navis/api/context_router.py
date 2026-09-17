@@ -18,10 +18,12 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.authz import Principal
+from navis.identity.throttle import rate_limit
 from navis.organization.contract import Capability
 from navis.organization.guards import require_capability
 from navis.platform.database import get_session
 from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import timed
 from navis.state.v2 import MorningBrief, StateService, scope_for
 
 logger = get_logger("context")
@@ -29,7 +31,11 @@ logger = get_logger("context")
 router = APIRouter(prefix="/context", tags=["context"])
 
 
-@router.get("")
+@router.get(
+    "",
+    # T-23: context assembly runs vector search + state projection per call.
+    dependencies=[Depends(rate_limit("read", "rate_limit_read_per_window"))],
+)
 async def context_bundle(
     user_id: str | None = None,  # accepted for FE compat; scoping is org-wide today
     p: Principal = Depends(require_capability(Capability.DECISION)),
@@ -46,9 +52,14 @@ async def context_bundle(
     start = time.perf_counter()
     # incremental_update (not get_state) so counts reflect the newest memory
     # rather than a stale snapshot — matches build_brief's discipline.
-    state = await StateService(db).incremental_update(p.org_id)
-    policy = await resolve_policy(db, p.org_id)
-    view = scope_for(state, MorningBrief(), policy, as_of=state.as_of)
+    with timed("context.state"):
+        state = await StateService(db).incremental_update(p.org_id)
+    with timed("context.policy"):
+        policy = await resolve_policy(db, p.org_id)
+    with timed("context.scope"):
+        view = scope_for(state, MorningBrief(), policy, as_of=state.as_of)
+    with timed("context.serialize"):
+        body = view.to_dict()
 
     elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
     # Structured audit log — replaces the deferred `context_assemblies` table.
@@ -59,4 +70,4 @@ async def context_bundle(
         p.org_id, view.intent_name, view.state_watermark,
         view.policy_version, len(view.entities), elapsed_ms,
     )
-    return view.to_dict()
+    return body

@@ -67,6 +67,9 @@ class SignalEventType(str, enum.Enum):
     DOC_CREATED = "doc.created"
     DOC_UPDATED = "doc.updated"
     DOC_MOVED = "doc.moved"
+    # Mirrors DRIVE_FILE_TRASHED. Without it a trashed Doc emitted only a Drive
+    # signal, so the DOCUMENT entity kept reporting the document as live forever.
+    DOC_TRASHED = "doc.trashed"
     # Meet (derived from Calendar)
     MEETING_CREATED = "meeting.created"
     MEETING_UPDATED = "meeting.updated"

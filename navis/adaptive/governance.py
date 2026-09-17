@@ -35,6 +35,31 @@ def validate_proposal(draft: ProposalDraft, active_policy: dict[str, Any]) -> No
         validate_change(change.field, old, change.to_value)
 
 
+def validate_changes(changes: list[dict[str, Any]], active_policy: dict[str, Any]) -> None:
+    """The same gate, applied to a STORED proposal at activation time.
+
+    `validate_proposal` takes a live `ProposalDraft` and so can only run when a
+    proposal is generated. Activation happens later, against a policy baseline
+    that may have moved (a rollback or kill switch in between), and the 25%
+    magnitude cap is defined relative to that baseline — so the check has to be
+    repeatable from the persisted `proposed_changes` alone.
+
+    Fails closed on a malformed record: a change missing its field or target
+    value cannot be shown to be safe, so it is refused rather than skipped.
+    """
+    for change in changes:
+        if not isinstance(change, dict):
+            raise PolicyViolation(f"malformed change record: {change!r}")
+        field = change.get("field")
+        to_value = change.get("to")
+        if not isinstance(field, str) or to_value is None:
+            raise PolicyViolation(f"malformed change record: {change!r}")
+        old = active_policy.get(field, change.get("from"))
+        if old is None:
+            raise PolicyViolation(f"no baseline for {field!r}")
+        validate_change(field, old, to_value)
+
+
 def kill_switch_payload() -> dict[str, Any]:
     """The safe baseline: exactly the code defaults (no learned drift)."""
     return dict(DEFAULT_POLICY)
@@ -45,6 +70,7 @@ __all__ = [
     "NotAuthorized",
     "PolicyViolation",
     "require_approver",
+    "validate_changes",
     "validate_proposal",
     "kill_switch_payload",
 ]

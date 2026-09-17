@@ -69,9 +69,20 @@ def test_priority_ranks_are_dense_and_ordered():
 def test_categories_map_from_signal_types():
     signals, state = _signals()
     by_cat = {d.category for d in _decide(signals, state)}
-    # The stale corpus yields risk + priority + delegation decisions.
+    # The stale corpus yields risk decisions.
     assert DecisionCategory.RISK in by_cat
-    assert DecisionCategory.PRIORITY in by_cat
+    # PRIORITY / OPPORTUNITY / DELEGATION are no longer reachable.
+    #
+    # This assertion used to read `DecisionCategory.PRIORITY in by_cat`,
+    # which pinned the bug: the only signal types that mapped to those
+    # categories (CONTEXT_SUMMARY, PRIORITY_LOAD, ORG_DRIFT, OPPORTUNITY,
+    # LEVERAGE_POINT) are interpretation, not decision points, and were
+    # being promoted into founders' briefs as "Organizational context"
+    # and "Active inbound engagement". See tests/decisions/
+    # test_decision_semantics.py for the full boundary.
+    assert DecisionCategory.PRIORITY not in by_cat
+    assert DecisionCategory.OPPORTUNITY not in by_cat
+    assert DecisionCategory.DELEGATION not in by_cat
 
 
 def test_multi_tenant_isolation():

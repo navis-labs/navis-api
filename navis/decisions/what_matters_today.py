@@ -15,18 +15,146 @@ from datetime import datetime
 from navis.decisions.base import (
     Decision,
     DecisionCategory,
+    InsightRelation,
+    IntelligenceFact,
+    IntelligenceView,
+    SupportingInsight,
     category_for,
     compute_decision_id,
 )
 from navis.reasoning.v2.contract import ReasoningSignal
 
-# Category nudges so ties break by decision importance (framing floats up).
+# Category nudges so ties break by decision importance.
+#
+# PRIORITY / OPPORTUNITY / DELEGATION are gone: the only signal types
+# that mapped to them (CONTEXT_SUMMARY, PRIORITY_LOAD, ORG_DRIFT,
+# OPPORTUNITY, LEVERAGE_POINT) are interpretation, not decisions, and no
+# longer reach this engine. PRIORITY additionally carried the LARGEST
+# bias here, which is why a bare "Organizational context" recitation
+# outranked real obligations in production briefs.
 _CATEGORY_BIAS = {
-    DecisionCategory.PRIORITY: 0.20,
     DecisionCategory.RISK: 0.12,
-    DecisionCategory.OPPORTUNITY: 0.10,
-    DecisionCategory.DELEGATION: 0.05,
 }
+
+# ── Intelligence corroboration ────────────────────────────────────────
+#
+# NOT A NEW SCORING DIMENSION. It is the same additive nudge the category
+# system above already applies, and its ceiling IS that system's largest
+# nudge — so an organizational fact can corroborate what Reasoning found
+# and can never outweigh it. A decision whose signal weight leads by more
+# than one bias unit cannot be displaced by Intelligence at all.
+#
+# Scaled by the insight's OWN confidence, which is the only strength
+# measure an insight carries that is comparable across insight types.
+# `sample_size` deliberately does NOT enter: it counts decisive learning
+# samples on a Learning fold and affected ENTITIES on a reality fold, so
+# treating it as evidential weight would let a 110-entity footprint
+# recitation outrank a real obligation — the exact failure the category
+# map was rewritten to remove.
+_INTELLIGENCE_BIAS_CEILING = _CATEGORY_BIAS[DecisionCategory.RISK]
+
+
+def _relevant_facts(
+    signal: ReasoningSignal, intelligence: IntelligenceView | None
+) -> tuple[tuple[IntelligenceFact, InsightRelation], ...]:
+    """The organizational facts that are ABOUT this signal, AND HOW. Deterministic.
+
+    Two relationships, both already recorded upstream, neither inferred:
+
+      1. the insight names this signal in `supporting_reasoning_signal_ids`
+         (written by `intelligence.service._provenance`) — it was folded FROM
+         this signal, so it is by construction about it;
+      2. the insight names this signal's entity among the entities in its
+         evidence (written by the reality engines' `_entities`).
+
+    Everything else is unrelated and contributes nothing. No fuzzy matching,
+    no text similarity, no model: an insight either names this signal or its
+    entity, or it does not.
+
+    WHICH of the two applied is now returned alongside each fact rather than
+    discarded. Both were already being flattened into one id list on the
+    decision, where a reader cannot tell shared origin from topical overlap and
+    the natural reading of either is "this insight caused this decision" —
+    which neither one is. See `decisions.base.InsightRelation`. The FIRST match
+    wins per fact (the `continue` below), so an insight folded from this very
+    signal is never downgraded to a mere entity match.
+
+    A SIGNAL MATCH IS NOT ONE RELATIONSHIP BUT TWO, split on
+    `fact.describes_state`. A reality insight that names this signal was folded
+    from it in the same pass; a Learning insight that names it is a measurement
+    of what happened when the organization acted on it, which is a different
+    claim with a different clock. The two only ever looked alike because both
+    matched on a signal id.
+    """
+    if intelligence is None or not intelligence.facts:
+        return ()
+    signal_id = str(signal.signal_id)
+    out: list[tuple[IntelligenceFact, InsightRelation]] = []
+    for fact in intelligence.facts:
+        if signal_id in fact.supporting_reasoning_signal_ids:
+            out.append((
+                fact,
+                InsightRelation.DERIVED_FROM_SAME_SIGNAL
+                if fact.describes_state
+                else InsightRelation.LEARNED_FROM_OUTCOMES,
+            ))
+            continue
+        if not (signal.entity_type and signal.entity_id):
+            continue
+        for entity in (fact.evidence or {}).get("entities") or ():
+            if (
+                isinstance(entity, dict)
+                and entity.get("entity_type") == signal.entity_type
+                and entity.get("entity_id") == signal.entity_id
+            ):
+                out.append((fact, InsightRelation.SHARES_ENTITY))
+                break
+    return tuple(out)
+
+
+def _supporting(
+    fact: IntelligenceFact, relation: InsightRelation, state_watermark: str | None
+) -> SupportingInsight:
+    """One insight reference, carrying whether it still describes THIS snapshot.
+
+    PURE, and a comparison rather than a judgement: both watermarks are stored
+    values — the decision's is the snapshot Reasoning ran over, the fact's is the
+    snapshot the insight recorded — and this reports whether they are the same
+    string. Nothing is inferred and nothing is filtered: a stale insight is still
+    returned, still scored, and still listed. It simply stops being able to
+    masquerade as current.
+
+    `None` for a Learning-derived fact, because its watermark is inherited from
+    whichever execution happened to record one and is not a claim about a
+    snapshot at all. Reporting False there would invent a staleness the row never
+    asserted; reporting True would be worse. See `SupportingInsight`.
+    """
+    return SupportingInsight(
+        insight_id=fact.insight_id,
+        relation=relation,
+        insight_type=fact.insight_type,
+        title=fact.title,
+        sample_size=fact.sample_size,
+        state_watermark=fact.state_watermark,
+        describes_current_snapshot=(
+            fact.state_watermark == state_watermark if fact.describes_state else None
+        ),
+    )
+
+
+def _intelligence_bias(
+    facts: tuple[tuple[IntelligenceFact, InsightRelation], ...]
+) -> float:
+    """How much the corroborating facts may move this decision: [0, ceiling].
+
+    The STRONGEST relevant fact decides, not the sum. Summing would let a
+    handful of weak insights stack past the ceiling and outweigh the primary
+    evidence, which is precisely what this bound exists to prevent.
+    """
+    if not facts:
+        return 0.0
+    strongest = max(min(max(f.confidence, 0.0), 1.0) for f, _relation in facts)
+    return _INTELLIGENCE_BIAS_CEILING * strongest
 
 
 class WhatMattersTodayEngine:
@@ -42,22 +170,78 @@ class WhatMattersTodayEngine:
         reasoning_version: int,
         state_watermark: str | None,
         as_of: datetime | None,
+        intelligence: IntelligenceView | None = None,
     ) -> list[Decision]:
+        """Rank signals into decisions, corroborated by what the org knows.
+
+        `intelligence` is the already-materialized `IntelligenceView` built once
+        per brief by orchestration. This engine performs NO I/O: it reads the
+        view it is handed and nothing else, so it stays a pure function of
+        (signals, policy, intelligence) and cannot add a query per decision.
+
+        Keyword-only with a `None` default, so every existing caller — and an
+        organization that knows nothing about itself yet — gets byte-identical
+        output to before.
+        """
         scored = []
         for s in signals:
             if s.confidence < self.min_confidence:
                 continue
+            # A SIGNAL IS NOT A DECISION. Interpretation signals — a state
+            # recitation, a volume trend, an inbound-activity observation —
+            # are valid reasoning output that asks nothing of anyone, so
+            # they never enter the brief. `category_for` returns None for
+            # them; see decisions/base.py for the full classification.
+            #
+            # They remain queryable as ReasoningSignals, so an engine or
+            # surface that wants them as CONTEXT or EVIDENCE still can.
+            # Nothing is discarded — it is just not called a decision.
             category = category_for(s.signal_type)
-            score = s.weight + _CATEGORY_BIAS.get(category, 0.0)
-            scored.append((score, s, category))
+            if category is None:
+                continue
+            facts = _relevant_facts(s, intelligence)
+            score = (
+                s.weight
+                + _CATEGORY_BIAS.get(category, 0.0)
+                + _intelligence_bias(facts)
+            )
+            scored.append((score, s, category, facts))
 
         # Deterministic order: score desc, then signal_id as a stable tiebreak.
         scored.sort(key=lambda t: (-t[0], str(t[1].signal_id)))
 
+        # One decision per underlying thing.
+        #
+        # Several engines can fire on the SAME entity — a customer who has
+        # gone quiet can raise RELATIONSHIP_COOLING and
+        # CUSTOMER_ENGAGEMENT_DROP off one relationship — which produced
+        # two cards describing one situation. Keep the highest-scoring
+        # signal for each entity; the list is already sorted, so the first
+        # occurrence wins and the order stays deterministic.
+        #
+        # Signals with no entity are not collapsed: they are genuinely
+        # org-wide and have no "same underlying thing" to share.
+        seen_entities: set[tuple[str, str]] = set()
+        deduped = []
+        for entry in scored:
+            s = entry[1]
+            if s.entity_type and s.entity_id:
+                key = (s.entity_type, s.entity_id)
+                if key in seen_entities:
+                    continue
+                seen_entities.add(key)
+            deduped.append(entry)
+
         decisions: list[Decision] = []
-        for rank, (_score, s, category) in enumerate(scored[: self.max_items], start=1):
+        for rank, (_score, s, category, facts) in enumerate(
+            deduped[: self.max_items], start=1
+        ):
             decisions.append(
                 Decision(
+                    # UNCHANGED, and deliberately: identity is (org, reasoning
+                    # version, watermark, signal). Intelligence corroborates a
+                    # decision, it does not make it a different decision, so
+                    # loading a view can never fork an id.
                     decision_id=compute_decision_id(
                         org_id, reasoning_version, state_watermark, s.signal_id
                     ),
@@ -72,6 +256,34 @@ class WhatMattersTodayEngine:
                     reasoning_version=reasoning_version,
                     state_watermark=state_watermark,
                     created_at=as_of,
+                    # Exactly the facts that were relevant to THIS signal —
+                    # the same set `_intelligence_bias` scored, so the stored
+                    # provenance and the applied nudge can never disagree.
+                    supporting_insight_ids=tuple(
+                        sorted(f.insight_id for f, _r in facts)
+                    ),
+                    # The same set again, each carrying the relationship that
+                    # admitted it. Sorted on the same key so the two sequences
+                    # are positionally identical and a client can zip them.
+                    supporting_insights=tuple(
+                        _supporting(f, r, state_watermark)
+                        for f, r in sorted(facts, key=lambda pair: pair[0].insight_id)
+                    ),
+                    # WHICH reasoning conclusion this is. `category` buckets six
+                    # signal types into RISK; this is the one the engine emitted.
+                    signal_type=s.signal_type.value,
+                    # The signal's own values, passed through unchanged. NOT the
+                    # ranking score: `_score` additionally folds in the category
+                    # bias and the intelligence nudge, which are this engine's
+                    # opinion about ordering, not the detecting engine's
+                    # statement about the finding.
+                    confidence=s.confidence,
+                    severity=s.severity,
+                    # The entity this decision is about, straight off the
+                    # signal. This engine already reads both fields to dedupe
+                    # (see `seen_entities` above) — they simply never left.
+                    entity_type=s.entity_type,
+                    entity_id=s.entity_id,
                 )
             )
         return decisions

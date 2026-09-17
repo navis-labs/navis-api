@@ -142,3 +142,101 @@ async def test_seed_allowed_outside_production(monkeypatch):
     out = await R.seed_signal(body, ctx=_Ctx(), db=_FakeDb())  # type: ignore[arg-type]
     assert out["ingested"] is True and captured["event"].external_id == "x"
     assert out["integration_id"] == str(supplied_integration_id)
+
+
+# ---- TASK 6.4.2: Pub/Sub webhook fails closed --------------------------------
+
+class _Req:
+    """Minimal Request stand-in: headers + query params only."""
+
+    def __init__(self, *, auth: str | None = None, params: dict | None = None, body: dict | None = None):
+        self.headers = {"Authorization": auth} if auth else {}
+        self.query_params = params or {}
+        self._body = body or {}
+
+    async def json(self):
+        return self._body
+
+
+async def test_pubsub_webhook_rejects_when_unconfigured(monkeypatch):
+    """The production defect: with no audience and no legacy token configured, the
+    endpoint accepted anonymous POSTs and enqueued a Google sync."""
+    from navis.platform.config import settings
+
+    monkeypatch.setattr(settings, "google_pubsub_audience", None)
+    monkeypatch.setattr(settings, "google_pubsub_sa_email", None)
+    monkeypatch.setattr(settings, "google_pubsub_sub", None)
+
+    enqueued = []
+    monkeypatch.setattr(R.celery_app, "send_task", lambda *a, **k: enqueued.append((a, k)))
+
+    with pytest.raises(HTTPException) as exc:
+        await R.google_pubsub_webhook(_Req())  # type: ignore[arg-type]
+    assert exc.value.status_code == 503
+    assert enqueued == [], "unauthenticated request must not enqueue work"
+
+
+async def test_pubsub_webhook_legacy_query_token_no_longer_authenticates(monkeypatch):
+    """`?token=` was a second auth mechanism for a channel Google already signs.
+    It is gone; presenting it must not grant access."""
+    from navis.platform.config import settings
+
+    monkeypatch.setattr(settings, "google_pubsub_audience", None)
+    monkeypatch.setattr(settings, "google_pubsub_sa_email", None)
+    monkeypatch.setattr(settings, "google_pubsub_sub", None)
+    monkeypatch.setenv("GOOGLE_WEBHOOK_VERIFICATION_TOKEN", "s3cret")
+
+    enqueued = []
+    monkeypatch.setattr(R.celery_app, "send_task", lambda *a, **k: enqueued.append((a, k)))
+
+    with pytest.raises(HTTPException) as exc:
+        await R.google_pubsub_webhook(_Req(params={"token": "s3cret"}))  # type: ignore[arg-type]
+    assert exc.value.status_code == 503
+    assert enqueued == []
+
+
+async def test_pubsub_webhook_rejects_bad_token_when_configured(monkeypatch):
+    from navis.platform.config import settings
+
+    monkeypatch.setattr(settings, "google_pubsub_audience", "https://navis.example/hook")
+    monkeypatch.setattr(settings, "google_pubsub_sa_email", "push@proj.iam.gserviceaccount.com")
+    monkeypatch.setattr(settings, "google_pubsub_sub", None)
+
+    enqueued = []
+    monkeypatch.setattr(R.celery_app, "send_task", lambda *a, **k: enqueued.append((a, k)))
+
+    # No Authorization header at all -> 401, not 503 (we ARE provisioned).
+    with pytest.raises(HTTPException) as exc:
+        await R.google_pubsub_webhook(_Req())  # type: ignore[arg-type]
+    assert exc.value.status_code == 401
+    assert enqueued == []
+
+
+async def test_pubsub_webhook_authenticated_push_enqueues(monkeypatch):
+    """A verified push still works end-to-end, and the enqueued task carries NO
+    organization identity — only the mailbox selector."""
+    import base64
+    import json as _json
+
+    from navis.platform.config import settings
+
+    monkeypatch.setattr(settings, "google_pubsub_audience", "https://navis.example/hook")
+    monkeypatch.setattr(settings, "google_pubsub_sa_email", "push@proj.iam.gserviceaccount.com")
+    monkeypatch.setattr(settings, "google_pubsub_sub", None)
+    monkeypatch.setattr(R, "verify_pubsub_request", lambda *a, **k: {"email": "push@proj.iam.gserviceaccount.com"})
+    monkeypatch.setattr(R, "redis_client", FakeRedis())
+
+    enqueued = []
+    monkeypatch.setattr(R.celery_app, "send_task", lambda *a, **k: enqueued.append((a, k)))
+
+    data = base64.b64encode(
+        _json.dumps({"emailAddress": "founder@acme.com", "historyId": 42}).encode()
+    ).decode()
+    out = await R.google_pubsub_webhook(  # type: ignore[arg-type]
+        _Req(auth="Bearer good", body={"message": {"data": data}})
+    )
+    assert out == {"status": "accepted"}
+    assert len(enqueued) == 1
+    kwargs = enqueued[0][1]["kwargs"]
+    assert kwargs == {"provider": "gmail", "email": "founder@acme.com", "history_id": "42"}
+    assert "org_id" not in kwargs and "organization_id" not in kwargs

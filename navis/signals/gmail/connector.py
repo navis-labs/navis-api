@@ -14,7 +14,6 @@ and ingests the returned events.
 """
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -81,10 +80,22 @@ class GmailConnector(WorkspaceConnector):
         start_history_id = str(profile.get("historyId"))
 
         cap = max(1, settings.gmail_onboard_message_cap)
+        # Bound the backfill by DATE, not just by count. Without this the
+        # newest-first pagination happily reaches back months on a slow
+        # inbox, and every one of those old emails lands in memory as a
+        # signal with its original internal_date — so the dashboard's
+        # morning brief shows 3-week-old threads as "commitments slipping"
+        # on the very first login. Gmail's `q=newer_than:{N}d` is
+        # server-side, so we save the fetch bandwidth too.
+        lookback_days = max(1, settings.gmail_onboard_lookback_days)
+        date_query = f"newer_than:{lookback_days}d"
+
         message_ids: list[str] = []
         page_token: str | None = None
         while len(message_ids) < cap:
-            listing = await client.list_messages(page_token=page_token, max_results=100)
+            listing = await client.list_messages(
+                page_token=page_token, max_results=100, query=date_query
+            )
             message_ids.extend(m["id"] for m in listing.get("messages", []))
             page_token = listing.get("nextPageToken")
             if not page_token:
@@ -96,12 +107,16 @@ class GmailConnector(WorkspaceConnector):
             # Operators see this and can run a wider backfill if a full sweep is required.
             metrics.incr("gmail.full_sync.capped")
             logger.warning(
-                "gmail full_sync capped at %d messages org=%s; older mail not backfilled",
-                cap, ctx.org_id,
+                "gmail full_sync capped at %d messages org=%s (window=%dd); "
+                "older mail beyond the cap not backfilled",
+                cap, ctx.org_id, lookback_days,
             )
 
         events = await self._fetch_and_normalize(ctx, client, message_ids)
-        logger.info("gmail full_sync org=%s captured=%d capped=%s", ctx.org_id, len(events), capped)
+        logger.info(
+            "gmail full_sync org=%s window=%dd captured=%d capped=%s",
+            ctx.org_id, lookback_days, len(events), capped,
+        )
         return SyncResult(events=events, cursor={"history_id": start_history_id})
 
     async def incremental_sync(
@@ -157,7 +172,13 @@ class GmailConnector(WorkspaceConnector):
         return SyncResult(events=events, cursor={"history_id": next_history_id})
 
     async def create_watch(self, ctx: SignalContext, client: GmailClient) -> dict[str, Any]:
-        topic = os.environ.get("GOOGLE_PUBSUB_TOPIC")
+        # Read through `settings`, not `os.environ`. The production startup check
+        # keys off `settings.google_pubsub_topic` to demand the matching audience and
+        # service identity (settings._enforce_production_safety); a second, narrower
+        # source meant a topic supplied via .env satisfied the validator's trigger
+        # while this call never saw it — validation and behaviour disagreeing about
+        # whether push is configured at all.
+        topic = settings.google_pubsub_topic
         if not topic:
             logger.warning("gmail watch skipped org=%s: no Pub/Sub topic configured", ctx.org_id)
             return {}

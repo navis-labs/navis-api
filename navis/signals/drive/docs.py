@@ -2,8 +2,18 @@
 
 A Google Doc is just a Drive file with mimeType
 ``application/vnd.google-apps.document``. When the Drive connector sees a change
-to such a file it ALSO emits a Docs-scoped signal (DOC_CREATED/UPDATED/MOVED),
-so Docs intelligence rides for free on the Drive feed.
+to such a file it ALSO emits a Docs-scoped signal, so Docs intelligence rides
+for free on the Drive feed.
+
+Reachability today: `DriveConnector._events_for_change` classifies every change
+as CREATED, UPDATED or TRASHED, so this module produces DOC_CREATED, DOC_UPDATED
+and DOC_TRASHED. DOC_MOVED is mapped but unreachable — nothing emits
+DRIVE_FILE_MOVED — a known gap, not an oversight; see `_DRIVE_TO_DOC` below.
+
+METADATA ONLY. No document content is ever read: the granted scope is
+`drive.metadata.readonly`, and `DriveClient` exposes no export / alt=media /
+Docs-API surface to read it with. A Doc record means "this organization has a
+document with this title/owner/folder", never "Navis knows what it says".
 """
 from __future__ import annotations
 
@@ -20,10 +30,15 @@ from navis.signals.base import (
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 
 # Map a Drive event type to its Docs equivalent (None = not represented as a Doc signal).
+# TRASHED is mapped so a removed Doc has a lifecycle fact of its own — the Drive
+# signal alone left the DOCUMENT entity looking live indefinitely. A RESTORE needs
+# no entry: Drive re-emits the file with trashed=false, which the connector
+# classifies as CREATED/UPDATED, and State's latest-wins fold reactivates it.
 _DRIVE_TO_DOC = {
     SignalEventType.DRIVE_FILE_CREATED: SignalEventType.DOC_CREATED,
     SignalEventType.DRIVE_FILE_UPDATED: SignalEventType.DOC_UPDATED,
     SignalEventType.DRIVE_FILE_MOVED: SignalEventType.DOC_MOVED,
+    SignalEventType.DRIVE_FILE_TRASHED: SignalEventType.DOC_TRASHED,
 }
 
 

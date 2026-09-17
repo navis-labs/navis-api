@@ -119,6 +119,29 @@ celery_app.conf.beat_schedule = {
         "task": "navis.execution.worker.recover_stale_executions",
         "schedule": 60,
     },
+    # ML: embed every memory fact that has no vector at the current write pin.
+    #
+    # This is the ONLY path by which most of Memory becomes searchable. The
+    # real-time subscriber (ml/embeddings/subscribers.py) reacts to bus pointer
+    # events, and `memory.service._BUS_EVENT_FOR_ENTITY` publishes those for only
+    # five entity types — so THREAD, COMPANY, MEETING, DOCUMENT, CHANNEL and
+    # CUSTOMER facts are never embedded by it. The sweeper was written as that
+    # safety net but was never scheduled, so those types had zero vectors and
+    # /chat could not recall a single email thread, meeting or document.
+    #
+    # Safe to run on a timer: keyset-paginated with a persisted cursor, bounded
+    # per invocation, and it selects only records lacking a vector at this pin —
+    # so a pass with nothing pending is one empty query and zero provider calls.
+    # Writes are idempotent (ON CONFLICT DO NOTHING on a deterministic id), so an
+    # overlapping run costs a wasted embed at worst, never a duplicate.
+    #
+    # Five minutes matches `sync-signals`: a fact is retrievable within roughly
+    # one sync cycle of landing, and the five subscriber-covered types stay
+    # instant.
+    "embed-memory-backlog": {
+        "task": "navis.ml.embeddings.jobs.embed_all_orgs",
+        "schedule": 60 * 5,
+    },
     # Identity hygiene: reap expired sessions + expired revoked-token rows. Hourly is
     # ample — expiry is already enforced at auth time; this only reclaims storage. Both
     # are idempotent index-served bulk DELETEs, so overlap/re-run is harmless.
@@ -140,16 +163,35 @@ celery_app.conf.beat_schedule = {
 # so new Gmail messages never extract into memory_records and the pipeline
 # silently stalls at Layer 1 → Layer 2.
 #
-# Deferred via worker_process_init because a top-level `import navis.registry`
-# hits a real circular-import: registry imports navis.execution.worker (etc.)
-# whose module body calls _register_tasks() which does
+# Deferred via signal hooks because a top-level `import navis.registry` hits a
+# real circular-import: registry imports navis.execution.worker (etc.) whose
+# module body calls _register_tasks() which does
 # `from navis.platform.queue import celery_app, run_async` — but at that instant
 # navis.platform.queue.__init__ is still executing its one and only import line
 # and `run_async` is not yet in its namespace. Signal-based init runs AFTER
 # celery has fully wired the queue package.
-from celery.signals import worker_process_init  # noqa: E402
+#
+# BOTH signals are connected because they cover different pools, and connecting
+# only one leaves a pool silently unwired:
+#   * worker_process_init — fires in each prefork CHILD, and in the solo pool.
+#     Does NOT fire for --pool=threads / gevent / eventlet.
+#   * worker_init         — fires once in the main worker process, which is
+#     exactly where threads/gevent/eventlet execute their tasks.
+# Registration is memoized in navis.platform.composition, so being called twice
+# (e.g. solo fires both) costs nothing. The relay tasks ALSO call the guard at
+# execution time, so delivery no longer depends on how the worker was started.
+from celery.signals import worker_init, worker_process_init  # noqa: E402
 
 
 @worker_process_init.connect
-def _register_event_subscribers(**_kwargs) -> None:
-    import navis.registry  # noqa: F401  (subscribe side-effects)
+def _register_subscribers_in_child(**_kwargs) -> None:
+    from navis.platform.composition import ensure_subscribers
+
+    ensure_subscribers()
+
+
+@worker_init.connect
+def _register_subscribers_in_main(**_kwargs) -> None:
+    from navis.platform.composition import ensure_subscribers
+
+    ensure_subscribers()

@@ -41,3 +41,6 @@ htmlcov/
 dev.db
 logs/
 *.log
+
+# Celery beat scheduler state (created at runtime by `celery beat`)
+celerybeat-schedule*

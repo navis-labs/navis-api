@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from navis.identity.audit import AuditAction, AuditService
 from navis.identity.members import normalize_email
 from navis.identity.models import Membership, Organization, Role, Session, User
-from navis.identity.org_service import OrganizationService
+from navis.identity.org_service import OrgLifecycleSeam
 from navis.identity.schemas import SignupRequest
 from navis.identity.tokens import TokenRevocationService
 from navis.organization.contract import OnboardingStage, stage_index
@@ -61,7 +61,7 @@ class IdentityService:
         except IntegrityError:
             raise AuthError("email already registered")
         # Org lifecycle goes through the seam (P2 extraction prep), not inline here.
-        org = await OrganizationService(self.db).create(name=data.organization_name)
+        org = await OrgLifecycleSeam(self.db).create(name=data.organization_name)
         await self.db.flush()
 
         # First user of an org is the founder.
@@ -144,9 +144,9 @@ class IdentityService:
             except IntegrityError:
                 raise AuthError("email already registered")
 
-            # Create the org. Slug collisions are handled by OrganizationService's retry loop.
+            # Create the org. Slug collisions are handled by OrgLifecycleSeam's retry loop.
             org_name = full_name or email.split("@")[0]
-            org = await OrganizationService(self.db).create(name=org_name)
+            org = await OrgLifecycleSeam(self.db).create(name=org_name)
             await self.db.flush()
 
             membership = Membership(user_id=user.id, organization_id=org.id, role=Role.FOUNDER)

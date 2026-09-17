@@ -12,7 +12,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy import (
+    DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -150,3 +152,50 @@ class SignalOutbox(UUIDPrimaryKey, Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class SignalImportance(Base):
+    """Deterministic importance score for one signal, at one policy version.
+
+    A DERIVED artifact, deliberately kept out of `signal_events`: that log is
+    immutable and rebuildable, and adding a mutable scored column to it would
+    break both properties. This mirrors `memory_embeddings` — same fact, many
+    versions, recomputable from the source at any time.
+
+    Because the id is a pure function of (signal, version), re-scoring is
+    idempotent (`ON CONFLICT DO NOTHING`) and two policy versions coexist, so a
+    new policy can be computed and compared BEFORE anything consumes it.
+    """
+
+    __tablename__ = "signal_importance"
+    __table_args__ = (
+        UniqueConstraint("signal_event_id", "version", name="uq_importance_signal_version"),
+        # Distribution / threshold queries scan by org + score.
+        Index("ix_signal_importance_org_score", "organization_id", "score"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True, index=True,
+    )
+    signal_event_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("signal_events.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    classification: Mapped[str] = mapped_column(String(40), nullable=False)
+    # Why it scored that way — makes a score auditable without re-deriving it.
+    features: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+_IMPORTANCE_NAMESPACE = uuid.UUID("c4e8a1b7-5d92-5f38-a067-2b9d4e6f8a13")
+
+
+def compute_importance_id(signal_event_id: uuid.UUID, version: int) -> uuid.UUID:
+    """Deterministic PK — same signal + version always collapses to one row."""
+    return uuid.uuid5(_IMPORTANCE_NAMESPACE, f"{signal_event_id}|{version}")

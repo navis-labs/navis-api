@@ -11,10 +11,22 @@ from navis.signals.google import oauth
 from navis.signals.google.oauth import ReconsentRequired, TokenManager
 
 
-def _integration(*, refresh_token="r-old", expired=True):
+def _integration(*, refresh_token: str | None = "r-old", expired: bool = True):
+    """Tokens are held ENCRYPTED, as every stored Integration is.
+
+    `TokenManager` decrypts internally, so the assertions below still compare
+    PLAINTEXT values — but a bare-plaintext fixture would only be readable
+    through `TokenCipher`'s legacy passthrough, which raises once
+    `SIGNALS_REJECT_LEGACY_PLAINTEXT` is on (TASK 6.4.1).
+    """
+    from navis.signals.crypto import token_cipher
+
     exp = datetime.now(timezone.utc) + timedelta(hours=-1 if expired else 5)
     return SimpleNamespace(
-        id="int-1", access_token="a-old", refresh_token=refresh_token, token_expires_at=exp
+        id="int-1",
+        access_token=token_cipher.encrypt("a-old"),
+        refresh_token=token_cipher.encrypt(refresh_token),
+        token_expires_at=exp,
     )
 
 

@@ -1,4 +1,20 @@
-"""AzureProvider — Azure OpenAI (chat + embeddings). Lazy SDK import."""
+"""AzureProvider — Azure OpenAI (chat + embeddings). Lazy SDK import.
+
+Azure routes ALL calls (chat + embeddings) by DEPLOYMENT NAME, not by the
+underlying model name. Your Azure resource can host any number of deployments;
+each one has its own SKU and quota. Chat and embeddings need SEPARATE
+deployments — the same deployment cannot serve both. This provider therefore
+takes two deployment names:
+
+  * `settings.azure_openai_deployment`       — for chat.completions
+  * `settings.azure_openai_embed_deployment` — for embeddings
+
+If either is unset, that capability degrades gracefully:
+  * chat unset  → uses `DEFAULT_DEPLOYMENT` (may 404 if you haven't created it),
+  * embed unset → `has_embedding()` returns False so the registry can pick the
+    deterministic provider for embeddings instead of trying an Azure call that
+    will 404.
+"""
 from __future__ import annotations
 
 import time
@@ -7,45 +23,50 @@ from navis.ml.providers.base import EmbedResult, GenRequest, GenResult, MLProvid
 from navis.platform.config import settings
 
 DEFAULT_DEPLOYMENT = "gpt-4o-mini"
-EMBED_DEPLOYMENT = "text-embedding-3-small"
-EMBED_DIM = 1536
+# Reported when no embed deployment is configured — kept so ProviderInfo has a
+# sane placeholder; NOT used as a fallback deployment name (Azure would 404).
+UNSET_EMBED_MODEL = "azure-embed-unconfigured"
+EMBED_DIM = 1536  # text-embedding-3-small / -large default; correct for both
 
 
 class AzureProvider(MLProvider):
-    def __init__(self, deployment: str | None = None) -> None:
-        model = deployment or settings.azure_openai_deployment or DEFAULT_DEPLOYMENT
-        self._deployment = model
-        self.info = ProviderInfo("azure", model, EMBED_DEPLOYMENT, EMBED_DIM, online=True)
-        self._client_obj = None
-        self._client_loop = None
+    def __init__(
+        self,
+        deployment: str | None = None,
+        embed_deployment: str | None = None,
+    ) -> None:
+        gen_model = deployment or settings.azure_openai_deployment or DEFAULT_DEPLOYMENT
+        embed_model = embed_deployment or settings.azure_openai_embed_deployment
+        self._deployment = gen_model
+        self._embed_deployment = embed_model  # may be None → embed() will fail loudly
+        # The ProviderInfo.embed_model IS the value stored in memory_embeddings.model.
+        # Using the deployment name (not the underlying model name) means one Azure
+        # resource can serve two different embedding SKUs across environments without
+        # collision — the model column reflects the routing target, which is what
+        # matters for retrieval-time filter correctness.
+        self.info = ProviderInfo(
+            "azure",
+            gen_model,
+            embed_model or UNSET_EMBED_MODEL,
+            EMBED_DIM,
+            online=True,
+        )
+
+    def has_embedding(self) -> bool:
+        """True iff an Azure embedding deployment is configured. Used by the
+        registry to decide whether to route embeddings to Azure or fall back
+        to the deterministic provider — a missing deployment name means Azure
+        would 404 on every embed call."""
+        return self._embed_deployment is not None
 
     def _client(self):
-        # Reuse one AsyncAzureOpenAI (and its httpx connection pool) per event loop: reused
-        # across all calls on a long-lived server loop (pooling), and rebuilt if the running
-        # loop changed (e.g. a Celery asyncio.run task on a fresh loop) so a client bound to a
-        # closed loop is never reused.
-        import asyncio
-
         from openai import AsyncAzureOpenAI
 
-        loop = asyncio.get_running_loop()
-        if self._client_obj is None or self._client_loop is not loop:
-            self._client_obj = AsyncAzureOpenAI(
-                api_key=settings.azure_openai_api_key,
-                azure_endpoint=settings.azure_openai_endpoint or "",
-                api_version=settings.azure_openai_api_version,
-                # ResilientProvider (registry) is the SOLE retry owner. The openai SDK defaults
-                # to max_retries=2; leaving it would DOUBLE-retry (up to 3x3 = 9 provider calls
-                # per logical call during an incident — retry amplification).
-                max_retries=0,
-            )
-            self._client_loop = loop
-        return self._client_obj
-
-    async def aclose(self) -> None:
-        client, self._client_obj, self._client_loop = self._client_obj, None, None
-        if client is not None:
-            await client.close()
+        return AsyncAzureOpenAI(
+            api_key=settings.azure_openai_api_key,
+            azure_endpoint=settings.azure_openai_endpoint or "",
+            api_version=settings.azure_openai_api_version,
+        )
 
     async def generate(self, req: GenRequest) -> GenResult:
         client = self._client()
@@ -70,15 +91,25 @@ class AzureProvider(MLProvider):
         )
 
     async def embed(self, texts: list[str]) -> EmbedResult:
+        if self._embed_deployment is None:
+            # Fail loudly rather than silently 404 — the registry is supposed
+            # to route around this via has_embedding(), so reaching here means
+            # something upstream bypassed that check.
+            raise RuntimeError(
+                "AzureProvider.embed called but AZURE_OPENAI_EMBED_DEPLOYMENT "
+                "is not configured. Either set the env var to your embedding "
+                "deployment name, or let the registry fall back to the "
+                "deterministic embedder (get_embedding_provider handles this)."
+            )
         client = self._client()
         start = time.monotonic()
-        resp = await client.embeddings.create(model=EMBED_DEPLOYMENT, input=texts)
+        resp = await client.embeddings.create(model=self._embed_deployment, input=texts)
         latency = int((time.monotonic() - start) * 1000)
         vectors = [d.embedding for d in resp.data]
         usage = getattr(resp, "usage", None)
         return EmbedResult(
             vectors=vectors,
-            model=EMBED_DEPLOYMENT,
+            model=self._embed_deployment,
             dim=len(vectors[0]) if vectors else EMBED_DIM,
             input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
             latency_ms=latency,

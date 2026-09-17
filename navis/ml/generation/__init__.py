@@ -1,9 +1,29 @@
-"""Narrative generation (Decision -> narrative; never narrative -> Decision)."""
-from navis.ml.generation.narratives import Narrative, brief, summary, draft, explanation
-from navis.ml.generation.prompts import Prompt, get_prompt
-from navis.ml.generation.prompts import REGISTRY as REGISTRY  # explicit re-export for prompt-enumeration tests; NOT public API
+"""Narrative generation (Decision -> narrative; never narrative -> Decision).
 
-# `generate(task)` removed: it discriminated on a product-Task enum that duplicated the router's;
-# the four named generators are the product surface, each naming a CAPABILITY via the gateway.
-# REGISTRY is intentionally NOT in __all__ — production code resolves prompts via get_prompt only.
-__all__ = ["Narrative", "brief", "summary", "draft", "explanation", "Prompt", "get_prompt"]
+`recommendation` is the one advisory generator: it may rank facts by urgency/impact
+so the founder can decide what to do first, but it still never invents facts and
+never fires actions.
+"""
+from navis.ml.generation.narratives import (
+    Narrative,
+    brief,
+    draft,
+    explanation,
+    generate,
+    recommendation,
+    summary,
+)
+from navis.ml.generation.prompts import REGISTRY, Prompt, get_prompt
+
+__all__ = [
+    "Narrative",
+    "generate",
+    "brief",
+    "summary",
+    "draft",
+    "explanation",
+    "recommendation",
+    "Prompt",
+    "get_prompt",
+    "REGISTRY",
+]

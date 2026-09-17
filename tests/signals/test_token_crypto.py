@@ -18,13 +18,29 @@ def test_round_trip_and_tagging():
     assert c.decrypt(ct) == "ya29.secret-access-token"
 
 
-def test_legacy_plaintext_passthrough():
+@pytest.fixture()
+def legacy_allowed(monkeypatch):
+    """Pin the sunset switch OFF.
+
+    These two tests assert the BACKWARD-COMPATIBILITY behaviour, which only
+    exists while `signals_reject_legacy_plaintext` is false. That flag is now
+    enabled in real environments (TASK 6.4.1), so inheriting it from ambient
+    config made them pass or fail depending on the machine's .env rather than on
+    the code. The switch's own behaviour is asserted by
+    `test_legacy_sunset_rejects_plaintext` below.
+    """
+    from navis.platform.config import settings
+
+    monkeypatch.setattr(settings, "signals_reject_legacy_plaintext", False)
+
+
+def test_legacy_plaintext_passthrough(legacy_allowed):
     c = TokenCipher([KEY_A])
     # A value without the enc: tag is treated as legacy plaintext.
     assert c.decrypt("legacy-plaintext-token") == "legacy-plaintext-token"
 
 
-def test_disabled_cipher_is_noop():
+def test_disabled_cipher_is_noop(legacy_allowed):
     c = TokenCipher([])  # no keys
     assert c.enabled is False
     assert c.encrypt("tok") == "tok"

@@ -38,10 +38,25 @@ def test_calendar_extracts_meeting_and_attendees():
     assert meeting.dedup_key == "etag-7"  # versioned by etag
 
 
-def test_drive_extracts_project_from_folder():
+def test_drive_folder_does_not_become_a_project():
+    """A Drive folder is a storage container, not an organizational project.
+    "Receipts" / "Untitled folder" must never surface as a confirmed Project —
+    and since the Drive path was PROJECT's only producer, inventing one here is
+    the whole failure mode. The Drive SignalEvent itself is unaffected."""
     drafts = run_extractors(drive_view())
-    projects = [d for d in drafts if d.entity_type == EntityType.PROJECT]
-    assert projects and projects[0].payload["folder_id"] == "folder-42"
+
+    assert [d for d in drafts if d.entity_type == EntityType.PROJECT] == []
+
+
+def test_project_entity_type_remains_supported_for_real_sources():
+    """07D removed a bad PRODUCER, not the Project model: the entity type, its
+    payload schema and State's fold all stay, so a genuine project signal can
+    populate PROJECT without rebuilding any of this."""
+    from navis.memory.schemas import current_version
+    from navis.memory.schemas.payloads import PAYLOAD_FIELDS_V1
+
+    assert current_version(EntityType.PROJECT) == 1
+    assert "folder_id" in PAYLOAD_FIELDS_V1[EntityType.PROJECT]
 
 
 def test_extractors_are_deterministic():

@@ -8,7 +8,12 @@ from __future__ import annotations
 import re
 from html import unescape
 
-from navis.reasoning.v2.base import ReasoningContext, ReasoningEngine, days_between
+from navis.reasoning.v2.base import (
+    ReasoningContext,
+    ReasoningEngine,
+    days_between,
+    has_human_bearing_evidence,
+)
 from navis.reasoning.v2.contract import SignalDraft, SignalType
 from navis.state.v2.models import OrganizationalState
 
@@ -19,6 +24,35 @@ PROJECT_STALLED_DAYS = 10.0
 DECISION_UNRESOLVED_DAYS = 7.0
 CUSTOMER_DROP_DAYS = 14.0
 MEETING_OVERLOAD_COUNT = 5
+
+# ── Upper age caps ─────────────────────────────────────────────────────
+#
+# There is no single correct ceiling, because the signals measure two
+# different things and only one of them decays.
+#
+# DECAY signals measure SILENCE — relationship cooling, project stalled,
+# customer engagement dropping. Silence genuinely stops being "cooling" at some
+# point and becomes a lapsed relationship: a different, lower-urgency fact that
+# a daily brief should not keep re-raising. One month is the founder's
+# actionable window here, and past it the item is history they can neither
+# salvage nor act on quickly.
+#
+# OBLIGATION signals measure an UNMET DUTY — a promise someone made, a decision
+# you owe, a reply you never sent. These do NOT decay. "You promised me the deck
+# 45 days ago" is more urgent than at 5 days, not less, and a Chief of Staff
+# that silently forgets promises past an arbitrary horizon has the single worst
+# failure mode this product can have. The 30-day cap applied to commitments was
+# therefore a real (if quiet) regression — it made Navis forget.
+#
+# The obligation ceiling is still BOUNDED rather than absent: the scan stays
+# sane, and a board carrying a year of debt is its own kind of useless. A
+# quarter is long enough that nothing a founder would still act on is dropped.
+MAX_DECAY_AGE_DAYS = 30.0
+MAX_OBLIGATION_AGE_DAYS = 90.0
+
+# Back-compat alias for the decay window. Kept so existing imports keep meaning
+# what they always meant; new code should name the window it wants.
+MAX_SURFACE_AGE_DAYS = MAX_DECAY_AGE_DAYS
 
 # Defensive scrub for legacy Memory rows written before the extractor learned
 # to strip HTML from Gmail bodies (extractors/email.py). New rows are already
@@ -39,30 +73,6 @@ def _clip(text: str | None, n: int = 80) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
-# --- Slipping / cooling / stalled predicates — ONE HOME ------------------------------------
-# The "is this entity slipping/cooling/stalled?" judgment is defined ONCE here and reused by
-# BOTH the entity engines (which also need the age for the signal) and the PriorityEngine's meta
-# counts, so the two can never drift. Each returns the age in days when the condition holds (the
-# projection clock; a not-open status or a missing/invalid last_seen is never a hit), else None.
-# Deterministic and replay-safe.
-
-def slipping_age(commitment, as_of) -> float | None:
-    if commitment.status != "open":
-        return None
-    age = days_between(as_of, commitment.last_seen)
-    return age if age is not None and age >= COMMITMENT_SLIPPING_DAYS else None
-
-
-def cooling_age(relationship, as_of) -> float | None:
-    age = days_between(as_of, relationship.last_interaction_at)
-    return age if age is not None and age >= RELATIONSHIP_COOLING_DAYS else None
-
-
-def stalled_age(project, as_of) -> float | None:
-    age = days_between(as_of, project.last_seen)
-    return age if age is not None and age >= PROJECT_STALLED_DAYS else None
-
-
 class CommitmentReasoningEngine(ReasoningEngine):
     name = "commitment_reasoning"
     version = "2.0.0"
@@ -70,8 +80,15 @@ class CommitmentReasoningEngine(ReasoningEngine):
     def analyze(self, state: OrganizationalState, ctx: ReasoningContext) -> list[SignalDraft]:
         out = []
         for c in state.commitments():
-            age = slipping_age(c, ctx.as_of)
-            if age is None:
+            if c.status != "open":
+                continue
+            # A dated promise belongs to CommitmentFollowUpEngine, which can say
+            # WHEN it was due. Skipping it here keeps the two mutually exclusive
+            # so one promise never produces two cards.
+            if c.due_at:
+                continue
+            age = days_between(ctx.as_of, c.last_seen)
+            if age is None or age < COMMITMENT_SLIPPING_DAYS or age > MAX_OBLIGATION_AGE_DAYS:
                 continue
             clean = _plain(c.text)
             if not clean:
@@ -96,14 +113,47 @@ class CommitmentReasoningEngine(ReasoningEngine):
 
 
 class RelationshipReasoningEngine(ReasoningEngine):
+    """A RELATIONSHIP the organization actually has has gone quiet.
+
+    2.1.0 added the relevance gate. Every address on every email becomes a
+    RELATIONSHIP, and this engine had no filter at all, so it reported
+    "relationship cooling" for newsletters, billing robots and no-reply senders.
+    Live, that was microsoft-noreply@microsoft.com (invoice),
+    openscout+on-the-side@substack.com (newsletter), mail@mail.adobe.com
+    (marketing) and founders@mail.slashy.com (automated_other) — and Intelligence
+    then aggregated them into organizational RISK and RELATIONSHIP insights,
+    telling a founder that Adobe's mailing list was a business risk.
+
+    THE GATE REQUIRES POSITIVE EVIDENCE, unlike OpportunityEngine's, which only
+    suppresses on positive evidence of irrelevance. The asymmetry is deliberate
+    and follows from what a false positive costs each engine:
+
+      * OPPORTUNITY says "here is a warm window" — a wrong one costs a glance.
+      * COOLING says "a relationship you rely on is decaying", and now also
+        feeds org-level risk aggregates. A wrong one corrupts the organization's
+        picture of itself, which is the failure this product cannot afford.
+
+    So an UNKNOWN relationship yields no conclusion here rather than a
+    speculative one. That is affordable because it is not actually a gap: all 36
+    relationships across both live organizations carry classification evidence,
+    since `signal_importance` is written in the same transaction as every
+    ingested signal. If coverage ever regresses, this engine goes quiet rather
+    than wrong — the correct direction to fail.
+    """
+
     name = "relationship_reasoning"
-    version = "2.0.0"
+    # 2.1.0: relevance gate added. Mirrors OpportunityEngine's 2.0.0 -> 2.1.0
+    # bump for the same class of change.
+    version = "2.1.0"
 
     def analyze(self, state: OrganizationalState, ctx: ReasoningContext) -> list[SignalDraft]:
         out = []
         for r in state.relationships():
-            age = cooling_age(r, ctx.as_of)
-            if age is None:
+            age = days_between(ctx.as_of, r.last_interaction_at)
+            if age is None or age < RELATIONSHIP_COOLING_DAYS or age > MAX_SURFACE_AGE_DAYS:
+                continue
+            observed = ctx.evidence.get(r.entity_id)
+            if not has_human_bearing_evidence(observed):
                 continue
             out.append(
                 SignalDraft(
@@ -115,7 +165,14 @@ class RelationshipReasoningEngine(ReasoningEngine):
                     confidence=min(0.9, 0.5 + age / 30),
                     severity=0.6,
                     dedup_key=r.entity_id,
-                    evidence={"days_since_contact": round(age, 2), "person_email": r.person_email},
+                    evidence={
+                        "days_since_contact": round(age, 2),
+                        "person_email": r.person_email,
+                        # Sorted for determinism. Makes the relevance call
+                        # auditable back to the signals it was derived from,
+                        # exactly as OpportunityEngine records it.
+                        "relevance_evidence": sorted(observed),
+                    },
                 )
             )
         return out
@@ -128,8 +185,8 @@ class ProjectReasoningEngine(ReasoningEngine):
     def analyze(self, state: OrganizationalState, ctx: ReasoningContext) -> list[SignalDraft]:
         out = []
         for p in state.projects():
-            age = stalled_age(p, ctx.as_of)
-            if age is None:
+            age = days_between(ctx.as_of, p.last_seen)
+            if age is None or age < PROJECT_STALLED_DAYS or age > MAX_SURFACE_AGE_DAYS:
                 continue
             out.append(
                 SignalDraft(
@@ -155,7 +212,7 @@ class CustomerReasoningEngine(ReasoningEngine):
         out = []
         for cu in state.customers():
             age = days_between(ctx.as_of, cu.last_seen)
-            if age is None or age < CUSTOMER_DROP_DAYS:
+            if age is None or age < CUSTOMER_DROP_DAYS or age > MAX_SURFACE_AGE_DAYS:
                 continue
             out.append(
                 SignalDraft(
@@ -182,8 +239,13 @@ class DecisionReasoningEngine(ReasoningEngine):
         for d in state.decisions():
             if d.status != "open":
                 continue
+            # Decision REQUESTS ("can you approve X?") are DecisionOwedEngine's
+            # job — it knows who is waiting and can address the follow-up. This
+            # engine covers decisions the org RECORDED and never closed out.
+            if d.kind == "request":
+                continue
             age = days_between(ctx.as_of, d.last_seen)
-            if age is None or age < DECISION_UNRESOLVED_DAYS:
+            if age is None or age < DECISION_UNRESOLVED_DAYS or age > MAX_OBLIGATION_AGE_DAYS:
                 continue
             out.append(
                 SignalDraft(

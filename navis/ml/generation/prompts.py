@@ -4,6 +4,16 @@ Each prompt has a stable id + integer version. Changing wording bumps the versio
 so telemetry and regression evals can attribute quality to an exact prompt revision.
 Business logic NEVER lives in a prompt — prompts only instruct narration over the
 already-decided, grounded facts.
+
+Two invariants every prompt must satisfy:
+  * `_NO_FABRICATION` — the LLM never invents facts and never takes actions.
+    Applies to ALL prompts, including advisory ones.
+  * `_NARRATE_ONLY`   — the LLM never authors decisions, recommendations, or
+    priorities. Applies to the narrative prompts (brief/summary/draft/explanation).
+    The `recommendation` prompt intentionally omits this clause: it exists so the
+    founder can ask "what should I do first" and get advisory prose grounded in
+    real memory, instead of a hard refusal. The output is still advisory text
+    for the human to act on — never an autonomous decision.
 """
 from __future__ import annotations
 
@@ -29,32 +39,55 @@ class Prompt:
             raise ValueError(f"Prompt.system must be a non-empty instruction (id={self.id!r})")
 
 
-_GROUND_RULE = (
+_NO_FABRICATION = (
     " You may only use the grounded facts provided. Cite facts as [n]. If the facts "
-    "do not answer the question, say so. Never invent facts. Never make decisions, "
-    "recommendations, priorities, or take actions — narrate only."
+    "do not answer the question, say so. Never invent facts. Never take actions."
+)
+
+_NARRATE_ONLY = (
+    " Never make decisions, recommendations, or priorities — narrate only."
+)
+
+_ADVISORY_GUARDRAIL = (
+    " Only rank items that appear in the grounded facts — never suggest something "
+    "the facts don't mention. Frame suggestions as advisory ('consider tackling X "
+    "next'), never as autonomous decisions. Cite the fact behind every suggestion."
 )
 
 _REGISTRY: dict[str, Prompt] = {
     "brief_narrative": Prompt(
         "brief_narrative", 1,
         "You are a concise executive writer. Summarize what matters from the grounded "
-        "facts into a short morning narrative for a founder." + _GROUND_RULE,
+        "facts into a short morning narrative for a founder."
+        + _NO_FABRICATION + _NARRATE_ONLY,
     ),
     "summary": Prompt(
-        "summary", 1,
-        "You are a precise summarizer. Produce a faithful summary of the grounded facts."
-        + _GROUND_RULE,
+        "summary", 2,
+        "You are a precise summarizer for a founder. Given the grounded facts, "
+        "produce a short executive narrative in three labelled sections: "
+        "**What happened** (2–4 sentences of the concrete events), "
+        "**Why it matters** (the operational impact — who's blocked, what's at stake), "
+        "**What next** (open threads or decisions still owed — never invent actions). "
+        "Cite every claim by [n]. If the facts don't cover a section, say so briefly "
+        "instead of padding." + _NO_FABRICATION + _NARRATE_ONLY,
     ),
     "draft": Prompt(
         "draft", 1,
         "You are a writing assistant drafting a message grounded ONLY in the facts."
-        + _GROUND_RULE,
+        + _NO_FABRICATION + _NARRATE_ONLY,
     ),
     "explanation": Prompt(
         "explanation", 1,
         "You explain WHY something is true using only the grounded facts and their "
-        "citations." + _GROUND_RULE,
+        "citations." + _NO_FABRICATION + _NARRATE_ONLY,
+    ),
+    "recommendation": Prompt(
+        "recommendation", 1,
+        "You are a triage advisor for a busy founder. Given the grounded facts, "
+        "identify which items deserve attention first and briefly explain why. "
+        "Weigh urgency (deadlines, waiting parties) and impact (revenue, blockers, "
+        "commitments already made). Produce a short ranked list — the top item "
+        "first, then 2–4 runners-up — and stop." + _NO_FABRICATION + _ADVISORY_GUARDRAIL,
     ),
     # Consumed by navis.reasoning.ai through the gateway. The signal_type list must stay in
     # sync with reasoning's SignalType enum — enforced by test (this module must never import

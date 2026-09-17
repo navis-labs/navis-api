@@ -27,15 +27,79 @@ _OUTCOME_NAMESPACE = uuid.UUID("d3f8a1b6-2c47-5e90-8a3b-1f2c4d6e8a05")
 
 
 class OutcomeType(str, enum.Enum):
-    # From Execution events
+    """What kind of fact this outcome records.
+
+    THREE SOURCES, and the distinction is load-bearing for anything that later
+    reads these as evidence:
+
+      * MACHINE outcomes — what Execution did. `ACTION_EXECUTED` means the
+        provider call succeeded; it does NOT mean the business outcome occurred
+        (see the module docstring on Outcome).
+      * HUMAN outcomes — what a person decided about a proposal. These are the
+        highest-value feedback Navis can receive, because they are a direct
+        judgement on something it proposed.
+      * WORLD outcomes — what actually happened afterwards, from provider
+        webhooks. Only these answer "did it work?".
+
+    `outcome_type` is a String(40) column, so members can be added without a
+    migration. Learning maps type -> result and defaults unknown types to
+    NEUTRAL, so a new member is inert there until Learning is taught about it.
+    """
+
+    # ── Machine: what Execution did ──────────────────────────────────────
     ACTION_EXECUTED = "action_executed"
     ACTION_FAILED = "action_failed"
-    # From provider webhooks (real-world results)
+
+    # ── Human: what a person decided about a proposal ────────────────────
+    #
+    # Execution has always EMITTED these (ACTION_REJECTED / ACTION_CANCELLED are
+    # in `_EVENT_FOR_STATUS`, written to the outbox in the same transaction as
+    # the status change and relayed like every other event). Observation simply
+    # had no subscriber for them, so a founder declining a proposal — the
+    # clearest negative signal the product can get — was published and dropped.
+    #
+    # REJECTED and CANCELLED are separate because they mean different things: a
+    # rejection is a judgement on the proposal ("no, not this"), a cancellation
+    # is usually a withdrawal of a request that has been overtaken by events.
+    # Collapsing them would teach a future Learning pass that the two are the
+    # same evidence, which they are not.
+    ACTION_REJECTED = "action_rejected"
+    ACTION_CANCELLED = "action_cancelled"
+
+    # A founder removed a DECISION from their brief. The judgement above are
+    # verdicts on a proposed ACTION; this is a verdict on the CONCLUSION itself
+    # — "Navis, this did not need me" — and it is the ONLY human choice most
+    # decisions can receive: `risk`, `opportunity` and `delegation` map to no
+    # action type (`execution.proposer.decision_action`), so they never become
+    # an ExecutionRequest and can never be rejected or cancelled.
+    #
+    # ITS OWN MEMBER, and not ACTION_REJECTED reused. The three existing
+    # judgement types all carry an `execution_id`; this one carries a decision
+    # and its reasoning signals and nothing else, and folding it into a member
+    # whose whole meaning is "about an action" would make `execution_id IS NULL`
+    # the only way to tell two different verdicts apart. The same argument the
+    # REJECTED/CANCELLED split already documents.
+    #
+    # WHY the brief-dismissal reason is NOT split into three members: the reason
+    # ("explicit" / "stale" / "duplicate") is stored verbatim on the outcome
+    # payload, so a later pass can separate them without re-deriving anything,
+    # and minting three types before anything reads them would fix a taxonomy to
+    # a distinction nothing yet uses.
+    DECISION_DISMISSED = "decision_dismissed"
+
+    # ── World: what actually happened (provider webhooks) ────────────────
     REPLY_RECEIVED = "reply_received"
     MEETING_ACCEPTED = "meeting_accepted"
     MEETING_COMPLETED = "meeting_completed"
     # From pollers (future)
     NO_RESPONSE = "no_response"
+
+
+# `FailureKind` — the vocabulary for WHY an execution failed — lives in
+# `navis.execution.contract`, next to `OutcomeReference`, because Execution is
+# what knows the cause and that module is already "the hooks Observation will
+# consume". Observation stores the value verbatim in
+# `ACTION_FAILED.payload["failure_kind"]` and never interprets it.
 
 
 def compute_outcome_id(source_event_id: str, outcome_type: str) -> uuid.UUID:

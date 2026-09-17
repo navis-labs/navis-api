@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import random
+import uuid
+from datetime import datetime, timezone
 
 from navis.memory.envelope import EntityType
 from navis.state.v2.builders import build_projection, continue_projection
@@ -335,3 +337,102 @@ def test_state_snapshot_declares_integrity_constraints():
     assert "ck_state_snapshots_watermark_paired" in names
     assert "ck_state_snapshots_projection_version_positive" in names
     assert "ck_state_snapshots_schema_version_positive" in names
+
+
+# ---- Document lifecycle through the projection (07E) --------------------
+
+
+def _doc(status: str | None, *, offset: int, tag: str, org_id=ORG_A):
+    payload = {"document_id": "doc-1", "title": "Strategy Doc", "source": "docs"}
+    if status is not None:
+        payload["status"] = status
+    return rec(EntityType.DOCUMENT, "doc-1", payload, offset=offset, tag=tag, org_id=org_id)
+
+
+def test_trashed_document_does_not_stay_active():
+    """The bug 07E closes: a trashed Doc previously kept reporting as live."""
+    state = build_projection(ORG_A, [
+        _doc("active", offset=0, tag="d-create"),
+        _doc("trashed", offset=10, tag="d-trash"),
+    ])
+    doc = state.documents()[0]
+
+    assert doc.status == "trashed" and doc.is_trashed is True
+
+
+def test_restored_document_becomes_active_again():
+    """Latest-wins, both directions — no un-delete mechanism required."""
+    state = build_projection(ORG_A, [
+        _doc("active", offset=0, tag="d-create"),
+        _doc("trashed", offset=10, tag="d-trash"),
+        _doc("active", offset=20, tag="d-restore"),
+    ])
+
+    assert state.documents()[0].is_trashed is False
+
+
+def test_document_written_before_status_existed_reads_as_active():
+    """Backward compatibility: `status` is an ADDITIVE field, so pre-existing
+    records simply lack it and must not read as trashed."""
+    state = build_projection(ORG_A, [_doc(None, offset=0, tag="d-legacy")])
+
+    assert state.documents()[0].status == "active"
+
+
+def test_document_trash_is_organization_scoped():
+    """Org A trashing its Doc must not trash org B's copy of the same file id.
+
+    `build_projection` folds ONE org's records — isolation is enforced upstream
+    by `MemoryReader.stream`'s `organization_id == org_id` filter, and here by
+    entity_id encoding org_id (matching `test_multi_tenant_isolation` above)."""
+    a = build_projection(ORG_A, [
+        _doc("active", offset=0, tag="d-a", org_id=ORG_A),
+        _doc("trashed", offset=10, tag="d-a2", org_id=ORG_A),
+    ])
+    b = build_projection(ORG_B, [_doc("active", offset=0, tag="d-b", org_id=ORG_B)])
+
+    assert a.documents()[0].is_trashed is True
+    assert b.documents()[0].is_trashed is False
+    assert a.documents()[0].entity_id != b.documents()[0].entity_id  # same file id, distinct entities
+
+
+# ---- Watermark pairing invariant ----------------------------------------
+#
+# `last_timestamp` and `last_memory_id` are a PAIR. `ck_state_snapshots_
+# watermark_paired` enforces that on the two dedicated COLUMNS, but the same
+# watermark also round-trips through the snapshot's `full_projection` JSONB,
+# which no constraint validates. `passed()` used to test only the timestamp,
+# so a half-set watermark reached `None.int` inside `order_key`.
+
+
+def test_half_set_watermark_does_not_crash_and_fails_safe():
+    from navis.state.v2.models import Watermark
+
+    now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    wm = Watermark(last_timestamp=now, last_memory_id=None)
+
+    # Fails SAFE: an unusable cursor means "nothing is known to be folded",
+    # so every record is unseen and the projection replays.
+    assert wm.passed(now, uuid.uuid4()) is True
+
+
+def test_from_dict_normalises_a_half_set_watermark():
+    from navis.state.v2.models import Watermark
+
+    only_ts = Watermark.from_dict({"last_timestamp": "2026-06-01T00:00:00+00:00"})
+    only_id = Watermark.from_dict({"last_memory_id": str(uuid.uuid4())})
+
+    assert only_ts == Watermark() and only_id == Watermark()
+
+
+def test_complete_watermark_ordering_is_unchanged():
+    from navis.state.v2.models import Watermark
+
+    now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    mid = uuid.uuid4()
+    wm = Watermark(last_timestamp=now, last_memory_id=mid)
+
+    assert wm.passed(datetime(2030, 1, 1, tzinfo=timezone.utc), mid) is True
+    assert wm.passed(datetime(2020, 1, 1, tzinfo=timezone.utc), mid) is False
+    assert wm.passed(now, mid) is False          # strictly after, not at-or-after
+    assert Watermark.from_dict(wm.to_dict()) == wm  # round-trip preserved

@@ -119,8 +119,73 @@ class OrganizationOut(BaseModel):
     slug: str
 
 
+class OrgMembershipOut(BaseModel):
+    """One organization this user holds a seat in.
+
+    Carries IDENTITY ONLY — no role, no permissions. That omission is the point:
+    permissions are published for the ACTIVE organization and nowhere else, so a
+    client physically cannot assemble an authorization answer for a tenant it is
+    not currently authenticated into. See `MeOut.organizations`.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    slug: str
+    # True for the organization this access token authenticated into — the one
+    # `MeOut.organization`, `MeOut.role` and `MeOut.permissions` all describe.
+    is_current: bool = False
+
+
 class MeOut(BaseModel):
+    """The authenticated caller's identity AND their effective authorization state.
+
+    `permissions` is the whole reason this response is not just `role`. A client
+    that knows only the role has to own a copy of the backend's role->permission
+    table to decide what to render, and that copy is wrong in two ways it cannot
+    detect: it misses per-org `role_permissions` grants entirely (they exist only
+    in the database), and it drifts the moment the backend's defaults change.
+    This field is the resolved `Principal.permissions` — defaults AND org grants,
+    computed by the same code that enforces them — so there is exactly one
+    permission table in the system and the UI reads it rather than reimplements it.
+
+    It remains a PRESENTATION input. Every protected route re-checks the same
+    permission server-side; holding a string here has never been what grants
+    access.
+    """
+
     user: UserOut
     organization: OrganizationOut
-    role: Role
+    # Nullable BY CONTRACT. A membership whose role is missing (pre-0043 data) or
+    # whose stored value this build does not know (a role added to the enum ahead
+    # of the code) is reported as `null` with an empty `permissions` list, rather
+    # than crashing the one endpoint a client needs to establish its session.
+    role: Role | None
+    # Sorted for a stable wire shape — clients may diff or cache this.
+    permissions: list[str] = Field(default_factory=list)
+    # Every organization this user is a member of, current one flagged. Present so
+    # a client can TELL whether the account is single- or multi-org instead of
+    # inferring "no others exist" from a response that only ever shows one.
+    # Read-only: there is no switch endpoint (see the route docstring).
+    organizations: list[OrgMembershipOut] = Field(default_factory=list)
     onboarding_completed: bool = False
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _tolerate_unusable_role(cls, v: object) -> object:
+        """Resolve an unusable role to None instead of raising.
+
+        `Role("")` and `Role("some_future_role")` both raise ValueError, and a
+        ValueError raised while BUILDING a response is a 500. The membership row
+        that produces it is already handled fail-closed everywhere authorization
+        is decided (`effective_permissions` returns the empty set for an unknown
+        role), so the honest representation is "no usable role" — never a guess,
+        and never an exception.
+        """
+        if v is None or isinstance(v, Role):
+            return v
+        try:
+            return Role(v)
+        except ValueError:
+            return None

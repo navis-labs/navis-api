@@ -15,9 +15,15 @@ password, unknown email, disabled account, locked) to one generic 401 (no enumer
 """
 from __future__ import annotations
 
+import time
+
+from fastapi import Depends, HTTPException, status
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+# Safe at module scope: `authz` imports models/permissions/tokens/platform and
+# never imports this module, so there is no cycle to defer around.
+from navis.identity.authz import Principal, get_principal
 from navis.platform.config import settings
 from navis.platform.monitoring import get_logger
 from navis.platform.monitoring.metrics import metrics
@@ -121,3 +127,119 @@ class LoginThrottle:
         except RedisError:
             metrics.incr("login.throttle.redis_error", labels={"op": "ip_record"})
             logger.warning("login.throttle redis unavailable on ip_record — failing open")
+
+
+# ── Per-ORGANIZATION rate limiting for expensive routes (T-23) ──────────────
+#
+# WHAT WAS MISSING. There was no HTTP rate limiting anywhere except the login
+# throttle above — no middleware, no dependency, no per-tenant quota. `POST /chat`
+# embeds a query, runs a full-scan vector search over the org's whole corpus,
+# folds state and calls an LLM, and was reachable at unlimited rate by any
+# authenticated principal. One organization could exhaust the database pool, the
+# Redis pool, the LLM provider quota and the API process's event loop for every
+# other tenant.
+#
+# KEYED ON THE AUTHENTICATED ORGANIZATION, never on anything the caller sends.
+# `Principal.org_id` is resolved by `get_principal` from a `Membership` row, so
+# there is no request field that can move a caller into another tenant's bucket
+# (to spend it) or out of their own (to escape it).
+#
+# WHY PER-ORG AND NOT PER-USER. The property being defended is tenant isolation:
+# one organization must not be able to starve another. A per-user key would let an
+# org with many seats consume proportionally more shared capacity, which is the
+# thing this exists to prevent. Within one tenant, how members share their own
+# budget is that tenant's problem.
+#
+# FAILS OPEN, DELIBERATELY. This is an AVAILABILITY control, not an authorization
+# one — the request is already authenticated and authorized by the time it gets
+# here. If Redis is unreachable the safe direction is to serve the request and
+# emit a metric, exactly as `LoginThrottle` and `execution.ratelimit` already do.
+# The opposite choice would turn a cache outage into a full outage. Authorization
+# controls in this codebase fail CLOSED; this one is not an authorization control.
+#
+# KEY SHAPE AND BOUNDEDNESS. `ratelimit:{bucket}:{org}:{window}` where `window` is
+# the floor of epoch seconds to the window size. Every key gets an EXPIRE on
+# creation, so the namespace is bounded by (buckets x active orgs) for one window
+# and disappears on its own — no unbounded growth, no sweeper needed.
+
+_RATE_LIMIT_PREFIX = "ratelimit:"
+
+
+class OrgRateLimiter:
+    """Fixed-window request counter, one bucket per (route class, organization)."""
+
+    def __init__(self, redis: Redis, *, window_seconds: int | None = None) -> None:
+        self.redis = redis
+        self.window_seconds = (
+            window_seconds
+            if window_seconds is not None
+            else settings.rate_limit_window_seconds
+        )
+
+    def _key(self, bucket: str, org_id, now: float) -> str:
+        window = int(now) // self.window_seconds
+        return f"{_RATE_LIMIT_PREFIX}{bucket}:{org_id}:{window}"
+
+    async def check(self, bucket: str, org_id, limit: int) -> tuple[bool, int]:
+        """`(allowed, retry_after_seconds)`. Counts the request that asks.
+
+        INCR-then-EXPIRE rather than a Lua script: the window is short and a lost
+        EXPIRE (process death between the two calls) costs one stranded key that
+        the next window's key replaces, which is not worth a scripting dependency.
+        """
+        if not settings.rate_limit_enabled or limit <= 0:
+            return True, 0
+        now = time.time()
+        key = self._key(bucket, org_id, now)
+        try:
+            hits = await self.redis.incr(key)
+            if hits == 1:
+                await self.redis.expire(key, self.window_seconds)
+        except RedisError:
+            metrics.incr("ratelimit.redis_error", labels={"bucket": bucket})
+            logger.warning("rate limiter redis unavailable — failing open bucket=%s", bucket)
+            return True, 0
+        if hits > limit:
+            # Bounded label: `bucket` is a fixed string per route class, never the
+            # organization id — a per-org label would scale metric cardinality with
+            # the customer count.
+            metrics.incr("ratelimit.throttled", labels={"bucket": bucket})
+            logger.warning(
+                "rate limit exceeded bucket=%s org=%s hits=%d limit=%d",
+                bucket, org_id, hits, limit,
+            )
+            retry_after = self.window_seconds - int(now) % self.window_seconds
+            return False, max(retry_after, 1)
+        return True, 0
+
+
+def rate_limit(bucket: str, limit_setting: str):
+    """FastAPI dependency: throttle this route per authenticated organization.
+
+    `limit_setting` names the Settings field holding this bucket's limit, read at
+    REQUEST time rather than captured at import — so a deployment can change a
+    limit without a code change, and tests can move it without re-importing the
+    router.
+
+    Returns 429 with a `Retry-After` header naming the seconds until the window
+    rolls, which is what lets a well-behaved client back off instead of spinning.
+    """
+
+    async def _dep(principal: Principal = Depends(get_principal)) -> Principal:
+        limit = int(getattr(settings, limit_setting))
+        allowed, retry_after = await _limiter().check(bucket, principal.org_id, limit)
+        if not allowed:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                f"rate limit exceeded for this organization; retry in {retry_after}s",
+                headers={"Retry-After": str(retry_after)},
+            )
+        return principal
+
+    return _dep
+
+
+def _limiter() -> OrgRateLimiter:
+    from navis.platform.cache import redis_client
+
+    return OrgRateLimiter(redis_client)

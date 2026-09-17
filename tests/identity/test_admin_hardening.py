@@ -209,10 +209,10 @@ def test_validate_permission_rejects_garbage():
 
 
 async def test_org_create_rejects_empty_name():
-    from navis.identity.org_service import OrganizationError, OrganizationService
+    from navis.identity.org_service import OrganizationError, OrgLifecycleSeam
     from tests.identity.fakes import FakeSession
 
-    svc = OrganizationService(FakeSession())
+    svc = OrgLifecycleSeam(FakeSession())
     for bad in ("", "   ", "\t\n"):
         with pytest.raises(OrganizationError):
             await svc.create(name=bad)

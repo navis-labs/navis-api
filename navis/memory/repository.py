@@ -71,6 +71,26 @@ class MemoryRepository:
         )
         return (await self.db.scalars(stmt)).all()
 
+    async def list_by_entity_type(
+        self,
+        org_id: uuid.UUID,
+        entity_type: EntityType,
+        *,
+        limit: int = 500,
+    ) -> Sequence[MemoryRecordRow]:
+        """Newest-first facts of one entity_type in an org. Backs read APIs that
+        surface people / decisions / commitments etc. Uses ix_mem_org_type_time."""
+        stmt = (
+            select(MemoryRecordRow)
+            .where(
+                MemoryRecordRow.organization_id == org_id,
+                MemoryRecordRow.entity_type == entity_type.value,
+            )
+            .order_by(MemoryRecordRow.event_timestamp.desc())
+            .limit(limit)
+        )
+        return (await self.db.scalars(stmt)).all()
+
     # --- governance (GDPR erasure cascade) -------------------------------------------------
     async def scan_org(
         self, org_id: uuid.UUID, *, limit: int = 500, after_id: uuid.UUID | None = None

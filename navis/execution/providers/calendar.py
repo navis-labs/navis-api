@@ -8,13 +8,16 @@ from navis.execution.contract import ProviderReference, ProviderResult
 from navis.execution.providers.base import Provider, ProviderValidationError
 
 Sender = Callable[[dict[str, Any]], Awaitable[str]]
+# The create path returns `(event_id, conference_extra)` — the mutation verbs
+# (reschedule / cancel) create no conference and keep the bare-id `Sender`.
+CreateSender = Callable[[dict[str, Any]], Awaitable[tuple[str, dict[str, Any]]]]
 
 
 class CalendarProvider(Provider):
     name = "calendar"
     action_type = "schedule_meeting"
 
-    def __init__(self, sender: Sender | None = None) -> None:
+    def __init__(self, sender: CreateSender | None = None) -> None:
         self._sender = sender
 
     async def validate(self, payload: dict[str, Any]) -> None:
@@ -31,8 +34,76 @@ class CalendarProvider(Provider):
             return ProviderResult(
                 ok=True, reference=ProviderReference("calendar", synthetic, {"dry_run": True})
             )
+        # `extra` carries meet_url / conference_status when a conference was
+        # requested, and is empty otherwise — so a plain event's reference
+        # shape is byte-identical to what it was before Meet support.
+        event_id, extra = await self._sender(payload)
+        return ProviderResult(
+            ok=True, reference=ProviderReference("calendar", event_id, extra)
+        )
+
+    async def status(self, reference: dict[str, Any]) -> str:
+        return "scheduled"
+
+
+class RescheduleMeetingProvider(Provider):
+    """Move an existing event to a new time.
+
+    Separate from CalendarProvider because the payloads and the failure modes
+    differ: a reschedule REQUIRES an existing `event_id`, and "the event is
+    gone" is a terminal error rather than something to retry.
+    """
+
+    name = "calendar"
+    action_type = "reschedule_meeting"
+
+    def __init__(self, sender: Sender | None = None) -> None:
+        self._sender = sender
+
+    async def validate(self, payload: dict[str, Any]) -> None:
+        if not payload.get("event_id"):
+            raise ProviderValidationError("reschedule_meeting requires 'event_id'")
+        if not payload.get("start"):
+            raise ProviderValidationError("reschedule_meeting requires 'start'")
+
+    async def execute(self, payload: dict[str, Any]) -> ProviderResult:
+        if self._sender is None:
+            return ProviderResult(
+                ok=True,
+                reference=ProviderReference(
+                    "calendar", str(payload.get("event_id")), {"dry_run": True}
+                ),
+            )
         event_id = await self._sender(payload)
         return ProviderResult(ok=True, reference=ProviderReference("calendar", event_id))
 
     async def status(self, reference: dict[str, Any]) -> str:
-        return "scheduled"
+        return "rescheduled"
+
+
+class CancelMeetingProvider(Provider):
+    """Cancel an existing event. Idempotent — 'already gone' is success."""
+
+    name = "calendar"
+    action_type = "cancel_meeting"
+
+    def __init__(self, sender: Sender | None = None) -> None:
+        self._sender = sender
+
+    async def validate(self, payload: dict[str, Any]) -> None:
+        if not payload.get("event_id"):
+            raise ProviderValidationError("cancel_meeting requires 'event_id'")
+
+    async def execute(self, payload: dict[str, Any]) -> ProviderResult:
+        if self._sender is None:
+            return ProviderResult(
+                ok=True,
+                reference=ProviderReference(
+                    "calendar", str(payload.get("event_id")), {"dry_run": True}
+                ),
+            )
+        event_id = await self._sender(payload)
+        return ProviderResult(ok=True, reference=ProviderReference("calendar", event_id))
+
+    async def status(self, reference: dict[str, Any]) -> str:
+        return "cancelled"

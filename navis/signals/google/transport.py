@@ -50,6 +50,14 @@ class GoogleAPIError(Exception):
         return self.status == 404
 
     @property
+    def is_conflict(self) -> bool:
+        """409 — the resource already exists. Google returns this when an
+        events.insert supplies a client-generated `id` that is already on the
+        calendar, which is exactly how the execution worker detects a REPLAYED
+        create and treats it as success instead of booking a second meeting."""
+        return self.status == 409
+
+    @property
     def is_gone(self) -> bool:
         return self.status == 410
 

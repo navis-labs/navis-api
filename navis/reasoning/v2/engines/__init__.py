@@ -7,6 +7,11 @@ from navis.reasoning.v2.engines.risk import (
     ProjectReasoningEngine,
     RelationshipReasoningEngine,
 )
+from navis.reasoning.v2.engines.obligations import (
+    CommitmentFollowUpEngine,
+    DecisionOwedEngine,
+)
+from navis.reasoning.v2.engines.waiting import WaitingReplyReasoningEngine
 from navis.reasoning.v2.engines.meta import (
     ContextEngine,
     LeverageEngine,
@@ -22,6 +27,9 @@ ENGINES = [
     CustomerReasoningEngine(),
     DecisionReasoningEngine(),
     MeetingReasoningEngine(),
+    WaitingReplyReasoningEngine(),
+    CommitmentFollowUpEngine(),
+    DecisionOwedEngine(),
     PriorityEngine(),
     OpportunityEngine(),
     LeverageEngine(),

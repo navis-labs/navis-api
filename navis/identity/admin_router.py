@@ -103,7 +103,15 @@ async def remove_member(
     db: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        await MemberService(db).remove(org_id=p.org_id, user_id=user_id, actor_id=p.subject_id)
+        await MemberService(db).remove(
+            org_id=p.org_id, user_id=user_id, actor_id=p.subject_id,
+            actor_permissions=p.permissions,
+        )
+    except MemberForbidden as exc:
+        # `remove` is now target-aware, so it can refuse on privilege. Listed FIRST:
+        # MemberForbidden subclasses MemberError, and falling through to the 404 arm
+        # would report an authorization decision as a missing member.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc))
     except MemberConflict as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     except MemberError as exc:

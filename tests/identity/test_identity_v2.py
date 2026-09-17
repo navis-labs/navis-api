@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import uuid
 
 import pytest
 
@@ -75,6 +76,174 @@ async def test_bulk_revoke_watermark_rejects_old_tokens():
     future = {"iat": int(datetime.now(timezone.utc).timestamp()) + 10_000}
     assert token_predates_bulk_revoke(old, user) is True
     assert token_predates_bulk_revoke(future, user) is False
+
+
+# ---- principal cache (hot-path DB skip on the JWT auth pipeline) ----
+
+async def test_principal_cache_hit_skips_downstream_db_queries():
+    """A pre-populated cache MUST make _principal_from_jwt return without touching
+    the DB. Regression guard for the /context auth-hot-path optimization."""
+    from navis.identity.authz import (
+        Principal,
+        PrincipalKind,
+        _principal_cache_put,
+        _principal_from_jwt,
+        principal_cache_clear,
+    )
+    from navis.platform.security import create_access_token
+
+    principal_cache_clear()
+    user_id = uuid.uuid4()
+    org_id = ORG_A
+    cached = Principal(
+        kind=PrincipalKind.USER, org_id=org_id, subject_id=user_id,
+        permissions=frozenset(), role="founder", user=None,
+    )
+    token = create_access_token(str(user_id), org_id=str(org_id))
+    # Extract the jti the exact same way _principal_from_jwt does.
+    from navis.platform.security import decode_token
+
+    payload = decode_token(token, expected_type="access")
+    _principal_cache_put(payload["jti"], cached)
+
+    class _RaisingSession:
+        async def get(self, *a, **kw):     raise AssertionError("db.get called on cache hit")
+        async def scalar(self, *a, **kw):  raise AssertionError("db.scalar called on cache hit")
+        async def scalars(self, *a, **kw): raise AssertionError("db.scalars called on cache hit")
+
+    got = await _principal_from_jwt(_RaisingSession(), token)  # type: ignore[arg-type]
+    assert got is cached
+
+
+async def test_principal_cache_miss_populates_then_hits():
+    """First call runs the DB pipeline and caches; second call is a hit."""
+    from navis.identity.authz import (
+        _PRINCIPAL_CACHE,
+        _principal_from_jwt,
+        principal_cache_clear,
+    )
+    from navis.platform.security import create_access_token, decode_token
+
+    principal_cache_clear()
+    db = FakeSession()
+    user = User(email="cache@x.com", is_active=True)
+    db.add(user)
+    db.add(Membership(user_id=user.id, organization_id=ORG_A, role=Role.FOUNDER))
+
+    token = create_access_token(str(user.id), org_id=str(ORG_A))
+    p1 = await _principal_from_jwt(db, token)
+    assert p1.subject_id == user.id
+    payload = decode_token(token, expected_type="access")
+    assert payload["jti"] in _PRINCIPAL_CACHE
+
+    # Second call with a session that raises on any DB access — must serve the cache.
+    class _RaisingSession:
+        async def get(self, *a, **kw):     raise AssertionError("cached path touched DB")
+        async def scalar(self, *a, **kw):  raise AssertionError("cached path touched DB")
+        async def scalars(self, *a, **kw): raise AssertionError("cached path touched DB")
+
+    p2 = await _principal_from_jwt(_RaisingSession(), token)  # type: ignore[arg-type]
+    assert p2.subject_id == user.id
+
+
+async def test_revoke_jti_evicts_the_principal_cache_synchronously():
+    """Explicit logout MUST propagate immediately — the cache must not serve
+    a revoked jti even within the TTL."""
+    from navis.identity.authz import (
+        _PRINCIPAL_CACHE,
+        Principal,
+        PrincipalKind,
+        _principal_cache_put,
+        principal_cache_clear,
+    )
+
+    principal_cache_clear()
+    jti = "jti-to-revoke"
+    _principal_cache_put(jti, Principal(
+        PrincipalKind.USER, ORG_A, ACTOR, frozenset(), role="founder", user=None,
+    ))
+    assert jti in _PRINCIPAL_CACHE
+
+    db = FakeSession()
+    await TokenRevocationService(db).revoke_jti(jti, user_id=ACTOR, expires_at=None)
+    assert jti not in _PRINCIPAL_CACHE   # evicted synchronously by revoke_jti
+
+
+async def test_revoke_all_for_user_evicts_every_cached_session_for_that_user():
+    """Bulk revoke (deactivation / 'log out everywhere') MUST invalidate every
+    outstanding session, not only the token that happened to present a jti."""
+    from navis.identity.authz import (
+        _PRINCIPAL_CACHE,
+        Principal,
+        PrincipalKind,
+        _principal_cache_put,
+        principal_cache_clear,
+    )
+
+    principal_cache_clear()
+    victim_user = uuid.uuid4()
+    other_user = uuid.uuid4()
+    # Three sessions for the victim, one for someone else.
+    for jti in ("v1", "v2", "v3"):
+        _principal_cache_put(jti, Principal(
+            PrincipalKind.USER, ORG_A, victim_user, frozenset(), role="founder", user=None,
+        ))
+    _principal_cache_put("other", Principal(
+        PrincipalKind.USER, ORG_A, other_user, frozenset(), role="founder", user=None,
+    ))
+    assert set(_PRINCIPAL_CACHE) == {"v1", "v2", "v3", "other"}
+
+    db = FakeSession()
+    db.add(User(id=victim_user, email="v@x.com", is_active=True))
+    await TokenRevocationService(db).revoke_all_for_user(victim_user)
+    assert set(_PRINCIPAL_CACHE) == {"other"}    # victim's sessions gone; unrelated user survives
+
+
+async def test_principal_cache_respects_ttl():
+    """A stale entry (past TTL) must not be served — the request pays the DB cost
+    and re-populates."""
+    import time as _time
+
+    from navis.identity.authz import (
+        _PRINCIPAL_CACHE,
+        Principal,
+        PrincipalKind,
+        _principal_cache_get,
+        principal_cache_clear,
+    )
+
+    principal_cache_clear()
+    jti = "ttl-jti"
+    # Manually inject an already-expired entry (expires_at in the past).
+    _PRINCIPAL_CACHE[jti] = (
+        _time.monotonic() - 1.0,
+        ACTOR,
+        Principal(PrincipalKind.USER, ORG_A, ACTOR, frozenset(), role="founder", user=None),
+    )
+    assert _principal_cache_get(jti) is None       # expired -> miss
+    assert jti not in _PRINCIPAL_CACHE             # lazily evicted on get
+
+
+async def test_principal_cache_is_bounded_lru():
+    """Cache size never exceeds _PRINCIPAL_CACHE_MAX — the oldest entries evict."""
+    from navis.identity.authz import (
+        _PRINCIPAL_CACHE,
+        _PRINCIPAL_CACHE_MAX,
+        Principal,
+        PrincipalKind,
+        _principal_cache_put,
+        principal_cache_clear,
+    )
+
+    principal_cache_clear()
+    for i in range(_PRINCIPAL_CACHE_MAX + 8):
+        _principal_cache_put(f"jti-{i}", Principal(
+            PrincipalKind.USER, ORG_A, ACTOR, frozenset(), role="founder", user=None,
+        ))
+    assert len(_PRINCIPAL_CACHE) == _PRINCIPAL_CACHE_MAX
+    # The oldest 8 evicted; the newest _MAX survive.
+    assert "jti-0" not in _PRINCIPAL_CACHE
+    assert f"jti-{_PRINCIPAL_CACHE_MAX + 7}" in _PRINCIPAL_CACHE
 
 
 # ---- API key lifecycle ----
@@ -166,7 +335,7 @@ async def test_member_invite_assign_remove():
     member = await db.get(Membership, m.id)
     assert member.role == Role.ADMIN
 
-    await svc.remove(org_id=ORG_A, user_id=m.user_id, actor_id=ACTOR)
+    await svc.remove(org_id=ORG_A, user_id=m.user_id, actor_id=ACTOR, actor_permissions=founder)
     assert await svc.list_members(ORG_A) == []
     # Removal bulk-revokes the user's tokens.
     user = await db.get(User, m.user_id)
@@ -312,7 +481,7 @@ async def test_cannot_remove_or_demote_last_founder():
     founder_uid = _uuid.uuid4()
     db.add(Membership(user_id=founder_uid, organization_id=ORG_A, role=Role.FOUNDER))
     with pytest.raises(MemberConflict):
-        await svc.remove(org_id=ORG_A, user_id=founder_uid, actor_id=ACTOR)
+        await svc.remove(org_id=ORG_A, user_id=founder_uid, actor_id=ACTOR, actor_permissions=ALL_PERMISSIONS)
     with pytest.raises(MemberConflict):
         await svc.assign_role(org_id=ORG_A, user_id=founder_uid, role=Role.EMPLOYEE, actor_id=ACTOR, actor_permissions=ALL_PERMISSIONS)
 

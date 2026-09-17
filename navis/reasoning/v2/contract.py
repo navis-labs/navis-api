@@ -14,7 +14,19 @@ from datetime import datetime
 from typing import Any
 
 # Bump when ANY engine's logic/thresholds change → signals get new ids, replay-safe.
-REASONING_VERSION = 1
+# v2: added MAX_SURFACE_AGE_DAYS cap to risk.py engines so signals aren't
+#     emitted for entities silent > 30 days (see engines/risk.py header).
+# v3: OpportunityEngine decides organizational relevance from the SET of
+#     signal_importance classifications observed across a relationship, instead
+#     of emitting for every recent inbound address (see engines/meta.py).
+# v4: RelationshipReasoningEngine applies that same relevance vocabulary, now
+#     shared from base.py, and REQUIRES human-bearing evidence rather than
+#     merely suppressing on evidence of irrelevance. Live, RELATIONSHIP_COOLING
+#     was firing for newsletters, billing robots and no-reply senders, and
+#     Intelligence aggregated them into organizational risk. PriorityEngine's
+#     cooling count moved under the same gate so PRIORITY_LOAD cannot contradict
+#     the signals. Historical v3 signal ids stay immutable and are not re-minted.
+REASONING_VERSION = 4
 
 _REASONING_NAMESPACE = uuid.UUID("7a2b9c14-3d5e-5f60-8b1a-9c0d2e4f6a81")
 
@@ -25,6 +37,17 @@ class SignalType(str, enum.Enum):
     PROJECT_STALLED = "project_stalled"
     CUSTOMER_ENGAGEMENT_DROP = "customer_engagement_drop"
     DECISION_UNRESOLVED = "decision_unresolved"
+    # Someone emailed the founder and no reply from them exists in the
+    # thread. Observed, never inferred — see engines/waiting.py.
+    WAITING_ON_USER_REPLY = "waiting_on_user_reply"
+    # A dated promise made TO the org whose deadline has passed with no
+    # delivery. Distinct from COMMITMENT_SLIPPING, which covers UNDATED
+    # promises by age alone; the two are mutually exclusive by design.
+    COMMITMENT_FOLLOW_UP = "commitment_follow_up"
+    # Somebody asked the founder to decide and no decision has landed.
+    # Distinct from DECISION_UNRESOLVED, which covers decisions the org
+    # RECORDED and never closed out.
+    DECISION_OWED = "decision_owed"
     MEETING_OVERLOAD = "meeting_overload"
     PRIORITY_LOAD = "priority_load"
     OPPORTUNITY = "opportunity"

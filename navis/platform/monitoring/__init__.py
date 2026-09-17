@@ -3,6 +3,7 @@ from navis.platform.monitoring.logging import (
     get_logger,
     get_org_id,
     get_request_id,
+    org_context,
     set_org_id,
     set_request_id,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "set_request_id",
     "get_org_id",
     "set_org_id",
+    "org_context",
     "metrics",
     "timed",
 ]

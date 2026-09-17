@@ -98,8 +98,17 @@ class Membership(UUIDPrimaryKey, Timestamped, Base):
     )
     # Bind the enum VALUE ('founder'), not the member NAME ('FOUNDER'): the PG `role`
     # enum type is defined with the lowercase values.
+    #
+    # NOT NULL since migration 0043. The annotation always said `Mapped[Role]` while
+    # the column allowed NULL, and that gap let a seat exist with no privilege
+    # attached to it — fail-closed for authorization, but a 500 on `/auth/me`.
+    # Readers still handle a missing role defensively (a database that predates 0043
+    # is a real deployment state, and a role must never be INFERRED); this makes the
+    # write side unable to produce one.
     role: Mapped[Role] = mapped_column(
-        SAEnum(Role, values_callable=lambda e: [m.value for m in e]), default=Role.FOUNDER
+        SAEnum(Role, values_callable=lambda e: [m.value for m in e]),
+        nullable=False,
+        default=Role.FOUNDER,
     )
 
     user: Mapped["User"] = relationship(back_populates="memberships")

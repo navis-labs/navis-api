@@ -5,18 +5,21 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import uuid
 
+from navis.identity.authz import Principal, get_principal
 from navis.identity.dependencies import CurrentContext, get_current_context
 from navis.identity.google_auth import GoogleAuthError, GoogleAuthService
-from navis.identity.models import Organization, Role, User
+from navis.identity.models import Membership, Organization, User
 from navis.identity.schemas import (
     GoogleAuthRequest,
     LoginRequest,
     MeOut,
     OrganizationOut,
+    OrgMembershipOut,
     RefreshRequest,
     SignupRequest,
     TokenPair,
@@ -216,9 +219,63 @@ async def logout(
 @router.get("/me", response_model=MeOut)
 async def me(
     ctx: CurrentContext = Depends(get_current_context),
+    principal: Principal = Depends(get_principal),
     db: AsyncSession = Depends(get_session),
 ) -> MeOut:
+    """The caller's identity, active organization, and EFFECTIVE PERMISSIONS.
+
+    This is the frontend's authorization READ contract. It reports what the
+    caller may do; it does not decide it. Enforcement stays where it has always
+    been — `require_permission` on each protected route — and this endpoint
+    simply publishes the same resolved `Principal.permissions` the gate uses, so
+    the UI stops carrying a second, drifting copy of the permission table.
+
+    WHAT "CURRENT ORGANIZATION" MEANS, AND WHY IT IS THE ONLY ONE DESCRIBED
+    ---------------------------------------------------------------------
+    `organization`, `role` and `permissions` all describe ONE tenant: the one
+    this access token authenticated into. That tenant is `Principal.org_id`,
+    which is not the JWT's `org` claim — `authz._principal_from_jwt` uses the
+    claim only to LOOK UP a membership row and then takes
+    `membership.organization_id` as the answer. A token naming an org the user
+    has no seat in is rejected 403 and never reaches this route, so the org
+    reported here is always one the database agrees the caller belongs to.
+
+    `organizations` lists every seat the user holds, current one flagged. It
+    exists so a client can distinguish "this user has one organization" from
+    "this response only shows one" — a distinction the previous shape erased.
+    It deliberately carries NO role and NO permissions per entry: authorization
+    is published for the active tenant only, so nothing here can be assembled
+    into an answer about another tenant.
+
+    MULTI-ORG SWITCHING IS NOT IMPLEMENTED AND IS NOT IMPLIED. There is no
+    switch endpoint and no way to re-scope an existing token; changing the
+    active organization means authenticating into it. The full multi-org
+    experience (an active-org token mechanism, an org picker, per-org
+    onboarding) is Phase 7 work. This list is a read, and nothing more.
+
+    Machine principals (API key / service account) are rejected 401 by
+    `get_current_context`, unchanged: /auth/me describes a human session.
+    """
+    # `get_current_context` already depends on `get_principal`, and FastAPI caches a
+    # dependency per request, so asking for both resolves the principal ONCE — no
+    # second trip through the JWT decode, revocation check, membership lookup and
+    # grant query. `ctx` is what enforces the human-only contract; `principal` is
+    # what carries the permissions this response exists to publish.
     org = await db.get(Organization, ctx.org_id)
+
+    # Every seat this user holds. Two queries, not a join: the fan-out is a
+    # handful of rows (one per organization the user belongs to) and the ORM
+    # models are what the response schema validates from.
+    memberships = (
+        await db.scalars(select(Membership).where(Membership.user_id == ctx.user.id))
+    ).all()
+    member_org_ids = [m.organization_id for m in memberships]
+    member_orgs = (
+        (await db.scalars(select(Organization).where(Organization.id.in_(member_org_ids)))).all()
+        if member_org_ids
+        else []
+    )
+
     # Determine onboarding_completed from the org's onboarding stage.
     onboarding_completed = False
     if ctx.org_id is not None:
@@ -228,9 +285,23 @@ async def me(
             onboarding_completed = (
                 stage_index(current_stage) >= stage_index(OnboardingStage.PROFILE_COMPLETE)
             )
+
     return MeOut(
         user=UserOut.model_validate(ctx.user),
         organization=OrganizationOut.model_validate(org),
-        role=Role(ctx.role),
+        # Passed as the raw string; MeOut resolves it and reports an unusable
+        # role as null rather than raising (see MeOut._tolerate_unusable_role).
+        role=principal.role,
+        # The resolved set the gate itself checks — code defaults PLUS this org's
+        # `role_permissions` grants. Scoped to `principal.org_id` by construction:
+        # `grants_for` filters on that org id, so a grant made in another tenant
+        # cannot appear here.
+        permissions=sorted(principal.permissions),
+        organizations=[
+            OrgMembershipOut(
+                id=o.id, name=o.name, slug=o.slug, is_current=(o.id == ctx.org_id)
+            )
+            for o in member_orgs
+        ],
         onboarding_completed=onboarding_completed,
     )

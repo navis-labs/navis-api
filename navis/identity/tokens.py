@@ -28,6 +28,13 @@ class TokenRevocationService:
             return
         self.db.add(RevokedToken(jti=jti, user_id=user_id, expires_at=expires_at))
         await self.db.flush()
+        # Immediate propagation: drop the in-process principal cache entry so
+        # a request presenting this jti in flight cannot re-authenticate off
+        # a warm cache. Deferred import — tokens.py is imported by authz.py,
+        # so a top-level import would circularise.
+        from navis.identity.authz import principal_cache_evict_jti
+
+        principal_cache_evict_jti(jti)
 
     async def is_jti_revoked(self, jti: str | None) -> bool:
         if not jti:
@@ -44,6 +51,13 @@ class TokenRevocationService:
         if user is not None:
             user.tokens_valid_from = at or datetime.now(timezone.utc)
             await self.db.flush()
+        # Immediate propagation for every outstanding session — the tokens_
+        # valid_from watermark only kicks in when the request reaches the
+        # bulk-revoke check, which the principal cache bypasses. Deferred
+        # import to avoid the circular tokens ↔ authz dependency.
+        from navis.identity.authz import principal_cache_evict_user
+
+        principal_cache_evict_user(user_id)
 
     async def purge_expired(self, *, now: datetime | None = None) -> int:
         # Single bulk DELETE (served by ix_rt_expires) — no N-row ORM load/delete loop.

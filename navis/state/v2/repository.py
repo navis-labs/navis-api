@@ -1,9 +1,11 @@
 """State V2 data access.
 
   MemoryReader      — read-only over `memory_records` ONLY (never legacy tables,
-                      never signals, never reasoning). Keyset pagination on
-                      (event_timestamp, memory_id) so a single-org rebuild streams
-                      in deterministic order and incremental reads start at a watermark.
+                      never signals, never reasoning). Two reads, two clocks:
+                      `stream` walks the whole org in EVENT order (the fold order
+                      a full rebuild needs), `observed_since` returns the delta in
+                      OBSERVATION order (the only order a resume cursor may use).
+                      `count` is the completeness probe.
   SnapshotRepository — load/save the cached projection (a cache, not truth).
 """
 from __future__ import annotations
@@ -11,7 +13,7 @@ from __future__ import annotations
 import uuid
 from typing import AsyncIterator
 
-from sqlalchemy import delete as sa_delete, literal, or_, select, tuple_
+from sqlalchemy import delete as sa_delete, func, literal, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,13 +39,49 @@ class MemoryReader:
             source_signal_event_id=row.source_signal_event_id,
             schema_version=row.schema_version,
             confidence=row.confidence,
+            # The observation clock. `created_at` is DB-assigned
+            # (`server_default=func.now()`), never written by the application,
+            # so it is the one timestamp on this row that cannot be in the future.
+            observed_at=row.created_at,
+        )
+
+    async def count(self, org_id: uuid.UUID) -> int:
+        """How many memory records this organization has, total.
+
+        THE COMPLETENESS PROBE, and it replaced an EXISTS check that could not
+        do the job. `has_records_after(cursor)` answers "is there anything NEW?"
+        — which is silent about anything that landed BELOW an already-advanced
+        cursor. That is precisely the class of row State was losing: an EXISTS
+        probe returns False, the cached projection is served as authoritative,
+        and the record is never folded.
+
+        A count answers both questions in the same round-trip: compared against
+        `OrganizationalState.record_count` it detects new records AND stranded
+        ones, and it cannot be fooled by where in the ordering the gap sits.
+
+        Served from `ix_mem_org_time`, whose leading column is organization_id,
+        so this is an index-only scan of one tenant's entries.
+        """
+        return int(
+            await self.db.scalar(
+                select(func.count())
+                .select_from(MemoryRecord)
+                .where(MemoryRecord.organization_id == org_id)
+            )
+            or 0
         )
 
     async def stream(
-        self, org_id: uuid.UUID, *, after: Watermark | None = None, batch: int = 5000
+        self, org_id: uuid.UUID, *, batch: int = 5000
     ) -> AsyncIterator[MemoryRecordView]:
-        last_ts = after.last_timestamp if after else None
-        last_mid = after.last_memory_id if after else None
+        """Every record for the org in EVENT order — the full-rebuild fold order.
+
+        Keyset-paginated on (event_timestamp, memory_id) so a 10M-record org
+        streams in O(batch) memory. No `after` parameter, deliberately: resuming
+        an event-ordered stream from a cursor is the defect this module was
+        rewritten to remove. Incremental reads go through `observed_since`.
+        """
+        last_ts, last_mid = None, None
         while True:
             stmt = select(MemoryRecord).where(MemoryRecord.organization_id == org_id)
             if last_ts is not None:
@@ -63,6 +101,36 @@ class MemoryReader:
                 return
             last_ts, last_mid = rows[-1].event_timestamp, rows[-1].memory_id
 
+    async def observed_since(
+        self, org_id: uuid.UUID, cursor: Watermark, *, limit: int
+    ) -> list[MemoryRecordView] | None:
+        """Records observed strictly after `cursor`, in OBSERVATION order.
+
+        Returns None when the delta exceeds `limit` — the caller must then do a
+        full rebuild, which streams and costs the same work at bounded memory.
+        Materializing is safe precisely because it is bounded: the caller has to
+        SORT this delta into event order before folding it (the reader cannot,
+        since the two orders differ), and a sort needs the rows in hand.
+
+        `cursor.last_timestamp is None` means nothing has been folded yet, so
+        everything is new — which is also what an empty projection wants.
+        """
+        stmt = select(MemoryRecord).where(MemoryRecord.organization_id == org_id)
+        if cursor.last_timestamp is not None and cursor.last_memory_id is not None:
+            stmt = stmt.where(
+                tuple_(MemoryRecord.created_at, MemoryRecord.memory_id)
+                > tuple_(cursor.last_timestamp, cursor.last_memory_id)
+            )
+        # limit + 1 so "exactly at the cap" is distinguishable from "over it"
+        # without a second COUNT round-trip.
+        stmt = stmt.order_by(
+            MemoryRecord.created_at.asc(), MemoryRecord.memory_id.asc()
+        ).limit(limit + 1)
+        rows = (await self.db.scalars(stmt)).all()
+        if len(rows) > limit:
+            return None
+        return [self._view(row) for row in rows]
+
 
 class SnapshotRepository:
     def __init__(self, db: AsyncSession) -> None:
@@ -77,6 +145,28 @@ class SnapshotRepository:
                 StateSnapshot.projection_version == projection_version,
             )
         )
+
+    async def watermark_only(
+        self, org_id: uuid.UUID, *, projection_version: int
+    ) -> tuple[datetime | None, uuid.UUID | None] | None:
+        """Return just the snapshot's watermark cursor without the JSONB payload.
+
+        Used by StateService's cache short-circuit: the watermark is all we
+        need to compute the in-process cache key, and skipping the ~22KB
+        `full_projection` column shaves both the JSONB fetch and the Python
+        deserialization from a warm /context call — the two dominant costs on
+        that hot path.
+
+        Returns None if the snapshot row is absent for (org, projection_version).
+        """
+        stmt = select(
+            StateSnapshot.watermark_timestamp, StateSnapshot.watermark_memory_id
+        ).where(
+            StateSnapshot.organization_id == org_id,
+            StateSnapshot.projection_version == projection_version,
+        )
+        row = (await self.db.execute(stmt)).one_or_none()
+        return None if row is None else (row[0], row[1])
 
     async def save(self, state: OrganizationalState) -> None:
         """Upsert the cache for (org, projection_version). Caches are disposable."""

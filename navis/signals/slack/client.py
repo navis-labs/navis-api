@@ -129,3 +129,27 @@ class SlackClient:
 
     async def users_list(self, *, cursor: str | None = None, limit: int = 200) -> dict[str, Any]:
         return await self._call("users.list", {"cursor": cursor, "limit": limit})
+
+    async def chat_post_message(
+        self, *, channel: str, text: str, thread_ts: str | None = None
+    ) -> dict[str, Any]:
+        """Post a message. The ONE write call this client makes.
+
+        Requires the `chat:write` scope; an install without it comes back
+        `ok:false, error:"missing_scope"`, which `_do` raises as a non-retryable
+        SlackAPIError (it is not in `_RETRYABLE_ERRORS`) — so a scope problem
+        fails once with a clear reason instead of burning the retry budget.
+
+        NO IDEMPOTENCY KEY EXISTS. Slack's chat.postMessage accepts no client
+        token for deduplication and returns a server-generated `ts`, so — unlike
+        Calendar (client-supplied event id) — a replay genuinely posts a second
+        message. See SlackProvider for what that means for the execution
+        contract; it is documented rather than papered over.
+
+        `thread_ts` replies inside an existing thread when supplied, which is how
+        a Slack reply differs from a fresh post. Omitted keys are stripped by
+        `_do`, so a plain post sends exactly the fields it did before.
+        """
+        return await self._call(
+            "chat.postMessage", {"channel": channel, "text": text, "thread_ts": thread_ts}
+        )

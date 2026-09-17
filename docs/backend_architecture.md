@@ -299,13 +299,23 @@ possible: an outcome can be traced back through decision → reasoning signals.
 
 | Aspect | Details |
 |---|---|
-| Responsibility | Consume `OUTCOME_OBSERVED`; attribute to signals; maintain aggregate counts (by signal/decision/outcome_type); derive patterns; emit `LEARNING_UPDATED` |
-| Key services | `LearningService.record_from_outcome()`, `derive_signal_patterns()` |
-| Key models | `LearningEvent`, `Aggregate` (`dimension`, `key`, `count`, `last_seen`), `Pattern` (`signal_id`, `success_rate`, `confidence`) |
+| Responsibility | Consume `OUTCOME_OBSERVED`; classify each outcome on TWO axes (`result` × `outcome_surface`); attribute to signals; maintain aggregate counts (by signal/decision/outcome_type); derive patterns; emit `LEARNING_UPDATED` |
+| Key services | `LearningService.record_from_outcome()`, `derive_signal_patterns()`, `learning_snapshot()` |
+| Key models | `LearningEvent` (lineage + `outcome_surface`, `failure_kind`, `provider_reference`), `LearningAggregate` (`dimension`, `key`, `successes`/`failures`/`neutrals`/`total`), `LearningPattern` (`signal_id`, `kind`, `success_rate`, `samples`) |
 | Determinism | Pure count aggregation — order-agnostic, idempotent; no wall-clock, no EMA, no RNG |
-| Depends on | `observation`, `platform.events`, `platform.database` |
-| Depended on by | `intelligence`, `adaptive` |
+| Input contract | `OUTCOME_OBSERVED` **only**. Learning imports no other pipeline domain (pinned by an AST test) and never re-reads Execution/Observation/provider state to reconstruct an outcome |
+| Output contract | `navis.learning.metrics.learning_snapshot()` — frozen dataclasses of primitives. Consumers do **not** read `learning_*` tables |
+| Depends on | `platform.events`, `platform.database` |
+| Depended on by | `intelligence` (via the contract), `adaptive` (still reads the tables directly — see below) |
 | External systems | None |
+
+**Delivery vs world outcomes.** `outcome_surface` records which of Observation's three
+sources a fact came from — `delivery` (the machine acted / the channel broke),
+`judgement` (a person's verdict on a proposal), `world` (what actually happened).
+Only judgement and world outcomes are decisive at the SIGNAL and DECISION
+dimensions: a Gmail outage is a fact about a channel, not about whether firing
+the signal was the right call. Delivery failures stay fully measurable at the
+OUTCOME dimension, which is keyed on `outcome_type`.
 
 ---
 
@@ -314,7 +324,7 @@ possible: an outcome can be traced back through decision → reasoning signals.
 | Aspect | Details |
 |---|---|
 | Responsibility | Deterministic projection of learning aggregates → insights; append-only |
-| Key services | `IntelligenceService.project()`, `project_view()` |
+| Key services | `IntelligenceService.project()`, `project_view()`; `IntelligenceRepository.build_view()` maps `learning_snapshot()` into a `LearningView` |
 | Key models | `Insight` (`insight_id` = UUIDv5 of `(org, insight_type, key, learning_version)`, `insight_type`, `title`, `summary`, `evidence[]`, `sample_size`, `confidence`, `supporting_learning_event_ids`, `learning_version`) |
 | Depends on | `learning`, `platform.database` |
 | Depended on by | `adaptive`, API (`GET /intelligence/insights`) |

@@ -15,6 +15,7 @@ import uuid
 import pytest
 
 from navis.state.v2.builders import build_projection
+from navis.state.v2.models import PROJECTION_VERSION
 from navis.state.v2.repository import SnapshotRepository
 from tests.state.fakes import ORG_A, ORG_B, corpus
 
@@ -107,19 +108,23 @@ async def test_version_isolation(db):
 
 
 async def test_tenant_isolation(db):
+    # Reads the CURRENT projection version rather than a literal, exactly like
+    # `test_version_isolation` above. This test is about one tenant's snapshot
+    # never being visible to another; pinning the literal `1` made it fail for
+    # the unrelated reason that the projection version moved on.
     await _org(db, ORG_A)
     await _org(db, ORG_B)
     repo = SnapshotRepository(db)
     await repo.save(build_projection(ORG_A, corpus(ORG_A)))
     await repo.save(build_projection(ORG_B, corpus(ORG_B)))
-    a = await repo.latest(ORG_A, projection_version=1)
-    b = await repo.latest(ORG_B, projection_version=1)
+    a = await repo.latest(ORG_A, projection_version=PROJECTION_VERSION)
+    b = await repo.latest(ORG_B, projection_version=PROJECTION_VERSION)
     assert a is not None and b is not None
     assert a.organization_id == ORG_A and b.organization_id == ORG_B
     # Disposing one tenant never touches the other.
     await repo.delete(ORG_A)
-    assert await repo.latest(ORG_A, projection_version=1) is None
-    assert await repo.latest(ORG_B, projection_version=1) is not None
+    assert await repo.latest(ORG_A, projection_version=PROJECTION_VERSION) is None
+    assert await repo.latest(ORG_B, projection_version=PROJECTION_VERSION) is not None
 
 
 async def test_half_set_watermark_is_rejected(db):

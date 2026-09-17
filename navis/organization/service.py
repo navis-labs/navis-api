@@ -52,6 +52,15 @@ class OrganizationService:
         Default plan is FREE in production; in non-production environments new orgs are
         provisioned with ENTERPRISE so the full pipeline (decision, execution,
         intelligence) is exercisable end-to-end without an out-of-band plan bump.
+
+        This is the ONLY environment-dependent step in the entitlement path, and it is
+        deliberately a PROVISIONING decision, not an authorization one: it writes real
+        entitlement rows that `EntitlementService._decide` then evaluates by the same
+        rules it applies in production. The gate itself must stay environment-blind —
+        `_decide` and `require_capability` previously carried `if not is_production:
+        return True` short-circuits, which meant a deployment with ENVIRONMENT unset
+        (the default) had no capability boundary at all. Give an environment breadth by
+        changing the plan it seeds here; never by teaching the gate about deployments.
         """
         if plan is None:
             plan = Plan.FREE if settings.is_production else Plan.ENTERPRISE
@@ -63,7 +72,14 @@ class OrganizationService:
                 OnboardingStage.CREATED.value: utcnow().isoformat(),
             }
             await self.repo.flush()
-        await self.billing.set_plan(org_id, plan, actor_id=actor_id)  # seeds entitlements
+        # PROVISIONING IS A BILLING AUTHORITY. This is the moment an organization's
+        # starting plan is decided, so it is allowed to grant — and must be, or a
+        # production org could never reach FREE from nothing. Every OTHER path into
+        # `set_plan` defaults to unauthorized and can only keep or reduce
+        # capabilities (see BillingService.PlanEscalationDenied).
+        await self.billing.set_plan(
+            org_id, plan, actor_id=actor_id, billing_authorized=True
+        )  # seeds entitlements
 
     # ---- the capability authority ----
     async def can_use(self, org_id: uuid.UUID, capability: Capability | str) -> bool:
