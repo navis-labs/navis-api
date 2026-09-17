@@ -113,7 +113,10 @@ jobs:
       DATABASE_URL: postgresql://navis:navis@localhost:5432/navis
       REDIS_URL: redis://localhost:6380/0
       SECRET_KEY: ci-only-not-a-secret-value-at-least-32-chars
-      ENVIRONMENT: test
+      # Must be one of development|staging|production — settings rejects anything
+      # else outright (it gates encryption enforcement and the production config
+      # checks, so it is never guessed). "test" is NOT a valid value.
+      ENVIRONMENT: development
 
       # THE line that decides whether this job means anything.
       #
@@ -180,7 +183,10 @@ jobs:
     env:
       DATABASE_URL: postgresql://navis:navis@localhost:5432/navis
       SECRET_KEY: ci-only-not-a-secret-value-at-least-32-chars
-      ENVIRONMENT: test
+      # Must be one of development|staging|production — settings rejects anything
+      # else outright (it gates encryption enforcement and the production config
+      # checks, so it is never guessed). "test" is NOT a valid value.
+      ENVIRONMENT: development
 
     steps:
       - uses: actions/checkout@v7
