@@ -149,10 +149,17 @@ jobs:
       - name: Enable pgvector
         run: PGPASSWORD=navis psql -h localhost -U navis -d navis_test -c 'CREATE EXTENSION IF NOT EXISTS vector'
 
+      # `python -m pytest`, NOT `pytest`. The module form puts the working
+      # directory on sys.path; the console script does not. There is no
+      # tests/__init__.py but the subdirectories have one, so pytest's own
+      # path insertion stops at `tests/` and never adds the repo root — the
+      # bare `pytest` command fails to import `navis` at all (106 collection
+      # errors, reproduced in a python:3.12-slim container).
+      #
       # `-rs` reports the reason for every skip, which the next step inspects.
       # The suite runs exactly once; nothing below re-runs it.
       - name: Run test suite
-        run: pytest -q -rs --durations=15 | tee /tmp/pytest.txt
+        run: python -m pytest -q -rs --durations=15 | tee /tmp/pytest.txt
 
       # Proves the integration tests actually ran. If NAVIS_TEST_DATABASE_URL
       # ever stops reaching them, this fails loudly instead of the suite going
