@@ -83,7 +83,13 @@ jobs:
         env:
           POSTGRES_USER: navis
           POSTGRES_PASSWORD: navis
-          POSTGRES_DB: navis
+          # MUST be named navis_test*. The integration tests assert
+          # `name.startswith("navis_test")` and refuse to run otherwise — a
+          # deliberate allowlist, because these fixtures call create_all and
+          # drop rows, and the guard is what stops that landing on a real
+          # database if NAVIS_TEST_DATABASE_URL is ever pointed somewhere live.
+          # Named `navis` here, all 184 integration tests error on that assert.
+          POSTGRES_DB: navis_test
         ports:
           - 5432:5432
         options: >-
@@ -110,7 +116,7 @@ jobs:
       # Settings supply defaults for everything, so no .env file is needed —
       # verified by running the suite with .env removed. These are set because
       # the integration tests and Alembic read them, not to satisfy imports.
-      DATABASE_URL: postgresql://navis:navis@localhost:5432/navis
+      DATABASE_URL: postgresql://navis:navis@localhost:5432/navis_test
       REDIS_URL: redis://localhost:6380/0
       SECRET_KEY: ci-only-not-a-secret-value-at-least-32-chars
       # Must be one of development|staging|production — settings rejects anything
@@ -128,7 +134,7 @@ jobs:
       #
       # Must carry the +asyncpg driver: it is handed straight to
       # create_async_engine(), which rejects a bare postgresql:// URL.
-      NAVIS_TEST_DATABASE_URL: postgresql+asyncpg://navis:navis@localhost:5432/navis
+      NAVIS_TEST_DATABASE_URL: postgresql+asyncpg://navis:navis@localhost:5432/navis_test
 
     steps:
       - uses: actions/checkout@v7
@@ -141,7 +147,7 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Enable pgvector
-        run: PGPASSWORD=navis psql -h localhost -U navis -d navis -c 'CREATE EXTENSION IF NOT EXISTS vector'
+        run: PGPASSWORD=navis psql -h localhost -U navis -d navis_test -c 'CREATE EXTENSION IF NOT EXISTS vector'
 
       # `-rs` reports the reason for every skip, which the next step inspects.
       # The suite runs exactly once; nothing below re-runs it.
