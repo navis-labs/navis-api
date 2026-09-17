@@ -17,6 +17,7 @@ from navis.platform.config import settings
 from navis.platform.database import dispose_engine
 from navis.platform.monitoring import configure_logging, get_logger
 from navis.platform.monitoring.health import liveness, readiness
+from navis.platform.monitoring.metrics import metrics as _metrics
 from navis.platform.monitoring.middleware import RequestContextMiddleware
 from navis.platform.monitoring.sentry import init_sentry
 
@@ -70,6 +71,19 @@ def create_app() -> FastAPI:
     async def ready() -> dict:
         """Readiness: Postgres + Redis reachable. For LB/k8s gating."""
         return await readiness()
+
+    @app.get("/metrics", tags=["platform"])
+    async def metrics_endpoint() -> dict:
+        """In-process metrics snapshot (counters + latency histograms).
+
+        Returns a JSON-serialisable dict with two top-level keys:
+          * ``counters``  — all named counters (events published, auth rejections, …)
+          * ``histograms`` — all named histograms with count, sum_ms, avg_ms, buckets_ms
+
+        Not authenticated — expose only on an internal/admin network in production
+        (behind a firewall or k8s NetworkPolicy).
+        """
+        return _metrics.snapshot()
 
     @app.get("/", tags=["platform"])
     async def root() -> dict[str, str]:

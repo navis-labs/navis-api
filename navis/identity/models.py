@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     Enum as SAEnum,
     ForeignKey,
+    Index,
     String,
     UniqueConstraint,
 )
@@ -17,6 +18,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from navis.platform.database.base import Base, Timestamped, UUIDPrimaryKey
+from navis.platform.security.crypto import EncryptedString
 
 
 class Role(str, enum.Enum):
@@ -106,6 +108,12 @@ class Session(UUIDPrimaryKey, Timestamped, Base):
     """Persisted refresh-token session (allows revocation)."""
 
     __tablename__ = "sessions"
+    __table_args__ = (
+        # ix_sessions_expires_at: the reaper (purge_expired_sessions) deletes rows
+        # WHERE expires_at < now(). Without this index the DELETE is a full-table scan;
+        # with it the DB only touches the expired fraction of rows.
+        Index("ix_sessions_expires_at", "expires_at"),
+    )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
@@ -119,7 +127,10 @@ class Session(UUIDPrimaryKey, Timestamped, Base):
 class Integration(UUIDPrimaryKey, Timestamped, Base):
     """An OAuth-connected signal source for an org (Gmail, Slack, Calendar...).
 
-    Tokens are stored encrypted-at-rest in production; here we keep the shape.
+    OAuth tokens (access_token, refresh_token) are encrypted at rest using Fernet
+    (AES-128-CBC + HMAC) via `EncryptedString`. The ciphertext is tagged `fenc:1:`.
+    Legacy plaintext rows (written before encryption was added) are returned as-is
+    and re-encrypted transparently on the next write — backward-compatible migration.
     """
 
     __tablename__ = "integrations"
@@ -135,8 +146,10 @@ class Integration(UUIDPrimaryKey, Timestamped, Base):
     )
     provider: Mapped[IntegrationProvider] = mapped_column(SAEnum(IntegrationProvider))
     external_account: Mapped[str | None] = mapped_column(String(320), nullable=True)
-    access_token: Mapped[str | None] = mapped_column(String, nullable=True)
-    refresh_token: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Encrypted at rest: EncryptedString transparently applies Fernet encrypt on write
+    # and decrypt on read. Unencrypted legacy rows are returned as-is (backward compat).
+    access_token: Mapped[str | None] = mapped_column(EncryptedString, nullable=True)
+    refresh_token: Mapped[str | None] = mapped_column(EncryptedString, nullable=True)
     token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     scopes: Mapped[str | None] = mapped_column(String, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)

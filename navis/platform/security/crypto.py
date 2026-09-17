@@ -77,3 +77,49 @@ class FieldCipher:
 
 
 field_cipher = FieldCipher.from_env()
+
+
+# ---------------------------------------------------------------------------
+# SQLAlchemy TypeDecorator: transparent encrypt-on-write / decrypt-on-read
+# ---------------------------------------------------------------------------
+
+try:
+    from sqlalchemy import String as _SAString
+    from sqlalchemy.types import TypeDecorator
+
+    class EncryptedString(TypeDecorator):
+        """A SQLAlchemy column type that stores strings Fernet-encrypted at rest.
+
+        Usage in a model::
+
+            access_token: Mapped[str | None] = mapped_column(EncryptedString, nullable=True)
+
+        The application always sees the plaintext value — encryption/decryption is
+        handled transparently by SQLAlchemy at the ORM boundary.
+
+        Migration path for existing plaintext rows:
+          * On READ  → `field_cipher.decrypt()` returns the raw value for untagged
+                       strings (backward-compatible — no data migration needed).
+          * On WRITE → the fresh ciphertext is written back next time the row is saved,
+                       gradually re-encrypting the table without a bulk migration job.
+
+        If `FIELD_ENCRYPTION_KEYS` is not configured (dev/test), values are stored as
+        plaintext and a WARNING is emitted once at startup — production MUST set keys.
+        """
+
+        impl = _SAString
+        cache_ok = True  # TypeDecorator is stateless — safe to cache in compiled queries
+
+        def process_bind_param(self, value: str | None, dialect) -> str | None:
+            """Called when writing to the DB: encrypt the plaintext."""
+            return field_cipher.encrypt(value)
+
+        def process_result_value(self, value: str | None, dialect) -> str | None:
+            """Called when reading from the DB: decrypt the ciphertext (or return as-is
+            for legacy plaintext rows that predate encryption)."""
+            return field_cipher.decrypt(value)
+
+except ImportError:
+    # SQLAlchemy not installed (e.g. a standalone utility import). Provide a no-op stub
+    # so the import succeeds without crashing the tool.
+    EncryptedString = None  # type: ignore[assignment,misc]

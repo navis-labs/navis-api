@@ -72,13 +72,29 @@ class IdentityService:
         return user, org, membership
 
     async def authenticate(self, email: str, password: str) -> User:
-        user = await self.db.scalar(select(User).where(User.email == normalize_email(email)))
+        from navis.identity.ratelimit import TooManyLoginAttempts, login_rate_limiter
+
+        email_normalized = normalize_email(email)
+
+        # Brute-force guard: fail fast before touching the DB if the account is locked.
+        # Raises TooManyLoginAttempts (maps to 429 at the router) if the limit is reached.
+        await login_rate_limiter.check(email_normalized)
+
+        user = await self.db.scalar(select(User).where(User.email == email_normalized))
         if not user or not user.hashed_password:
+            # Still record a failure so an attacker can't enumerate existing emails by
+            # observing different lock-out behaviour for known vs unknown addresses.
+            await login_rate_limiter.record_failure(email_normalized)
             raise AuthError("invalid credentials")
         if not verify_password(password, user.hashed_password):
+            await login_rate_limiter.record_failure(email_normalized)
             raise AuthError("invalid credentials")
         if not user.is_active:
             raise AuthError("account disabled")
+
+        # Success: reset the strike counter so a returning user with a fresh password
+        # doesn't hit a stale lockout.
+        await login_rate_limiter.reset(email_normalized)
         return user
 
     async def primary_membership(self, user: User) -> Membership | None:

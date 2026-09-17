@@ -69,4 +69,14 @@ celery_app.conf.beat_schedule = {
         "task": "navis.execution.worker.recover_stale_executions",
         "schedule": 60,
     },
+    # Identity reapers: prevent revoked_tokens and sessions tables from growing unbounded.
+    # Each task does a single bulk DELETE — cheap, idempotent, and index-served.
+    "purge-expired-sessions": {
+        "task": "navis.identity.worker.purge_expired_sessions",
+        "schedule": 60 * 60,  # hourly — sessions expire in days, hourly cleanup is sufficient
+    },
+    "purge-revoked-tokens": {
+        "task": "navis.identity.worker.purge_revoked_tokens",
+        "schedule": 60 * 60,  # hourly — token expiry is 60 min max, so cleanup keeps the table tiny
+    },
 }

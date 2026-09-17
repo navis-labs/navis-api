@@ -24,6 +24,7 @@ from navis.identity.permissions import effective_permissions
 from navis.identity.tokens import TokenRevocationService, token_predates_bulk_revoke
 from navis.platform.database import get_session
 from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.logging import set_org_id
 from navis.platform.monitoring.metrics import metrics
 from navis.platform.security import TokenError, decode_token
 
@@ -153,13 +154,20 @@ async def get_principal(
                 "provide either an API key or a bearer token, not both",
             )
         if x_api_key:
-            return await _principal_from_api_key(db, x_api_key)
-        if creds and creds.scheme.lower() == "bearer":
+            principal = await _principal_from_api_key(db, x_api_key)
+        elif creds and creds.scheme.lower() == "bearer":
             # A navis_ prefixed bearer is an API key; otherwise a JWT.
             if creds.credentials.startswith("navis_"):
-                return await _principal_from_api_key(db, creds.credentials)
-            return await _principal_from_jwt(db, creds.credentials)
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing credentials")
+                principal = await _principal_from_api_key(db, creds.credentials)
+            else:
+                principal = await _principal_from_jwt(db, creds.credentials)
+        else:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing credentials")
+        # Bind the authenticated org_id to the logging context so every downstream log
+        # line (and every DomainEvent) automatically carries the tenant without callers
+        # doing anything. Cleared automatically when the request context is torn down.
+        set_org_id(str(principal.org_id))
+        return principal
     except HTTPException as exc:
         # One place that counts every auth rejection (401 invalid/revoked vs 403).
         metrics.incr("auth.rejected", labels={"status": str(exc.status_code)})

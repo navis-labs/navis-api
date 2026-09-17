@@ -52,6 +52,16 @@ class Settings(BaseSettings):
     jwt_public_key: str | None = None   # PEM — verification key for RS256/ES256
     jwt_key_id: str | None = None       # `kid` header for key rotation / JWKS
 
+    # ---- Field Encryption (at-rest) ----
+    # Comma-separated Fernet keys, newest first.
+    # Used to encrypt Integration OAuth tokens (Gmail/Slack access_token, refresh_token)
+    # and SSO connection secrets before they are written to the database.
+    #
+    # Generate:  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Rotate:    prepend new key (NEW,OLD) — new writes use new key, old rows still decrypt.
+    # Not set:   encryption is DISABLED and a WARNING is logged at startup (dev only).
+    field_encryption_keys: str = ""
+
     # ---- AI / ML ----
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
