@@ -1,0 +1,36 @@
+name: Deploy staging
+
+# development branch IS staging. Every merge into it goes out automatically —
+# no approval, no manual step. That is the point of a staging environment: it
+# should always hold the next release candidate, so problems surface here.
+
+on:
+  push:
+    branches: [development]
+  workflow_dispatch: # manual re-deploy / rollback of an older commit
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # Merged code is tested here, once, before anything is built or deployed.
+  # ci.yml has no `push` trigger precisely so this is the only run on merge.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    uses: ./.github/workflows/deploy.yml
+    secrets: inherit
+    with:
+      environment: staging
+      # ---- EDIT THESE to match your AWS account ----
+      aws-region: ap-south-1
+      ecr-repository: navis-api-staging
+      ecs-cluster: navis-staging
+      api-service: navis-api-staging
+      worker-service: navis-worker-staging
+      beat-service: navis-beat-staging
+      migration-subnets: subnet-REPLACE_ME_A,subnet-REPLACE_ME_B
+      migration-security-groups: sg-REPLACE_ME
