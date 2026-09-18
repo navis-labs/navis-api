@@ -124,6 +124,19 @@ jobs:
       # checks, so it is never guessed). "test" is NOT a valid value.
       ENVIRONMENT: development
 
+      # Fernet keys for FieldCipher and TokenCipher. Without them the ciphers
+      # fall back to passthrough, and the 12 tests that assert PII and OAuth
+      # tokens are sealed at rest fail — they are the suite's encryption-at-rest
+      # guarantees, so they must run with real keys, not be skipped.
+      #
+      # Generated for CI and nothing else. They encrypt only rows created and
+      # dropped inside the job, protect nothing, and are deliberately in the
+      # workflow rather than in secrets: a value in `secrets` would be masked in
+      # logs and imply it matters, and rotating it would silently change what
+      # the suite tests. The real keys live in the ECS task definitions.
+      FIELD_ENCRYPTION_KEYS: FVLksBH-IvYfC5m2UHB03yDm8cHofFCd_YVdQzCEyHk=
+      SIGNALS_TOKEN_KEYS: Oe50JzQrZG9pbS1RzLXnhfKdEKaBZ_dpaeSeRpvrQXI=
+
       # THE line that decides whether this job means anything.
       #
       # All 21 tests/integration/*_postgres.py modules are gated on
