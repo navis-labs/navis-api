@@ -37,6 +37,15 @@ on:
       migration-security-groups:
         required: true
         type: string
+      assign-public-ip:
+        description: >-
+          ENABLED for public subnets, DISABLED for private subnets with a NAT
+          gateway. Wrong value and the migration task cannot reach ECR: it never
+          pulls its image and sits until the job times out, with no error that
+          says why. Defaults to DISABLED, the safer of the two.
+        required: false
+        default: DISABLED
+        type: string
 
 permissions:
   contents: read
@@ -116,7 +125,7 @@ jobs:
             --cluster "${{ inputs.ecs-cluster }}" \
             --task-definition "${{ inputs.ecr-repository }}-migrate" \
             --launch-type FARGATE \
-            --network-configuration "awsvpcConfiguration={subnets=[${{ inputs.migration-subnets }}],securityGroups=[${{ inputs.migration-security-groups }}],assignPublicIp=DISABLED}" \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ inputs.migration-subnets }}],securityGroups=[${{ inputs.migration-security-groups }}],assignPublicIp=${{ inputs.assign-public-ip }}}" \
             --overrides '{"containerOverrides":[{"name":"migrate","image":"${{ steps.image.outputs.uri }}","command":["alembic","upgrade","head"]}]}' \
             --query 'tasks[0].taskArn' --output text)
 
