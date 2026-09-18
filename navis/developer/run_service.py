@@ -29,11 +29,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import String, func, literal_column, nulls_last, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.developer.lifecycle import (
+    ALLOWED_RUN_TRANSITIONS,
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
     MAX_STEP_LABEL,
@@ -66,8 +67,70 @@ class StepLimitReached(LifecycleError):
     """This run already holds as many steps as the platform will record."""
 
 
+class StaleWrite(LifecycleError):
+    """A conditional write lost to an outcome that was already newer.
+
+    Routes map it to 409. Distinct from every other `LifecycleError` because it
+    is not a malformed request: the caller did nothing wrong, it simply arrived
+    second. A client is expected to treat it as a no-op, not as a failure to
+    retry — retrying a stale write reproduces it exactly.
+    """
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Compare instants, never wall clocks.
+
+    `DateTime(timezone=True)` returns aware datetimes, but a caller may hand in
+    a naive one and Python refuses to order the two — a `TypeError` raised from
+    inside a concurrency guard would turn a losing write into a 500 rather than
+    a refusal. A naive value is read as UTC, which is the only assumption this
+    codebase makes anywhere else about a timestamp with no zone.
+    """
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def loses_to_stored_outcome(
+    *, stored: datetime | None, incoming: datetime | None, if_newer: bool
+) -> bool:
+    """Should this conditional write be refused as stale?
+
+    PURE, and module-level, so the concurrency rule can be pinned on plain
+    values instead of through a session, a transaction and four layers of
+    transport. The rule is small and the cost of getting it wrong is a silently
+    replaced checkpoint, which is exactly the combination that deserves direct
+    tests rather than incidental coverage.
+
+    Refused only when the caller ASKED to be held to monotonic authorship, both
+    sides can say when they were observed, and the incoming one is STRICTLY
+    older.
+
+    ── EQUALITY IS ADMITTED, AND THE REASON IS STRUCTURAL ──────────────
+    An earlier draft refused an equal instant too, on the grounds that two
+    writes bearing the same timestamp are not ordered by anything and letting
+    the second win makes arrival the tiebreak. That reasoning is sound between
+    WRITERS and does not apply here, because on one run there is only ever one.
+    `agent_run_outcomes` is UNIQUE per run and a session owns exactly one run,
+    so every write to a given row comes from the same author revising its own
+    statement — and within one author, arrival order IS authorship order.
+
+    Refusing equality therefore refused the normal case: an agent recording a
+    decision and then a second decision inside the same millisecond had the
+    second silently dropped. Caught by the existing checkpoint-merge tests,
+    which is what they are for.
+
+    What remains guarded is the case that is genuinely dangerous and cannot be
+    ordered by arrival: a STRICTLY older statement arriving last, because a
+    retry overtook the request it retried or a delayed write landed after a
+    newer one. That write claims to describe an earlier moment, and letting it
+    replace the row would take the append-only sections with it.
+    """
+    if not if_newer or stored is None or incoming is None:
+        return False
+    return _as_utc(incoming) < _as_utc(stored)
 
 
 def _clamp(limit: int | None) -> int:
@@ -79,6 +142,38 @@ def _clamp(limit: int | None) -> int:
     if limit is None:
         return DEFAULT_PAGE_SIZE
     return max(1, min(int(limit), MAX_PAGE_SIZE))
+
+
+#: The one indexed metadata key. See `AgentTask.__table_args__`.
+WORK_KEY_FIELD = "navisWorkKey"
+
+#: The states a run cannot leave. Derived from the transition table rather than
+#: written out again, so a status added there cannot be forgotten here.
+_TERMINAL_RUN_STATUSES = frozenset(
+    status for status, onward in ALLOWED_RUN_TRANSITIONS.items() if not onward
+)
+
+
+def _work_key_expression():
+    """`task_metadata ->> 'navisWorkKey'`, with the KEY as a SQL literal.
+
+    THE LITERAL IS THE WHOLE POINT, and it is not a style choice. The obvious
+    spelling, `AgentTask.task_metadata["navisWorkKey"].astext`, renders the key
+    as a BIND PARAMETER — `task_metadata ->> $2` — and PostgreSQL can only match
+    a query against an expression index when the indexed expression appears
+    verbatim. Under a generic plan `$2` is not `'navisWorkKey'`, the match
+    fails, and the lookup degrades to a sequential scan of the tenant's tasks:
+    the exact cost this index exists to remove, arrived at silently and only on
+    the deployments that reuse plans.
+
+    The VALUE stays bound, so the work key itself is never interpolated into
+    SQL. `return_type=String` keeps the comparison textual; without it
+    SQLAlchemy infers JSONB from the left operand and casts the bound value,
+    which again stops the expression matching the index.
+    """
+    return AgentTask.task_metadata.op("->>", return_type=String)(
+        literal_column(f"'{WORK_KEY_FIELD}'")
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,14 +311,26 @@ class AgentLifecycleService:
         *,
         agent_id: uuid.UUID | None = None,
         status: str | None = None,
+        work_key: str | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> Page:
         """This tenant's tasks, newest first.
 
-        `agent_id` and `status` are FILTERS applied on top of the tenant
-        predicate, never scope: another organization's agent id narrows the
-        result to nothing rather than reaching its rows.
+        `agent_id`, `status` and `work_key` are FILTERS applied on top of the
+        tenant predicate, never scope: another organization's agent id or work
+        key narrows the result to nothing rather than reaching its rows.
+
+        `work_key` matches `task_metadata->>'navisWorkKey'` EXACTLY. Not a
+        prefix, not a pattern, not a containment test — a client asking for one
+        work stream must never be handed a neighbouring one, and an exact
+        equality is also the only shape `ix_agent_tasks_org_work_key` can
+        answer with a single index descent.
+
+        An empty string is a filter like any other and matches the rows whose
+        key is empty, which is none. That is deliberate: a caller that computed
+        a blank key has a bug, and answering it with the tenant's entire task
+        list would hide the bug behind a plausible-looking page.
 
         Ordering is `created_at DESC, id DESC`. The id tiebreak is not
         decoration — two rows written in the same microsecond would otherwise
@@ -238,6 +345,8 @@ class AgentLifecycleService:
             predicates.append(AgentTask.agent_id == agent_id)
         if status is not None:
             predicates.append(AgentTask.status == status)
+        if work_key is not None:
+            predicates.append(_work_key_expression() == work_key)
 
         total = await self._db.scalar(
             select(func.count()).select_from(AgentTask).where(*predicates)
@@ -395,6 +504,29 @@ class AgentLifecycleService:
         run = await self.get_run(org_id, run_id)
         if run is None:
             return None
+
+        # ── FINISHING TWICE THE SAME WAY IS A NO-OP, NOT A CONFLICT ────────
+        # `ALLOWED_RUN_TRANSITIONS` gives a terminal run no outgoing edges, so a
+        # REPEAT of the state it already holds was refused with 409 alongside
+        # genuine rewrites. Those are not the same event and must not share an
+        # answer.
+        #
+        # The caller that hits this is the one that cannot avoid it. A session
+        # closes its run as the process is torn down, which is exactly when a
+        # response is most likely to be lost — and the documented remedy for a
+        # lost response is to retry. Answering the retry with a conflict tells a
+        # client its shutdown failed when the ledger already says what the
+        # client was trying to make it say, and the only way to distinguish the
+        # two is an extra read on the path with the least time to spend.
+        #
+        # So the operation is idempotent in the precise sense: the same terminal
+        # status returns the existing row unchanged. A DIFFERENT terminal status
+        # is still refused, because `completed` becoming `failed` is a rewrite
+        # of history and an execution ledger that can be edited is not a ledger.
+        # `completed_at` is deliberately NOT restamped — it records when the run
+        # ended, not when somebody last said so.
+        if run.status == status and status in _TERMINAL_RUN_STATUSES:
+            return run
 
         if not may_transition(run.status, status):
             raise InvalidTransition(f"a {run.status} run cannot become {status}")
@@ -596,12 +728,40 @@ class AgentLifecycleService:
         human_corrections: int | None = None,
         produced_at: datetime | None = None,
         metadata: dict | None = None,
+        if_newer: bool = False,
     ) -> AgentRunOutcome | None:
         """Record what came of a run. One per run; a second call UPDATES it.
 
         Updating rather than inserting a second row is deliberate: the unique
         constraint means a run has one verdict, and an evaluator that scores a
         result later is revising that verdict, not adding a contradictory one.
+
+        ── `if_newer`: COMPARE-AND-SWAP ON THE REALITY CLOCK ───────────────
+        Replacing the row wholesale is safe between SESSIONS, because a session
+        owns one run and `UNIQUE(run_id)` stops it reaching another's. It is
+        NOT safe within one run. Two writers on the same run — a compaction
+        checkpoint and an explicit one, a retry that overtakes the request it
+        retried — are ordered by arrival, and arrival order is not authorship
+        order. The older statement lands last and silently replaces the newer
+        one, taking the append-only sections with it.
+
+        `if_newer=True` refuses that write instead: when the stored row already
+        carries a `produced_at` at or after the incoming one, nothing is
+        modified and `StaleWrite` is raised. This is the optimistic-concurrency
+        rule durable-execution engines use — Temporal fences a reacquired
+        history shard with a monotonic RangeID so a displaced owner's writes
+        fail OCC rather than split-brain — applied to the clock this domain
+        already has. No new column, no revision counter, no migration: the
+        version IS `produced_at`, because `produced_at` is already what
+        readers order by, and a version readers ignore would be decoration.
+
+        DEFAULT OFF, so every existing caller is unaffected. An evaluator
+        revising a verdict long after the fact, or a backfill writing history,
+        is not a stale writer and must not be refused. Only a caller that
+        claims monotonic authorship asks to be held to it.
+
+        A write with no `produced_at` is never refused: it makes no claim about
+        when it was observed, so there is nothing to compare.
         """
         run = await self.get_run(org_id, run_id)
         if run is None:
@@ -613,6 +773,15 @@ class AgentLifecycleService:
                 AgentRunOutcome.organization_id == org_id,
             )
         )
+
+        if existing is not None and loses_to_stored_outcome(
+            stored=existing.produced_at, incoming=produced_at, if_newer=if_newer
+        ):
+            raise StaleWrite(
+                "a newer outcome is already recorded for this run "
+                f"(stored produced_at {existing.produced_at.isoformat()} "
+                f"is at or after the submitted {produced_at.isoformat()})"
+            )
 
         summary = sanitize_text(summary, field="summary", limit=4000)
         scrubbed = sanitize_metadata(metadata, field="metadata")
@@ -655,6 +824,80 @@ class AgentLifecycleService:
                 AgentRunOutcome.organization_id == org_id,
             )
         )
+
+    async def latest_task_outcome(
+        self, org_id: uuid.UUID, task_id: uuid.UUID
+    ) -> tuple[AgentRunOutcome, AgentRun] | None:
+        """The newest outcome CARRYING CONTENT across every run of one task.
+
+        ── WHY THIS EXISTS: a scan depth is not a retrieval model ──────────
+        Without it, a client asking "what is the latest state of this work"
+        must list the task's runs and then fetch outcomes one run at a time,
+        because `run_id` is the only address an outcome has. Every such client
+        ends up choosing a scan depth, and every scan depth is wrong twice: too
+        shallow and a real checkpoint under a run of quiet sessions reads as
+        ABSENT — silently, and indistinguishably from work that never existed —
+        too deep and a hook spends a developer's startup on empty probes. The
+        developer CLI had settled on 8/16/32, which reaches 56 runs and loses
+        anything beneath. Raising it to 128 moves the cliff; it does not remove
+        it.
+
+        The invariant the client actually needs is one the database can state
+        exactly, so it is stated here instead of approximated there.
+
+        ── ORDERING IS THE CONTRACT, NOT AN IMPLEMENTATION DETAIL ──────────
+        `produced_at DESC NULLS LAST, updated_at DESC, run_id DESC` — reality
+        time first, row time second, id last. It mirrors the client's own
+        `selectCurrentCheckpoint` rung for rung, and it has to: a server that
+        ordered differently would answer a DIFFERENT checkpoint than the paged
+        path it replaces, and the two would disagree only for the tenants big
+        enough to need this. Reality time leads because a write that lands late
+        having observed early must not present itself as the newest state. The
+        id tiebreak makes the order total, so two outcomes stamped in the same
+        microsecond cannot swap between two calls.
+
+        ── AN EMPTY SUMMARY IS SKIPPED, DELIBERATELY ───────────────────────
+        An outcome with no summary states nothing about where work stands, and
+        every run this feature opens gets an outcome row only if it checked in.
+        Returning a contentless newest row would hide a real checkpoint beneath
+        it — the same failure as too shallow a scan, arrived at from the other
+        direction. The predicate is applied HERE, on the server, where the
+        index is, rather than by a client filtering a page it already paid for.
+
+        ── TENANT ──────────────────────────────────────────────────────────
+        The predicate is on BOTH tables, not just the outcome. The join could
+        reach a run through `run_id` alone, and `organization_id` on the run is
+        then redundant — right up until the day a row is written with a
+        mismatched tenant, at which point redundancy is the only thing that
+        catches it. `None` for a task that is not this tenant's, which the
+        route turns into 404: a cross-tenant task id reveals nothing.
+        """
+        # Existence is checked against the TASK, so "this task has no
+        # checkpoint yet" (404 with the task present) and "no such task" are
+        # not merged into one answer the caller cannot act on.
+        if await self.get_task(org_id, task_id) is None:
+            return None
+
+        row = (
+            await self._db.execute(
+                select(AgentRunOutcome, AgentRun)
+                .join(AgentRun, AgentRun.id == AgentRunOutcome.run_id)
+                .where(
+                    AgentRunOutcome.organization_id == org_id,
+                    AgentRun.organization_id == org_id,
+                    AgentRun.task_id == task_id,
+                    AgentRunOutcome.summary != "",
+                )
+                .order_by(
+                    nulls_last(AgentRunOutcome.produced_at.desc()),
+                    AgentRunOutcome.updated_at.desc(),
+                    AgentRunOutcome.run_id.desc(),
+                )
+                .limit(1)
+            )
+        ).first()
+
+        return None if row is None else (row[0], row[1])
 
     # ── Telemetry rollup ────────────────────────────────────────────────
 
@@ -728,6 +971,8 @@ __all__ = [
     "Page",
     "PayloadTooLarge",
     "RunTelemetry",
+    "StaleWrite",
     "StepLimitReached",
     "UnknownAgent",
+    "loses_to_stored_outcome",
 ]

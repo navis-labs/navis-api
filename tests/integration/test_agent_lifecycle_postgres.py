@@ -107,7 +107,17 @@ async def test_the_migration_and_the_orm_describe_the_same_schema(engine):
         assert {"agent_tasks", "agent_runs", "agent_run_steps", "agent_run_outcomes"} <= set(tables)
 
         for table, expected_indexes in (
-            ("agent_tasks", {"ix_agent_tasks_org_created", "ix_agent_tasks_agent_created"}),
+            (
+                "agent_tasks",
+                {
+                    "ix_agent_tasks_org_created",
+                    "ix_agent_tasks_agent_created",
+                    # 0054. The continuity lookup — an expression index, so
+                    # drift here is invisible to `create_all` parity unless the
+                    # name is pinned.
+                    "ix_agent_tasks_org_work_key",
+                },
+            ),
             (
                 "agent_runs",
                 {

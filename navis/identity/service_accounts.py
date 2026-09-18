@@ -20,6 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from navis.identity.agents import AgentEnvironment, AgentRuntime
 from navis.identity.apikeys import ApiKeyService
 from navis.identity.enterprise_models import ApiKey, ServiceAccount
+from navis.platform.monitoring import get_logger
+
+logger = get_logger("identity.service_accounts")
 
 
 class ServiceAccountService:
@@ -28,16 +31,30 @@ class ServiceAccountService:
         self.keys = ApiKeyService(db)
 
     async def create(
-        self, *, org_id: uuid.UUID, name: str, scopes: list[str], created_by: uuid.UUID | None = None
+        self,
+        *,
+        org_id: uuid.UUID,
+        name: str,
+        scopes: list[str],
+        created_by: uuid.UUID | None = None,
+        expires_at: datetime | None = None,
     ) -> tuple[ServiceAccount, str]:
         """The original two-value contract, kept for `/identity/service-accounts`.
 
         Delegates to `create_agent` so there is ONE creation path: an account made
         here and an account made through the Agents API are the same row written
         by the same code, and neither can acquire a property the other lacks.
+
+        `expires_at` bounds the FIRST CREDENTIAL, not the account — see
+        `create_agent`. Defaulting to None keeps this signature's existing
+        callers producing exactly the key they produced before.
         """
         sa, _key, plaintext = await self.create_agent(
-            org_id=org_id, name=name, scopes=scopes, created_by=created_by
+            org_id=org_id,
+            name=name,
+            scopes=scopes,
+            created_by=created_by,
+            expires_at=expires_at,
         )
         return sa, plaintext
 
@@ -52,6 +69,10 @@ class ServiceAccountService:
         environment: str = AgentEnvironment.DEVELOPMENT.value,
         runtime: str = AgentRuntime.CUSTOM.value,
         credential_name: str | None = None,
+        #: Optional lifetime for the FIRST CREDENTIAL. None means it does not
+        #: expire, which is what every credential minted before expiry existed
+        #: is — so omitting it leaves this function's output unchanged.
+        expires_at: datetime | None = None,
     ) -> tuple[ServiceAccount, ApiKey, str]:
         """Create the identity AND its first credential, in one transaction.
 
@@ -64,6 +85,14 @@ class ServiceAccountService:
         function takes it as an argument rather than resolving it because it is
         also reachable from a worker with no request behind it; the HTTP edges
         pass `Principal.org_id` and accept no organization from the wire.
+
+        `expires_at` BOUNDS THE CREDENTIAL, NEVER THE AGENT. `service_accounts`
+        has no expiry column and must not grow one: an agent is the identity that
+        outlives its secrets — it is what keeps historical runs attributed after
+        a credential is rotated out — so a lifetime belongs on the thing you
+        replace, not on the thing you replace it for. Validation (an instant
+        already in the past is refused) lives in `ApiKeyService.create`, the one
+        floor under every minting path.
         """
         sa = ServiceAccount(
             organization_id=org_id,
@@ -82,6 +111,7 @@ class ServiceAccountService:
             scopes=scopes,
             created_by=created_by,
             service_account_id=sa.id,
+            expires_at=expires_at,
         )
         return sa, key, plaintext
 
@@ -141,17 +171,62 @@ class ServiceAccountService:
         await self.db.flush()
         return sa
 
-    async def rotate(self, sa_id: uuid.UUID, *, org_id: uuid.UUID) -> str:
+    async def rotate(
+        self,
+        sa_id: uuid.UUID,
+        *,
+        org_id: uuid.UUID,
+        #: Lifetime for the REPLACEMENT credential. None means it does not
+        #: expire, which is what every rotation produced before this parameter
+        #: existed — see the note below on why that is not inherited.
+        expires_at: datetime | None = None,
+    ) -> str:
+        """Revoke every credential of this account and mint one replacement.
+
+        ROTATION DOES NOT INHERIT THE OLD EXPIRY, AND THE CALLER MUST SAY SO.
+        An account can hold several credentials with different lifetimes — one
+        never-expiring, one dated — so there is no single expiry to carry over:
+        picking the longest would quietly extend a bound somebody chose, and
+        picking the shortest would shorten one. Both are the service guessing at
+        an operator's intent about a credential that is about to be the only one
+        that works.
+
+        The consequence is worth stating plainly, because it is a downgrade the
+        caller can miss: rotating a dated credential without passing
+        `expires_at` replaces it with one that never expires. That was the only
+        behaviour available before, so it is not a regression — but it is no
+        longer the only option, and the log line below records it when it
+        happens so an audit can see where a bound was dropped.
+        """
         sa = await self._require(sa_id, org_id)
+        if expires_at is None:
+            # Read BEFORE the revocation below, which does not clear `expires_at`
+            # but does make "which keys were live" unanswerable from the rows.
+            dated = [k for k in await self.active_keys(sa.id) if k.expires_at is not None]
+            if dated:
+                logger.info(
+                    "rotation dropped credential expiry: service_account=%s org=%s "
+                    "dated_credentials=%d replacement=never-expires",
+                    sa.id, sa.organization_id, len(dated),
+                )
         await self.keys.revoke_for_service_account(sa.id)
         _, plaintext = await self.keys.create(
             org_id=sa.organization_id, name=f"{sa.name} key (rotated)",
             scopes=sa.scopes, created_by=sa.created_by, service_account_id=sa.id,
+            expires_at=expires_at,
         )
         return plaintext
 
     async def issue_credential(
-        self, sa_id: uuid.UUID, *, org_id: uuid.UUID, name: str, created_by: uuid.UUID | None = None
+        self,
+        sa_id: uuid.UUID,
+        *,
+        org_id: uuid.UUID,
+        name: str,
+        created_by: uuid.UUID | None = None,
+        #: Optional lifetime for THIS credential. None means it does not
+        #: expire, matching every credential minted before expiry existed.
+        expires_at: datetime | None = None,
     ) -> tuple[ApiKey, str]:
         """Mint an ADDITIONAL credential without retiring the existing ones.
 
@@ -174,6 +249,7 @@ class ServiceAccountService:
             scopes=list(sa.scopes or []),
             created_by=created_by,
             service_account_id=sa.id,
+            expires_at=expires_at,
         )
 
     async def revoke(self, sa_id: uuid.UUID, *, org_id: uuid.UUID) -> ServiceAccount:
@@ -184,33 +260,65 @@ class ServiceAccountService:
         return sa
 
     async def list_for_org(
-        self, org_id: uuid.UUID, *, limit: int = 50, offset: int = 0
+        self,
+        org_id: uuid.UUID,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        created_by: uuid.UUID | None = None,
     ) -> list[ServiceAccount]:
+        """This tenant's agents, optionally only the ones one person created.
+
+        `created_by=None` means NO CREATOR FILTER — the whole organization's
+        fleet, which is what every caller before P1-7 asked for and still gets.
+        It deliberately does NOT mean "rows whose creator is NULL": the filter
+        is applied only when a creator is named, so an organization-wide caller
+        keeps seeing agents registered before the column was populated.
+
+        Passing a creator is how the self-serve Developer scope is expressed
+        (`agents_router._sees_every_agent`). The tenant predicate is
+        unconditional either way — the creator filter narrows, never widens.
+        """
+        stmt = select(ServiceAccount).where(ServiceAccount.organization_id == org_id)
+        if created_by is not None:
+            stmt = stmt.where(ServiceAccount.created_by == created_by)
         return list(
             (
                 await self.db.scalars(
-                    select(ServiceAccount)
-                    .where(ServiceAccount.organization_id == org_id)
-                    .order_by(ServiceAccount.created_at.desc(), ServiceAccount.id)
+                    stmt.order_by(ServiceAccount.created_at.desc(), ServiceAccount.id)
                     .limit(limit)
                     .offset(offset)
                 )
             ).all()
         )
 
-    async def count_for_org(self, org_id: uuid.UUID, *, active_only: bool = False) -> int:
+    async def count_for_org(
+        self,
+        org_id: uuid.UUID,
+        *,
+        active_only: bool = False,
+        created_by: uuid.UUID | None = None,
+    ) -> int:
         """How many accounts this tenant holds. Backs pagination and the ceiling.
 
         `active_only` counts what may still authenticate. The creation ceiling
         uses it so revoking an agent frees its slot — a limit that counted
         tombstones would make an organization that rotates its fleet
         permanently unable to create another.
+
+        `created_by` narrows the count to one person's agents, so a paged list
+        reports a `total` that matches what the caller can actually see. IT IS
+        NOT USED FOR THE CEILING, deliberately: the agent limit is a property of
+        the ORGANIZATION, and counting per-creator would let a team of ten
+        quietly hold ten times the agents the tenant is provisioned for.
         """
         stmt = select(func.count()).select_from(ServiceAccount).where(
             ServiceAccount.organization_id == org_id
         )
         if active_only:
             stmt = stmt.where(ServiceAccount.revoked_at.is_(None))
+        if created_by is not None:
+            stmt = stmt.where(ServiceAccount.created_by == created_by)
         return int(await self.db.scalar(stmt) or 0)
 
     async def active_keys(self, sa_id: uuid.UUID) -> list[ApiKey]:

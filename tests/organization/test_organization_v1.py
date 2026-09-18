@@ -281,6 +281,58 @@ def test_plan_capability_monotonicity():
     assert ent == frozenset(Capability)
 
 
+#: What the DEVELOPER surface cannot function without — one capability per stage
+#: of the loop it actually serves.
+#:
+#:   memory       the retrieval floor `POST /developer/context` gates on
+#:   state        what is currently true, plus the agent registry's own gate
+#:   reasoning    the organization's conclusions; without it the context
+#:                bundle withholds the reasoning layer
+#:   observation  the agent execution ledger — tasks, runs, steps, outcomes
+#:
+#: Not the whole Developer surface: `decision`, `intelligence` and `learning`
+#: stay paid on purpose, and a FREE org is correctly told so through
+#: `layers.withheld`. These four are the ones whose absence leaves nothing for
+#: a developer to evaluate.
+DEVELOPER_FLOOR = frozenset({
+    Capability.MEMORY, Capability.STATE, Capability.REASONING, Capability.OBSERVATION,
+})
+
+
+def test_every_plan_grants_the_developer_floor():
+    """A self-serve developer must be able to read context and record runs.
+
+    THE REGRESSION THIS PINS (P0-4). `observation` was ENTERPRISE-only, so on
+    the FREE tier every tenant gets by signing up, the entire agent execution
+    ledger answered 402 — an agent platform whose free tier cannot record what
+    an agent did. Seven of the Developer surface's fourteen route groups were
+    unreachable; with this floor it is four, and each of those four is a
+    deliberate paid layer that reports itself as withheld rather than empty.
+
+    Dropping any of these from any plan takes the Developer product below
+    usable for that tier, which is a decision to make deliberately and not by
+    editing a set literal.
+    """
+    for plan in Plan:
+        missing = sorted(c.value for c in DEVELOPER_FLOOR - capabilities_for_plan(plan))
+        assert missing == [], f"{plan.value} cannot serve the Developer surface: missing {missing}"
+
+
+def test_the_developer_floor_does_not_quietly_become_the_whole_matrix():
+    """The floor is a floor, not a way to make everything free.
+
+    If `decision`, `intelligence`, `learning` or `execution` ever land in FREE,
+    that is a pricing change and it should be argued for, not arrive as a side
+    effect of widening the floor.
+    """
+    free = capabilities_for_plan(Plan.FREE)
+    for paid in (
+        Capability.DECISION, Capability.INTELLIGENCE,
+        Capability.LEARNING, Capability.EXECUTION,
+    ):
+        assert paid not in free, f"{paid.value} became free — was that deliberate?"
+
+
 # ---- architecture guard ----
 
 def test_organization_imports_no_business_domain():

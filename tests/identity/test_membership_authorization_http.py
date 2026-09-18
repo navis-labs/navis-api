@@ -463,7 +463,10 @@ def test_me_permissions_include_per_org_grants_not_just_role_defaults(me_env):
     )
     perms = client.get("/auth/me").json()["permissions"]
     assert "execute_actions" in perms
-    assert "view_decisions" in perms
+    # The role's own remaining default, so this asserts defaults UNION grants
+    # rather than just the grant. `view_decisions` used to stand here; it is a
+    # Developer-surface permission and is no longer an `employee` default.
+    assert "view_signals" in perms
 
 
 def test_me_permissions_are_sorted_and_are_plain_strings(me_env):
@@ -661,3 +664,165 @@ def test_me_resolves_the_principal_exactly_once(me_env):
     client.app.dependency_overrides[get_principal] = counting_principal  # type: ignore[attr-defined]
     assert client.get("/auth/me").status_code == 200
     assert calls["n"] == 1, f"principal resolved {calls['n']}x — dependency cache lost"
+
+
+# ── P0-8: switching to another seat the caller already holds ─────────────────
+#
+# `/auth/me` has always LISTED every organization the caller belongs to, while
+# both login paths resolved `primary_membership` — the oldest. Every other seat
+# was therefore visible and unreachable, and the only action a person had left
+# was to sign up again, which is how a duplicate organization gets created.
+# `POST /auth/switch` closes that, and these pin that it closes it without
+# becoming a way to name a tenant you do not belong to.
+
+
+def test_switch_issues_a_session_for_another_seat_the_user_holds(me_env):
+    client, _db, as_me = me_env
+    as_me(Role.FOUNDER, org_id=ORG_A, also_member_of=(ORG_B,))
+
+    r = client.post("/auth/switch", json={"organization_id": str(ORG_B)})
+
+    assert r.status_code == 200
+    assert r.json()["access_token"]
+
+
+def test_switch_refuses_an_organization_the_user_is_not_a_member_of(me_env):
+    """The request names an organization; the MEMBERSHIP ROW decides.
+
+    Refused with the same wording and status `_principal_from_jwt` uses for a
+    forged `org` claim, so a non-member cannot distinguish "not yours" from
+    "does not exist" and the route is not an organization oracle.
+    """
+    client, _db, as_me = me_env
+    as_me(Role.FOUNDER, org_id=ORG_A)  # ORG_B exists, but this user has no seat
+
+    r = client.post("/auth/switch", json={"organization_id": str(ORG_B)})
+
+    assert r.status_code == 403
+    assert client.post(
+        "/auth/switch", json={"organization_id": str(uuid.uuid4())}
+    ).status_code == 403
+
+
+def test_switch_creates_no_organization_and_no_membership(me_env):
+    """It is a re-scope, not a provisioning path.
+
+    The failure this guards against is the tempting "switch to an org you are
+    not in by creating it", which would turn the fix for duplicate
+    organizations into a new source of them.
+    """
+    client, db, as_me = me_env
+    as_me(Role.FOUNDER, org_id=ORG_A, also_member_of=(ORG_B,))
+    orgs_before = len(db.store.get(Organization, []))
+    memberships_before = len(db.store.get(Membership, []))
+
+    client.post("/auth/switch", json={"organization_id": str(ORG_B)})
+    client.post("/auth/switch", json={"organization_id": str(uuid.uuid4())})
+
+    assert len(db.store.get(Organization, [])) == orgs_before
+    assert len(db.store.get(Membership, [])) == memberships_before
+
+
+# ── P1-8: the Developer team routes admit a Developer administrator ─────────
+#
+# Three routes administer Developer team membership and all three were gated
+# on an Application permission, so a Developer owner or admin who is an
+# Application `employee` was refused by the ROUTE before any service-layer
+# rule could apply. These assert the gate, not the grant: whether the
+# assignment itself is allowed is `_ensure_grantable`'s answer and is covered
+# in `test_developer_access_model.py`.
+
+
+def _developer_admin(org_id=ORG_A, subject_id=None):
+    """An Application `employee` whose Developer role is `admin` — the tech
+    lead at a Developer-first company, and the exact principal that could not
+    reach these routes before P1-8."""
+    from navis.identity.permissions import effective_permissions
+
+    uid = subject_id or uuid.uuid4()
+    return Principal(
+        kind=PrincipalKind.USER,
+        org_id=org_id,
+        subject_id=uid,
+        permissions=effective_permissions("employee", developer_role="admin"),
+        role="employee",
+        user=User(id=uid, email="lead@x.com"),
+    )
+
+
+def test_a_developer_admin_may_list_the_team(env):
+    client, _db, seed, _as = env
+    seed(ORG_A, Role.EMPLOYEE)
+    client.app.dependency_overrides[get_principal] = _developer_admin  # type: ignore[attr-defined]
+
+    assert client.get("/identity/members").status_code == 200
+
+
+def test_a_developer_admin_may_invite(env):
+    client, _db, _seed, _as = env
+    client.app.dependency_overrides[get_principal] = _developer_admin  # type: ignore[attr-defined]
+
+    response = client.post(
+        "/identity/members/invite",
+        json={"email": "new@x.com", "role": "employee", "developer_role": "developer"},
+    )
+    assert response.status_code == 201, response.text
+
+
+def test_a_developer_admin_may_reach_the_access_route(env):
+    client, _db, seed, _as = env
+    target = seed(ORG_A, Role.EMPLOYEE)
+    client.app.dependency_overrides[get_principal] = _developer_admin  # type: ignore[attr-defined]
+
+    response = client.post(
+        f"/identity/members/{target}/access", json={"developer_role": "developer"}
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_a_developer_admin_may_not_remove_a_member(env):
+    """DELIBERATELY NOT EXTENDED. Removing a member evicts them from the
+    ORGANIZATION — dropping their Application access and bulk-revoking their
+    tokens — which is an organizational act, not a Developer one. The
+    Developer-scoped equivalent is revoking Developer access, which is the
+    route above with `developer_role: null`."""
+    client, _db, seed, _as = env
+    target = seed(ORG_A, Role.EMPLOYEE)
+    client.app.dependency_overrides[get_principal] = _developer_admin  # type: ignore[attr-defined]
+
+    assert client.delete(f"/identity/members/{target}").status_code == 403
+
+
+def test_an_ordinary_developer_may_not_administer_the_team(env):
+    """`developer` is the self-serve building role, not an administrator."""
+    from navis.identity.permissions import effective_permissions
+
+    client, _db, seed, _as = env
+    target = seed(ORG_A, Role.EMPLOYEE)
+    uid = uuid.uuid4()
+    client.app.dependency_overrides[get_principal] = lambda: Principal(  # type: ignore[attr-defined]
+        kind=PrincipalKind.USER, org_id=ORG_A, subject_id=uid,
+        permissions=effective_permissions("employee", developer_role="developer"),
+        role="employee", user=User(id=uid, email="dev@x.com"),
+    )
+
+    assert client.get("/identity/members").status_code == 403
+    assert client.post(
+        "/identity/members/invite", json={"email": "x@y.com", "role": "employee"}
+    ).status_code == 403
+    assert client.post(
+        f"/identity/members/{target}/access", json={"developer_role": "viewer"}
+    ).status_code == 403
+
+
+def test_an_application_admin_still_reaches_these_routes(env):
+    """The disjunction is ADDITIVE — every caller that passed before still
+    passes on the Application permission alone."""
+    client, _db, seed, as_ = env
+    seed(ORG_A, Role.EMPLOYEE)
+    as_("admin")
+
+    assert client.get("/identity/members").status_code == 200
+    assert client.post(
+        "/identity/members/invite", json={"email": "app@x.com", "role": "employee"}
+    ).status_code == 201

@@ -60,6 +60,7 @@ from navis.developer.run_schemas import (
     CloseTaskRequest,
     CreateTaskRequest,
     FinishRunRequest,
+    LatestOutcomeOut,
     OutcomeOut,
     RecordOutcomeRequest,
     RecordStepRequest,
@@ -76,6 +77,7 @@ from navis.developer.run_service import (
     AgentLifecycleService,
     InvalidTransition,
     LifecycleError,
+    StaleWrite,
     StepLimitReached,
     UnknownAgent,
 )
@@ -149,7 +151,7 @@ def _refuse(exc: Exception) -> HTTPException:
     """
     if isinstance(exc, UnknownAgent):
         return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    if isinstance(exc, (InvalidTransition, StepLimitReached)):
+    if isinstance(exc, (InvalidTransition, StepLimitReached, StaleWrite)):
         return HTTPException(status.HTTP_409_CONFLICT, str(exc))
     return HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
 
@@ -196,13 +198,41 @@ async def create_task(
 )
 async def list_tasks(
     task_status: str | None = Query(default=None, alias="status"),
+    # ── A FILTER, and the reason it exists ─────────────────────────────
+    # A client that records work against a task and then LOSES the id — a
+    # developer tool restarting in the same worktree, a scheduler resuming
+    # after a deploy — has no way back to it, because a task is addressable
+    # only by an id it no longer holds. Its own key, written into
+    # `metadata.navisWorkKey` when the task was created, is the way back.
+    #
+    # Without this the client must page the organization's open tasks and
+    # match the key itself. That works until the tenant has more open tasks
+    # than the client is willing to read, and then it does not FAIL — it
+    # reports the work stream as absent and a duplicate one is opened beside
+    # the original. Exactly the failure `task_id` above was added to fix for
+    # runs, one level up.
+    #
+    # Like every other filter here it narrows the tenant predicate and never
+    # replaces it: a work key belonging to another organization matches no
+    # rows rather than reaching them. Matched EXACTLY, and backed by
+    # `ix_agent_tasks_org_work_key` (organization_id, task_metadata ->>
+    # 'navisWorkKey').
+    #
+    # Bounded at 128 characters so the parameter cannot become a channel for
+    # an arbitrarily large string; anything longer is refused as malformed
+    # rather than sent to the database.
+    work_key: str | None = Query(default=None, max_length=128),
     limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(default=0, ge=0),
     ctx: DeveloperContext = Depends(_reader),
     db: AsyncSession = Depends(get_session),
 ) -> TaskPageOut:
     page = await AgentLifecycleService(db).list_tasks(
-        ctx.organization_id, status=task_status, limit=limit, offset=offset
+        ctx.organization_id,
+        status=task_status,
+        work_key=work_key,
+        limit=limit,
+        offset=offset,
     )
     rows = [TaskOut.of(r) for r in page.rows]
     return TaskPageOut(
@@ -296,13 +326,31 @@ async def start_run(
 )
 async def list_runs(
     run_status: str | None = Query(default=None, alias="status"),
+    # ── A FILTER, and the reason it exists ─────────────────────────────
+    # Without it a caller looking for one task's runs must read the newest
+    # page of the ORGANIZATION's runs and sift them itself. That is not
+    # merely slow: once other work pushes a task's newest run past the page,
+    # the task's runs are simply absent from the answer, and a caller cannot
+    # tell "this task has no runs" from "its runs are further down". The
+    # Developer CLI reads a work stream's checkpoint that way, so the failure
+    # surfaces as a session restoring nothing while a checkpoint exists.
+    #
+    # Like every other filter here it narrows the tenant predicate and never
+    # replaces it: a task id belonging to another organization matches no
+    # rows rather than reaching them. `ix_agent_runs_task_created`
+    # (task_id, created_at DESC) already backs exactly this query.
+    task_id: uuid.UUID | None = Query(default=None),
     limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(default=0, ge=0),
     ctx: DeveloperContext = Depends(_reader),
     db: AsyncSession = Depends(get_session),
 ) -> RunPageOut:
     page = await AgentLifecycleService(db).list_runs(
-        ctx.organization_id, status=run_status, limit=limit, offset=offset
+        ctx.organization_id,
+        task_id=task_id,
+        status=run_status,
+        limit=limit,
+        offset=offset,
     )
     rows = [RunOut.of(r) for r in page.rows]
     return RunPageOut(
@@ -462,13 +510,62 @@ async def record_outcome(
             human_corrections=body.human_corrections,
             produced_at=body.produced_at,
             metadata=body.metadata,
+            if_newer=body.if_newer,
         )
     except (LifecycleError, PayloadTooLarge) as exc:
         raise _refuse(exc)
     if outcome is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such run in this organization")
     await db.commit()
+    # THE PERSISTED ROW, read back off the flushed object — never an echo of
+    # the request. Everything this domain does to a payload happens between the
+    # two: the summary is scrubbed, the metadata is scrubbed and bounded, and a
+    # value that matched a credential pattern is not what was sent. A client
+    # that compares this against what it submitted can therefore detect a write
+    # that succeeded and stored something else, which is the only way the
+    # 2,637-character checkpoint stored as ten characters would have been
+    # caught at the time instead of a day later.
     return OutcomeOut.of(outcome)
+
+
+@router.get(
+    "/tasks/{task_id}/latest-outcome",
+    response_model=LatestOutcomeOut,
+    responses=_ERRORS,
+    dependencies=[_READ_LIMIT],
+    summary="The newest outcome carrying content across every run of one task",
+)
+async def get_latest_task_outcome(
+    task_id: uuid.UUID,
+    ctx: DeveloperContext = Depends(_reader),
+    db: AsyncSession = Depends(get_session),
+) -> LatestOutcomeOut:
+    """One indexed read where a client would otherwise scan.
+
+    AN OUTCOME IS ADDRESSABLE ONLY BY `run_id`, so "what is the latest state of
+    this work" had no answer but: list the task's runs, then fetch outcomes one
+    run at a time until something turns up. That forces every client to pick a
+    scan depth, and a scan depth is a silent correctness bound — past it a real
+    checkpoint reads as ABSENT, indistinguishable from work that never existed.
+
+    NO NEW FACT AND NO NEW AUTHORITY. Every field returned is one
+    `/developer/runs/{id}` and `/developer/runs/{id}/outcome` already serve to
+    `view_observation`. What changes is that the selection happens where the
+    tenant predicate and the index are, instead of across N round trips.
+
+    Returns the newest outcome whose summary is non-empty, ordered by reality
+    time (`produced_at`) and not by row time, with the run that produced it.
+    404 when the task is not this organization's, and equally when it has no
+    such outcome yet — the caller's next move is the same either way.
+    """
+    found = await AgentLifecycleService(db).latest_task_outcome(ctx.organization_id, task_id)
+    if found is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "no outcome with a summary recorded for that task in this organization",
+        )
+    outcome, run = found
+    return LatestOutcomeOut.of(outcome, run)
 
 
 # ── Telemetry rollup ────────────────────────────────────────────────────────

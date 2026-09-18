@@ -73,3 +73,65 @@ async def test_replay_is_deterministic_and_idempotent(db):
     second = await svc.replay_org(org_id)
     assert second["facts"] == first["facts"]
     assert second["new"] == 0  # replay produced identical ids → nothing new
+
+
+# ── Disclosure is org-scoped IN THE QUERY (P0-3E) ───────────────────────────
+
+
+async def test_disclosure_lookup_returns_no_rows_for_another_tenants_memory_id(db):
+    """CROSS-ORGANIZATION MEMORY -> 0 ROWS, proved against real PostgreSQL.
+
+    `disclosure_by_memory_id` is what tells the Developer boundary what a
+    retrieved fact may say. `tests/orchestration/test_memory_minimization.py`
+    proves the SQL carries the `organization_id` predicate and that the caller
+    withholds when the lookup comes back empty; this proves the predicate
+    actually excludes the other tenant's row when a database executes it —
+    which no compiled-SQL assertion can.
+
+    Both orgs get a REAL memory record with a REAL thread body in its payload,
+    so a regression that dropped the filter would return Org B's snippet here
+    and this would fail on the returned row rather than on a count.
+    """
+    from datetime import datetime, timezone
+
+    from navis.memory.lineage import disclosure_by_memory_id
+    from navis.memory.models import MemoryRecord
+
+    org_a, sig_a = await _seed_signal(db)
+    org_b, sig_b = await _seed_signal(db)
+
+    now = datetime.now(timezone.utc)
+    ids = {}
+    for org_id, sig_id, snippet in (
+        (org_a, sig_a, "Org A: the bridge closes Friday."),
+        (org_b, sig_b, "Org B: we are being acquired, do not forward."),
+    ):
+        memory_id = uuid.uuid4()
+        ids[org_id] = memory_id
+        db.add(
+            MemoryRecord(
+                memory_id=memory_id,
+                organization_id=org_id,
+                entity_type="thread",
+                entity_id=uuid.uuid4(),
+                source_signal_event_id=sig_id,
+                source_integration_id=None,
+                extractor_name="email_thread",
+                extractor_version="1",
+                schema_version=1,
+                event_timestamp=now,
+                dedup_key=f"thread:{memory_id}",
+                payload={"subject": "Bridge", "participants": ["a@acme.com"],
+                         "snippet": snippet},
+                confidence=1.0,
+            )
+        )
+    await db.flush()
+
+    # Org A asks about BOTH ids — the shape a regression would take: a caller
+    # holding one credential and an id from somewhere else.
+    got = await disclosure_by_memory_id(db, org_a, list(ids.values()))
+
+    assert set(got) == {ids[org_a]}, "the lookup crossed a tenant boundary"
+    assert ids[org_b] not in got
+    assert "acquired" not in str(got), "another tenant's snippet reached the caller"

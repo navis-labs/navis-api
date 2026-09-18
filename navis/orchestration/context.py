@@ -95,6 +95,36 @@ logger = get_logger("orchestration.context")
 # RTT to a remote database and no code change removes it.
 REASONING_GROUNDING_TIMEOUT_S = 4.0
 
+# The SAME read, bounded for a caller that is not an interactive turn.
+#
+# ── WHY TWO NUMBERS AND NOT ONE BIGGER ONE ──────────────────────────────────
+# 4.0s above is sized to a CHAT TURN, where a human is waiting and a slow answer
+# is a bad answer. An agent calling POST /developer/context is not waiting in
+# that sense: the surrounding request already measures 17-25s end to end, and
+# the MCP client's own timeout is configured in tens of seconds. Spending a few
+# more seconds to return the State and Reasoning layers is unambiguously better
+# for that caller than returning a 17-fact bundle fast.
+#
+# Re-measured on this deployment (742-record projection, `read_only_state`,
+# warm process, one request at a time):
+#
+#     p50  3.3s     excursions to 5.5s
+#     first call in a process   21.5s   (snapshot read + deserialize, cold)
+#     4 concurrent              9.8s    (remote-side contention, not pool
+#                                        starvation — the pool is 10+20 and
+#                                        never saturated at this concurrency)
+#
+# The distribution the 4.0s bound was sized against ("warm p50 1.4s, p95 1.6s")
+# NO LONGER HOLDS on this deployment, which is the whole reason the Developer
+# boundary was degrading: a warm sequential read now straddles 4.0s and fails
+# roughly one time in six.
+#
+# 10.0s covers the measured warm p100 and the 4-concurrent case. It deliberately
+# does NOT cover the 21.5s cold fold — a cold read is still refused and still
+# degrades explicitly, because sizing the bound to the worst case observed would
+# turn "too slow to be useful" into "wait half a minute".
+DEVELOPER_STATE_TIMEOUT_S = 10.0
+
 # `Grounding.kind` for a fact derived from a ReasoningSignal, and for one scoped
 # State entity. The documented vocabulary is memory | state | learning |
 # intelligence; `kind` is a free string with no validation layer.
@@ -119,6 +149,22 @@ CONTEXT_LIST_ITEMS = 4
 # The one token budget for this path — the same value `ContextBuilder.build`
 # enforces, so both branches bound the bundle identically.
 CONTEXT_TOKEN_BUDGET = 1500
+
+#: What a fact's `text` says when minimization could not establish what the
+#: stored text contains. See `minimize_memory_facts`.
+#:
+#: A SENTINEL STRING RATHER THAN A NEW FIELD, deliberately. `text` is already
+#: free-form prose on the wire, so this needs no schema change, no contract
+#: version and no consumer migration — every existing reader sees a fact it
+#: cannot mistake for an organizational claim, in the position where a claim
+#: would have been. A new `withheld` boolean would say the same thing while
+#: letting a consumer that ignores it read the sentinel as content.
+#:
+#: Self-describing on purpose: an agent reading this knows the gap is a
+#: disclosure decision and not a quiet organization, which is the same
+#: distinction `state_degraded_reason` and `layers.withheld` exist to make.
+#: Greppable, so an operator can find it in a captured bundle.
+WITHHELD_FACT_TEXT = "[withheld: Navis could not verify this fact's disclosure]"
 
 
 def compose_within_budget(base: GroundedContext, extra: list[Grounding]) -> GroundedContext:
@@ -342,6 +388,14 @@ def scoped_view_to_groundings(view: ScopedView) -> list[Grounding]:
             Grounding(
                 kind=CONTEXT_KIND,
                 source=entity.entity_id,
+                # The SAME id as `source` here, and stated anyway. For a state
+                # fact the two coincide; for a reasoning fact they do not, and a
+                # consumer cannot know which case it is holding without asking
+                # the layer. Populating it on both makes "which entity is this
+                # about?" one field to read rather than a per-kind rule, which
+                # is the whole point of the pair.
+                subject_type=entity.entity_type,
+                subject_id=entity.entity_id,
                 # type: label — the decision-relevant fields State already holds
                 # — (reason) — the projection's own explanation of why this
                 # entity made the cut ("open, oldest activity").
@@ -460,10 +514,31 @@ class StateGrounding:
     #: value existed and simply had no way out of State.
     newest_fact_at: datetime | None
     available: bool
+    #: WHY State is missing, when it is. None when `available` is True.
+    #:
+    #: `available=False` alone conflates three different operational facts that
+    #: a reader must act on differently:
+    #:
+    #:     "absent"   no usable snapshot exists and we declined to build one.
+    #:                The organization is cold. Nothing is wrong.
+    #:     "timeout"  a snapshot EXISTS and the read exceeded its bound. The
+    #:                organization is not cold; this answer is thinner than the
+    #:                data supports, and retrying may well succeed.
+    #:     "failed"   the read raised. An error, not a cold tenant.
+    #:
+    #: The distinction was already made internally — three separate metrics
+    #: counters — and simply had no way out. Reporting it does not weaken the
+    #: degraded contract: `available` stays False in every case, no stale state
+    #: is served and nothing is fabricated.
+    degraded_reason: str | None = None
 
 
 async def state_groundings(
-    db: AsyncSession, org_id: uuid.UUID, *, read_only: bool = False
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    *,
+    read_only: bool = False,
+    timeout_s: float = REASONING_GROUNDING_TIMEOUT_S,
 ) -> StateGrounding:
     """Current organizational understanding, as cited facts.
 
@@ -490,6 +565,12 @@ async def state_groundings(
     and resolving it costs a second round trip inside a latency-bounded path.
     Both callers take the default per-type cap, so both see the same slice.
 
+    `timeout_s` BOUNDS THE READ, and the default is the chat turn's bound so
+    `/chat` behaviour is unchanged by construction. The Developer boundary passes
+    `DEVELOPER_STATE_TIMEOUT_S` because it is not an interactive turn — see the
+    measurements beside those two constants. Nothing else differs: the same read,
+    the same projection, the same degradation, only a different patience.
+
     Best-effort. State unavailable, slow, or empty all degrade to no groundings,
     which leaves the memory-only path exactly as it was.
     """
@@ -499,13 +580,15 @@ async def state_groundings(
             state = await asyncio.wait_for(
                 service.read_only_state(org_id) if read_only
                 else service.get_state(org_id),
-                timeout=REASONING_GROUNDING_TIMEOUT_S,
+                timeout=timeout_s,
             )
             if state is None:
                 # Only reachable on the read-only path: there is no usable
                 # snapshot and we declined to build one. Honest absence.
                 metrics.incr("context.state_groundings.absent")
-                return StateGrounding([], None, None, None, available=False)
+                return StateGrounding(
+                    [], None, None, None, available=False, degraded_reason="absent"
+                )
             view = scope_for(state, MorningBrief(), None, as_of=state.as_of)
             signals = run_reasoning_v2(
                 state, evidence=await relevance_evidence(db, org_id)
@@ -516,16 +599,24 @@ async def state_groundings(
         # stack on every first request.
         logger.warning(
             "context: state read exceeded %.1fs, composing without state/reasoning org=%s",
-            REASONING_GROUNDING_TIMEOUT_S, org_id,
+            timeout_s, org_id,
         )
         metrics.incr("context.state_groundings.timeout")
         await reset_session(db)
-        return StateGrounding([], None, None, None, available=False)
+        # A snapshot may well EXIST here — this says only that reading it took
+        # longer than this caller's bound. Reported as "timeout" rather than
+        # collapsed into a bare False, because a cold tenant and a slow read are
+        # different problems with different responses.
+        return StateGrounding(
+            [], None, None, None, available=False, degraded_reason="timeout"
+        )
     except Exception:  # noqa: BLE001 — enrichment is never worth failing the turn
         logger.exception("context: state grounding unavailable org=%s", org_id)
         metrics.incr("context.state_groundings.failed")
         await reset_session(db)
-        return StateGrounding([], None, None, None, available=False)
+        return StateGrounding(
+            [], None, None, None, available=False, degraded_reason="failed"
+        )
 
     context_groundings = scoped_view_to_groundings(view)
     reasoning_groundings = [
@@ -536,6 +627,16 @@ async def state_groundings(
             source=str(s.signal_id),
             text=reasoning_text(state, s),
             occurred_at=s.state_as_of,
+            # WHOM the conclusion is about, carried as the canonical pair the
+            # signal already holds. `source` above identifies the CONCLUSION;
+            # these identify its SUBJECT, and conflating the two is what left
+            # "relationship is cooling" unattributable to a relationship.
+            #
+            # Passed through verbatim, including None: an org-wide signal
+            # (priority_load, meeting_overload) genuinely has no subject, and
+            # `reasoning_text` already declines to name one in that case.
+            subject_type=s.entity_type,
+            subject_id=s.entity_id,
         )
         for s in signals
     ]
@@ -874,7 +975,167 @@ class ComposedContext:
     #: tell "the organization has no insights" from "this caller may not read
     #: them" — otherwise a narrowly-scoped credential reads a thin bundle as a
     #: complete picture of the company.
-    layers: "ContextLayers" 
+    layers: "ContextLayers"
+    #: WHY State is missing, when it is: "absent" | "timeout" | "failed" |
+    #: "withheld". None when `state_available` is True.
+    #:
+    #: Optional and LAST, so every existing construction site — including the
+    #: positional ones in tests — is unaffected, the same convention `lineage`
+    #: and `subject_type` were added under. A consumer needs this to tell a cold
+    #: organization from a slow read from a permission gate; `state_available`
+    #: alone collapses four situations into one boolean.
+    state_degraded_reason: str | None = None
+
+
+async def minimize_memory_facts(
+    db: AsyncSession, org_id: uuid.UUID, context: GroundedContext
+) -> GroundedContext:
+    """Re-render the memory layer without raw source body content.
+
+    ── WHY THE DEVELOPER BOUNDARY DOES THIS AND `/chat` DOES NOT ────────────
+    `memory_embeddings.source_text` is built for SIMILARITY. For an email thread
+    that means the whole rendered fact including the message body — up to ~2000
+    characters of it. Embedding the body is right: it is what makes the thread
+    findable. Forwarding it to an EXTERNAL AGENT is a different decision, and it
+    was being made implicitly by reusing the embedded string as the fact text.
+    A member reading their own organization in the Navis UI already has that
+    mail; a model running on a developer's machine is not the same exposure.
+    So the minimization is asymmetric ON PURPOSE, and the asymmetry is the
+    point rather than an inconsistency.
+    ── IT FAILS CLOSED, PER ITEM (P0-3E) ────────────────────────────────────
+    The text on an incoming memory fact IS `memory_embeddings.source_text`, so
+    until the disclosure row has been read this function does not know whether
+    it is holding a participant list or an email body. Every path that cannot
+    establish that therefore WITHHOLDS the text rather than passing it through:
+    a failed lookup, a memory_id that returned no row, and an entity type this
+    build has no minimal rendering for. Withholding is the only safe answer to
+    "I do not know what this string contains".
+
+    PER ITEM, NEVER THE BUNDLE. One unresolvable fact withholds one fact's
+    text. The other memory facts keep their minimized text, and the State,
+    Reasoning, Intelligence and Learning layers are not touched at all — they
+    are derived claims, not embedded source. A caller that lost one fact still
+    has an organization to reason about, which is the whole reason the earlier
+    fail-open was tempting.
+
+    WITHHELD IS NOT DELETED, AND IT IS NOT SILENT. The fact stays in the
+    bundle carrying the provenance the caller is already authorized to hold —
+    `kind`, `source` (the memory_id), `occurred_at` and `lineage`, all ids and
+    timestamps rather than content — with `text` replaced by
+    `WITHHELD_FACT_TEXT`. So the caller can see that Navis holds a fact here,
+    can cite it, can fetch it through a route that authorizes it, and cannot
+    mistake the gap for an organization that has nothing to say.
+
+    `subject_type`/`subject_id` are left as they arrived on a withheld fact,
+    because they are READ FROM the row this function failed to read. Filling
+    them in from anywhere else would be the fabricated authorization this
+    boundary exists to refuse.
+    ── WHAT IT DOES NOT DO ──────────────────────────────────────────────────
+    Nothing is deleted from Memory, no embedding is rewritten, and the stored
+    record is untouched — this only changes what enters one caller's bundle.
+    Provenance is preserved exactly: `source` (the memory_id) and `lineage` are
+    carried through unchanged, so both a minimized and a withheld fact is still
+    auditable back to the row it came from.
+    ── AND IT FILLS IN THE CANONICAL SUBJECT ────────────────────────────────
+    The same row carries `(entity_type, entity_id)`, so the memory layer gains
+    the subject the other layers got in P0-3C, from the same round trip. READ,
+    never inferred: a fact whose extractor recorded no `entity_id` keeps
+    `subject_id=None` and stays honestly unattributed.
+    """
+    from navis.memory.lineage import disclosure_by_memory_id
+    from navis.ml.embeddings.service import memory_text_minimal
+
+    memory_facts = [f for f in context.facts if f.kind == "memory"]
+    if not memory_facts:
+        return context
+
+    ids: list[uuid.UUID] = []
+    for fact in memory_facts:
+        try:
+            ids.append(uuid.UUID(fact.source))
+        except (ValueError, AttributeError):
+            # A memory fact whose source is not a uuid cannot be looked up, so
+            # its text cannot be established either. It is withheld below, not
+            # passed through and not guessed at.
+            continue
+
+    disclosures: dict[uuid.UUID, Any] | None = {}
+    if ids:
+        try:
+            disclosures = await disclosure_by_memory_id(db, org_id, ids)
+        except Exception:  # noqa: BLE001
+            # FAILS CLOSED. Without the lookup there is no way to tell which
+            # facts carry a body, and the incoming text is the embedded string
+            # — which for a thread includes the message snippet. So no memory
+            # text goes out on this path: `disclosures = None` marks "unknown"
+            # distinctly from "looked up, no row", and the loop withholds every
+            # memory fact's text while leaving the rest of the bundle intact.
+            #
+            # `context.minimize_memory.failed` stays the alertable signal that
+            # minimization is degraded; `context.minimize_memory.withheld`
+            # counts what that cost the caller.
+            logger.exception("context: memory minimization unavailable org=%s", org_id)
+            metrics.incr("context.minimize_memory.failed")
+            disclosures = None
+
+    rewritten: list[Grounding] = []
+    changed = 0
+    withheld = 0
+    for fact in context.facts:
+        if fact.kind != "memory":
+            rewritten.append(fact)
+            continue
+        disclosure = None
+        if disclosures is not None:
+            try:
+                disclosure = disclosures.get(uuid.UUID(fact.source))
+            except (ValueError, AttributeError):
+                disclosure = None
+        # No row means the org-scoped query did not return this memory_id — a
+        # fact from another tenant, or one deleted between the search and this
+        # read. Either way nothing here is authorized to say what its text is.
+        minimal = (
+            None
+            if disclosure is None
+            else memory_text_minimal(disclosure.entity_type, disclosure.payload)
+        )
+        if minimal is None:
+            # Includes the entity types with no minimal renderer: their
+            # `source_text` came from the generic payload scan, which reads
+            # `text`/`content`/`description` and so may be raw source body.
+            withheld += 1
+            rewritten.append(replace(fact, text=WITHHELD_FACT_TEXT))
+            continue
+        if minimal != fact.text:
+            changed += 1
+        rewritten.append(
+            replace(
+                fact,
+                text=minimal,
+                subject_type=disclosure.entity_type,
+                subject_id=(
+                    None if disclosure.entity_id is None else str(disclosure.entity_id)
+                ),
+            )
+        )
+
+    metrics.incr("context.minimize_memory.rewritten", value=changed)
+    metrics.incr("context.minimize_memory.withheld", value=withheld)
+    if withheld:
+        # The COUNT, never the fact. A memory_id would be safe to log; the text
+        # this function just refused to disclose would not, and a log line that
+        # names the withheld item is one edit away from carrying it.
+        logger.warning(
+            "context: withheld %d/%d memory fact texts org=%s",
+            withheld, len(memory_facts), org_id,
+        )
+    # `token_estimate` is recomputed because the facts changed length. Same
+    # arithmetic `compose_within_budget` uses, so the figure keeps meaning the
+    # same thing: the RENDERED cost of these facts.
+    used = estimate_tokens(replace(context, facts=[]).render()) + sum(
+        estimate_tokens(f.render_line(i)) for i, f in enumerate(rewritten, 1)
+    )
+    return replace(context, facts=rewritten, token_estimate=used)
 
 
 async def build_grounded_context(
@@ -884,6 +1145,14 @@ async def build_grounded_context(
     *,
     subject: SubjectResolution | None = None,
     read_only: bool = False,
+    #: Bound on the State read. Defaults to the CHAT turn's bound, so `/chat`
+    #: is unchanged by construction; the Developer boundary passes
+    #: `DEVELOPER_STATE_TIMEOUT_S`. See the measurements beside both constants.
+    state_timeout_s: float = REASONING_GROUNDING_TIMEOUT_S,
+    #: Leave RAW SOURCE BODY CONTENT out of the memory layer. Off by default,
+    #: so `/chat` composes exactly what it always has; the Developer boundary
+    #: turns it on. See `minimize_memory_facts`.
+    minimize_memory: bool = False,
     layers: ContextLayers | None = None,
     k: int = 8,
     token_budget: int = CONTEXT_TOKEN_BUDGET,
@@ -960,11 +1229,20 @@ async def build_grounded_context(
         # State is read ONCE and produces both derived layers, so a caller
         # entitled to neither must not pay for the read at all.
         if not (layers.state or layers.reasoning):
-            return StateGrounding([], None, None, None, available=False)
+            # Not a failure: this credential may not read these layers, which
+            # `layers.withheld` already reports. Named so it is never confused
+            # with a read that was attempted and did not finish.
+            return StateGrounding(
+                [], None, None, None, available=False, degraded_reason="withheld"
+            )
         if not concurrent:
-            return await state_groundings(db, org_id, read_only=read_only)
+            return await state_groundings(
+                db, org_id, read_only=read_only, timeout_s=state_timeout_s
+            )
         async with sessions() as s:  # type: ignore[misc]
-            return await state_groundings(s, org_id, read_only=read_only)
+            return await state_groundings(
+                s, org_id, read_only=read_only, timeout_s=state_timeout_s
+            )
 
     if concurrent:
         with timed("context.subject_state_concurrent"):
@@ -1024,6 +1302,9 @@ async def build_grounded_context(
         # Retrieval, Learning and Intelligence concurrently, one session each.
         sessions=sessions if concurrent else None,
     )
+    if minimize_memory:
+        context = await minimize_memory_facts(db, org_id, context)
+
     return ComposedContext(
         context=context,
         derived=derived,
@@ -1031,6 +1312,7 @@ async def build_grounded_context(
         as_of=grounded.as_of,
         newest_fact_at=grounded.newest_fact_at,
         state_available=grounded.available,
+        state_degraded_reason=grounded.degraded_reason,
         subject=subject,
         expanded=expanded,
         layers=layers,

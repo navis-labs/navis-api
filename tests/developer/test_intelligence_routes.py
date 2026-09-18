@@ -405,10 +405,19 @@ def test_each_route_gates_on_the_layer_it_reads(handler, permission, capability)
 
 def test_the_three_permissions_are_not_developer_specific():
     """No `developer_admin`, no second RBAC, no scope vocabulary of its own: an
-    agent and a human are authorized by the same words."""
-    from navis.identity.permissions import default_permissions_for_role
+    agent and a human are authorized by the same words.
 
-    founder = default_permissions_for_role("founder")
+    RESOLVED THROUGH THE FULL EVALUATOR SINCE P1-6. These three are Developer-
+    surface permissions, so a founder now reaches them through
+    `memberships.developer_role` rather than through their Application role —
+    but through the SAME `effective_permissions` and the same vocabulary, which
+    is what this test is actually about. Asserting against
+    `default_permissions_for_role` alone would now be asserting that one half of
+    a two-half resolution contains everything, which was never the claim.
+    """
+    from navis.identity.permissions import effective_permissions
+
+    founder = effective_permissions("founder", developer_role="owner")
     for permission in (
         Permission.VIEW_INTELLIGENCE, Permission.VIEW_DECISIONS, Permission.VIEW_REASONING
     ):

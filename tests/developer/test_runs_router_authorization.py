@@ -70,11 +70,30 @@ def test_the_write_permission_is_not_the_agent_administration_one():
 
 def test_the_write_permission_exists_in_the_shared_vocabulary():
     """A permission, not a Developer-specific role. It resolves through the same
-    table every other gate reads."""
+    evaluator every other gate reads.
+
+    WHICH ROLE CARRIES IT MOVED AT P1-6, and the move is the point. Writing the
+    execution ledger is Developer authority, so it now comes from
+    `memberships.developer_role` — a Developer `developer` or above — and no
+    longer from an Application role. An Application `admin` holding it was the
+    coupling `0051_surface_rbac_columns` was written to end.
+    """
+    from navis.identity.permissions import (
+        DEVELOPER_ROLE_PERMISSIONS,
+        effective_permissions,
+    )
+
     assert Permission.RECORD_AGENT_RUNS == "record_agent_runs"
-    assert Permission.RECORD_AGENT_RUNS in default_permissions_for_role("founder")
-    assert Permission.RECORD_AGENT_RUNS in default_permissions_for_role("admin")
+    # Reachable by a real human assignment, through the one evaluator.
+    assert Permission.RECORD_AGENT_RUNS in effective_permissions(
+        "founder", developer_role="owner"
+    )
+    assert Permission.RECORD_AGENT_RUNS in DEVELOPER_ROLE_PERMISSIONS["developer"]
+    # Not reachable from any Application role, nor from a Developer viewer.
+    assert Permission.RECORD_AGENT_RUNS not in default_permissions_for_role("founder")
+    assert Permission.RECORD_AGENT_RUNS not in default_permissions_for_role("admin")
     assert Permission.RECORD_AGENT_RUNS not in default_permissions_for_role("employee")
+    assert Permission.RECORD_AGENT_RUNS not in DEVELOPER_ROLE_PERMISSIONS["viewer"]
 
 
 def test_every_route_declares_one_of_the_two_gates():
@@ -163,6 +182,140 @@ def test_every_list_route_bounds_its_page(path: str):
     # attributes on the Query object.
     ceilings = [getattr(m, "le", None) for m in query.metadata]
     assert MAX_PAGE_SIZE in ceilings, f"{path} does not cap its page size"
+
+
+# ── 5. A list can be scoped to one task ─────────────────────────────────────
+
+
+def test_runs_can_be_filtered_by_task():
+    """WHY THIS IS CORRECTNESS, NOT CONVENIENCE.
+
+    `GET /developer/runs` answers newest-first across the whole organization.
+    A caller wanting one task's runs had to read a page and sift it, and once
+    other work pushed that task's newest run past the page boundary the task's
+    runs were absent from the answer entirely — indistinguishable, to the
+    caller, from a task that has no runs. The Developer CLI locates a work
+    stream's checkpoint through exactly this call, so the failure showed up as
+    a fresh session restoring nothing while a checkpoint existed.
+    """
+    route = next(
+        r for r in module.router.routes if r.path == "/developer/runs" and "GET" in r.methods
+    )
+    params = inspect.signature(route.endpoint).parameters
+
+    assert "task_id" in params, "runs cannot be scoped to a task"
+    assert params["task_id"].default.default is None, "the task filter must be optional"
+
+
+def test_the_task_filter_is_passed_to_the_service():
+    """A parameter the handler accepts and drops is worse than none: the caller
+    believes the result is scoped and it is not."""
+    source = inspect.getsource(module.list_runs)
+
+    assert "task_id=task_id" in source
+
+
+def test_the_task_filter_never_replaces_the_tenant_predicate():
+    """A filter narrows the organization's rows. If it ever became the scope,
+    a task id from another tenant would reach that tenant's runs."""
+    from navis.developer.run_service import AgentLifecycleService
+
+    source = inspect.getsource(AgentLifecycleService.list_runs)
+
+    assert "AgentRun.organization_id == org_id" in source
+    # The task predicate is appended to that list, never substituted for it.
+    assert "predicates.append(AgentRun.task_id == task_id)" in source
+
+
+# ── 6. A task list can be scoped to one work key ────────────────────────────
+
+
+def test_tasks_can_be_filtered_by_work_key():
+    """THE SAME CORRECTNESS ARGUMENT, ONE LEVEL UP.
+
+    A client that records work against a task and then loses the id has no way
+    back to it: a task is addressable by id, and the id is what a restarted
+    process does not have. It had to page the tenant's open tasks and match
+    `metadata.navisWorkKey` itself — which stops finding the stream once the
+    tenant holds more open tasks than the client reads, and reports that as
+    ABSENCE rather than as an error. A second stream is then opened beside the
+    first.
+    """
+    route = next(
+        r for r in module.router.routes if r.path == "/developer/tasks" and "GET" in r.methods
+    )
+    params = inspect.signature(route.endpoint).parameters
+
+    assert "work_key" in params, "tasks cannot be scoped to a work key"
+    assert params["work_key"].default.default is None, "the work-key filter must be optional"
+
+
+def test_the_work_key_filter_is_bounded():
+    """An unbounded string parameter is a channel. A work key is 37 characters;
+    anything past the bound is refused as malformed rather than sent to the
+    database."""
+    route = next(
+        r for r in module.router.routes if r.path == "/developer/tasks" and "GET" in r.methods
+    )
+    query = inspect.signature(route.endpoint).parameters["work_key"].default
+
+    ceilings = [getattr(m, "max_length", None) for m in query.metadata]
+    assert any(c is not None for c in ceilings), "work_key accepts a string of any length"
+
+
+def test_the_work_key_filter_is_passed_to_the_service():
+    """A parameter the handler accepts and drops is worse than none: the caller
+    believes the result is scoped and it is not."""
+    source = inspect.getsource(module.list_tasks)
+
+    assert "work_key=work_key" in source
+
+
+def test_the_work_key_filter_never_replaces_the_tenant_predicate():
+    """A filter narrows the organization's rows. If it ever became the scope, a
+    work key computed in another tenant would reach that tenant's tasks — and
+    work keys are derived from a git remote, so two tenants working on the same
+    open-source repository compute the SAME key."""
+    from navis.developer.run_service import AgentLifecycleService
+
+    source = inspect.getsource(AgentLifecycleService.list_tasks)
+
+    assert "AgentTask.organization_id == org_id" in source
+    assert "predicates.append(_work_key_expression() == work_key)" in source
+
+
+def test_the_work_key_match_is_an_equality_and_not_a_pattern():
+    """A LIKE or a containment test would hand a caller its neighbour's work
+    stream, which is worse than handing it nothing."""
+    from navis.developer import run_service
+
+    source = inspect.getsource(run_service.AgentLifecycleService.list_tasks)
+
+    for pattern in (".like(", ".ilike(", ".contains(", ".startswith(", "@>"):
+        assert pattern not in source, f"the work-key filter uses {pattern}"
+
+
+def test_the_work_key_expression_keeps_the_json_key_literal():
+    """THE PLAN DEPENDS ON THIS, not just the index's existence.
+
+    PostgreSQL matches a query to an expression index by comparing parsed
+    expressions. SQLAlchemy's natural spelling renders the JSON key as a bind
+    parameter, which does not match under a generic plan — and the lookup then
+    degrades to a sequential scan of the tenant's tasks, silently, on exactly
+    the deployments that reuse plans.
+    """
+    import sqlalchemy as sa
+    from sqlalchemy.dialects import postgresql
+
+    from navis.developer.run_service import _work_key_expression
+
+    rendered = str(
+        (_work_key_expression() == sa.bindparam("w")).compile(dialect=postgresql.dialect())
+    )
+
+    assert "->> 'navisWorkKey'" in rendered, rendered
+    # The VALUE stays bound: the work key is never interpolated into SQL.
+    assert "nws1" not in rendered
 
 
 # ── Refusal mapping ─────────────────────────────────────────────────────────

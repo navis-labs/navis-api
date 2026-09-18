@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.enterprise_models import RolePermission
 from navis.identity.models import Membership, User
-from navis.identity.permissions import effective_permissions
+from navis.identity.permissions import developer_grant_key, effective_permissions
 from navis.identity.tokens import TokenRevocationService, token_predates_bulk_revoke
 from navis.platform.database import get_session
 from navis.platform.monitoring import get_logger, set_org_id
@@ -159,6 +159,17 @@ class Principal:
     subject_id: uuid.UUID          # user id, or api-key/service-account id
     permissions: frozenset[str]
     role: str | None = None
+    #: The member's role on the DEVELOPER surface, or None for no Developer
+    #: access (P1-6). Reported so `/auth/me` can tell a console what the member
+    #: is, and so an audit record can name it.
+    #:
+    #: ALREADY FOLDED INTO `permissions` ABOVE — reading this field is never how
+    #: a gate decides anything. `effective_permissions` unions the Application
+    #: and Developer halves into the one set `require_permission` checks, so
+    #: there is exactly one authorization input and this is a label on it.
+    #: None for every machine principal: a credential's reach is its
+    #: `api_keys.scopes` and it holds no membership row to have a role in.
+    developer_role: str | None = None
     user: User | None = None
     scopes: list[str] = field(default_factory=list)
     # WHICH CREDENTIAL authenticated this request, as distinct from WHO it
@@ -184,6 +195,41 @@ class Principal:
         return permission in self.permissions
 
 
+async def grants_for_roles(
+    db: AsyncSession, org_id: uuid.UUID, roles: list[str]
+) -> dict[str, list[str]]:
+    """Per-org permission grants for SEVERAL role keys, in ONE round-trip.
+
+    EXISTS FOR THE ROUND-TRIP COUNT, NOT FOR TIDINESS. Since P1-6 a human
+    principal resolves two role keys — the Application role and the namespaced
+    Developer role (`developer_grant_key`) — and `_principal_from_jwt` is the
+    hot path that already pays four sequential Neon round-trips. Asking twice
+    would add a fifth to every authenticated request for a table that is empty
+    in every deployment today.
+
+    Returns a dict keyed by the role strings that were ASKED FOR, so a caller
+    can index it without checking for absence; a role with no rows maps to the
+    empty list. Blank keys are dropped before querying — `developer_grant_key`
+    returns "" for a member with no Developer role, and that must match nothing
+    rather than becoming a wildcard.
+    """
+    wanted = [r for r in roles if r]
+    if not wanted:
+        return {r: [] for r in roles}
+    rows = (
+        await db.scalars(
+            select(RolePermission).where(
+                RolePermission.role.in_(wanted),
+                RolePermission.organization_id.in_([org_id, None]),
+            )
+        )
+    ).all()
+    out: dict[str, list[str]] = {r: [] for r in roles}
+    for row in rows:
+        out.setdefault(row.role, []).append(row.permission)
+    return out
+
+
 async def grants_for(db: AsyncSession, org_id: uuid.UUID, role: str) -> list[str]:
     """Per-org permission grants layered on a role's code defaults.
 
@@ -191,16 +237,12 @@ async def grants_for(db: AsyncSession, org_id: uuid.UUID, role: str) -> list[str
     permissions exactly as this resolves the ACTOR's. Two queries with the same
     intent would be free to drift, and a drift here means an authorization
     comparison between two differently-computed permission sets.
+
+    Delegates to `grants_for_roles` for exactly that reason: the batched form is
+    now the one that the authentication path uses, so this single-role form must
+    be the same query rather than a second one that resembles it.
     """
-    rows = (
-        await db.scalars(
-            select(RolePermission).where(
-                RolePermission.role == role,
-                RolePermission.organization_id.in_([org_id, None]),
-            )
-        )
-    ).all()
-    return [r.permission for r in rows]
+    return (await grants_for_roles(db, org_id, [role]))[role]
 
 
 async def _principal_from_jwt(db: AsyncSession, token: str) -> Principal:
@@ -255,7 +297,19 @@ async def _principal_from_jwt(db: AsyncSession, token: str) -> Principal:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "no active org membership")
 
     role = membership.role.value if membership.role else None
-    grants = await grants_for(db, membership.organization_id, role or "")
+    # THE TWO SURFACES, RESOLVED TOGETHER (P1-6). `memberships.role` answers for
+    # the Application surface and `memberships.developer_role` for the Developer
+    # surface; `effective_permissions` unions them into the one set every gate
+    # checks. A NULL `developer_role` contributes nothing, which is precisely
+    # what "this member has no Developer access" has to mean.
+    #
+    # Both grant lookups are ONE query (`grants_for_roles`), so the surface split
+    # costs this hot path no additional round-trip.
+    developer_role = membership.developer_role
+    developer_key = developer_grant_key(developer_role)
+    grants_by_role = await grants_for_roles(
+        db, membership.organization_id, [role or "", developer_key]
+    )
 
     # Detach the User row from this request's session before caching so a
     # future cache hit — served under a DIFFERENT session — can safely read
@@ -271,8 +325,14 @@ async def _principal_from_jwt(db: AsyncSession, token: str) -> Principal:
         kind=PrincipalKind.USER,
         org_id=membership.organization_id,
         subject_id=user.id,
-        permissions=effective_permissions(role, grants),
+        permissions=effective_permissions(
+            role,
+            grants_by_role[role or ""],
+            developer_role=developer_role,
+            developer_grants=grants_by_role[developer_key],
+        ),
         role=role,
+        developer_role=developer_role,
         user=user,
     )
     _principal_cache_put(jti, principal)
@@ -280,11 +340,42 @@ async def _principal_from_jwt(db: AsyncSession, token: str) -> Principal:
 
 
 async def _principal_from_api_key(db: AsyncSession, plaintext: str) -> Principal:
-    from navis.identity.apikeys import ApiKeyService
+    from navis.identity.apikeys import ApiKeyService, CredentialRefusal
     from navis.identity.enterprise_models import ServiceAccount
 
-    key = await ApiKeyService(db).verify(plaintext)
+    checked = await ApiKeyService(db).check(plaintext)
+    key = checked.key
     if key is None:
+        # WHICH REFUSAL IS NAMED, AND WHY ONLY THIS ONE.
+        #
+        # `expired` is reported because only the holder of a genuine credential
+        # can provoke it — a guess produces `malformed` or `unknown` — so it
+        # reveals nothing the caller did not already possess, and it is the
+        # difference between "rotate this key" and an afternoon spent checking
+        # the header for typos. It is also what OpenAI and Anthropic answer.
+        #
+        # `revoked` is deliberately NOT distinguished on the wire. It is also
+        # only reachable with a real key, but a revoked credential is one
+        # somebody chose to cut off, and confirming to whoever still holds it
+        # that it was specifically revoked tells them the organization noticed.
+        # "Invalid" is the truthful and sufficient answer there.
+        #
+        # The metric keeps all four apart for operators, who are the reader that
+        # actually needs to tell a forgotten rotation from a deliberate cutoff.
+        reason = checked.refusal.value if checked.refusal else "unknown"
+        metrics.incr("auth.api_key_refused", labels={"reason": reason})
+        if checked.refusal is CredentialRefusal.EXPIRED:
+            # The PREFIX only. It is the public, non-secret lookup segment the
+            # console already displays, and it is what lets an operator find the
+            # row; the secret segment is never touched. A malformed key cannot
+            # reach here, so the split is safe.
+            logger.info(
+                "auth denied: api key expired prefix=%s", plaintext.split("_", 2)[1]
+            )
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED,
+                "api key expired; mint a replacement in the Navis console",
+            )
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid api key")
     kind = PrincipalKind.API_KEY
     if key.service_account_id is not None:
@@ -378,20 +469,96 @@ def ensure_grantable_scopes(scopes: list[str], principal: Principal) -> None:
     that gets a fix and one that does not, and the divergence is invisible until
     a credential is minted through the wrong door. `authz` is the module that
     already owns "what may this principal do", so it owns this too.
+
+    IT ALSO ENFORCES THE HUMAN-ONLY BOUND (P1-8), and that is a SERVER rule
+    rather than a console default. The permission list the console offers when
+    minting a credential is documented as a management-surface default and not
+    a server rule, so omitting `manage_developer_access` from it was not
+    sufficient: a Developer owner holds the permission, the creator-bound
+    check below would therefore have passed it, and the resulting credential
+    would have satisfied the member-administration gates. An agent able to
+    grant humans Developer access is an escalation out of the agent sandbox,
+    so the refusal belongs at the one chokepoint every credential goes
+    through — this function, which both `identity.admin_router` and
+    `developer.agents_router` already call.
+
+    `HUMAN_ONLY_PERMISSIONS` is a BOUND, not a description: unlike the
+    catalog, it is consulted here deliberately, and the test that forbids this
+    function from reading descriptive tables is about exactly that
+    distinction.
     """
-    from navis.identity.permissions import validate_permission
+    from navis.identity.permissions import HUMAN_ONLY_PERMISSIONS, validate_permission
 
     for scope in scopes:
         try:
             validate_permission(scope)
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    # Checked BEFORE the creator-bound comparison, so the refusal names the
+    # real reason. Otherwise a holder of the permission would be told nothing
+    # (it is not "excess" for them) and only a non-holder would be refused —
+    # which is the wrong rule entirely.
+    human_only = set(scopes) & HUMAN_ONLY_PERMISSIONS
+    if human_only:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "these permissions administer people and can never be granted to "
+            f"a credential: {sorted(human_only)}",
+        )
     excess = set(scopes) - set(principal.permissions)
     if excess:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             f"cannot grant scopes you do not hold: {sorted(excess)}",
         )
+
+
+def require_any_permission(*permissions: str):
+    """As `require_permission`, but any ONE of `permissions` is enough (P1-8).
+
+    WHY A DISJUNCTION, AND WHY IT IS NOT A SECOND AUTHORIZATION SYSTEM. Three
+    identity-administration routes are reachable two genuinely different ways:
+    an Application administrator holding `manage_roles`/`manage_members`, and a
+    Developer administrator holding `manage_developer_access`. Both are real
+    answers to "may you call this route" — the first administers the
+    organization, the second administers the Developer team inside it — and
+    neither implies the other.
+
+    ADDITIVE BY CONSTRUCTION. Every existing caller passed on the Application
+    permission and still does; the alternative is only ever consulted after
+    that check fails. So no route becomes harder to reach and no credential
+    loses anything.
+
+    The input is still `Principal.permissions`, resolved by the one
+    `effective_permissions`. This asks the existing evaluator a question with
+    an `or` in it, which is the only thing it adds — the same shape, and the
+    same reasoning, as `developer.gateway.require_developer_any`.
+
+    The denial names every acceptable permission rather than just the first:
+    an operator refused here needs to know which of the two grants would fix
+    it, and reporting only one sends a Developer admin to ask for
+    `manage_roles` — the Application permission this route exists to stop
+    requiring.
+    """
+    if not permissions:  # a gate that accepts nothing would deny everyone
+        raise ValueError("require_any_permission needs at least one permission")
+
+    async def _dep(principal: Principal = Depends(get_principal)) -> Principal:
+        if not any(principal.has(p) for p in permissions):
+            wanted = " or ".join(permissions)
+            logger.warning(
+                "permission denied: principal=%s kind=%s org=%s perm=%s",
+                principal.subject_id, principal.kind, principal.org_id, wanted,
+            )
+            # Labelled by the whole disjunction, so the metric distinguishes
+            # this gate from the single-permission ones it replaced.
+            metrics.incr("auth.permission_denied", labels={"permission": wanted})
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, f"missing permission: {wanted}"
+            )
+        return principal
+
+    return _dep
 
 
 def require_permission(permission: str):

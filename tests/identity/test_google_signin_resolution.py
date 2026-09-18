@@ -24,7 +24,7 @@ import uuid
 
 import pytest
 
-from navis.identity.models import Membership, Organization, Role, User
+from navis.identity.models import Membership, Organization, OrganizationKind, Role, User
 from navis.identity.service import IdentityService
 from tests.identity.fakes import FakeSession
 
@@ -75,6 +75,40 @@ async def test_a_returning_google_account_resolves_its_existing_user_and_org():
     assert len(db.store.get(User, [])) == users_before
     assert len(db.store.get(Organization, [])) == orgs_before
     assert len(db.store.get(Membership, [])) == memberships_before
+
+
+@pytest.mark.asyncio
+async def test_a_returning_account_ignores_the_workspace_arguments_entirely():
+    """P0-5 CASE A, and the property that makes one Google button safe.
+
+    The console cannot know whether a Google click is a sign-in or a sign-up
+    until the Core answers, so it sends the workspace choice every time. That
+    is only safe if a returning account cannot be affected by it. Here the
+    caller asks for a PERSONAL workspace called something else entirely, and
+    the account resolves to exactly the company workspace it already had.
+
+    If this ever fails, a Sarvam engineer signing in with the personal button
+    gets a second tenant with none of their organization's data in it.
+    """
+    db = FakeSession()
+    user, org, membership = _seed(db, google_sub=GOOGLE_SUB)
+    orgs_before = len(db.store.get(Organization, []))
+
+    resolved, org_id, is_new_user, _ = await IdentityService(db).google_signin(
+        email=EMAIL,
+        google_sub=GOOGLE_SUB,
+        full_name="A Founder",
+        workspace_kind=OrganizationKind.PERSONAL,
+        organization_name="Some Other Company",
+    )
+
+    assert resolved.id == user.id
+    assert org_id == org.id == membership.organization_id
+    assert is_new_user is False
+    # Not renamed, not reclassified, not duplicated.
+    assert org.name == "A Founder"
+    assert org.kind == OrganizationKind.COMPANY.value
+    assert len(db.store.get(Organization, [])) == orgs_before
 
 
 @pytest.mark.asyncio
@@ -162,3 +196,84 @@ async def test_a_disabled_account_is_refused_rather_than_re_created():
         )
 
     assert len(db.store.get(User, [])) == 1
+
+
+# ── Sign-in must not provision a tenant (P0-8) ──────────────────────────
+#
+# The console's sign-in page has one Google button, and until P0-8 a click on
+# it by somebody with no Navis account created a `company` organization named
+# after them, made them its founder and its Developer owner, and told them
+# nothing. Three of the four organizations in production were created that
+# way. `create_workspace=False` is what distinguishes "sign me in" from
+# "found a company"; these pin both halves of it.
+
+
+@pytest.mark.asyncio
+async def test_sign_in_refuses_an_unknown_identity_instead_of_founding_a_company():
+    from navis.identity.service import NoSuchAccountError
+
+    db = FakeSession()
+    # Deliberately empty: no user, no organization, no invitation.
+
+    with pytest.raises(NoSuchAccountError):
+        await IdentityService(db).google_signin(
+            email="nobody@example.com",
+            google_sub="a_subject_navis_has_never_seen",
+            full_name="Nobody",
+            create_workspace=False,
+        )
+
+    # The whole point: the refusal is not merely a different status code, it
+    # is the absence of three writes.
+    assert db.store.get(User, []) == []
+    assert db.store.get(Organization, []) == []
+    assert db.store.get(Membership, []) == []
+
+
+@pytest.mark.asyncio
+async def test_an_invited_person_signs_in_normally_with_creation_disabled():
+    """The flow `create_workspace=False` must NOT break.
+
+    `MemberService.invite` writes a real `users` row with no password and no
+    google_sub, so an invitee is found by the EMAIL lookup and resolves to the
+    organization that invited them. If the refusal were keyed on "has never
+    signed in" rather than "has no user row", this is the person it would lock
+    out of the organization that just invited them.
+    """
+    db = FakeSession()
+    invited = User(id=uuid.uuid4(), email=EMAIL, full_name=None, is_active=True)
+    org = Organization(id=uuid.uuid4(), name="Inviting Company", slug="inviting-co-1234abcd")
+    membership = Membership(
+        id=uuid.uuid4(), user_id=invited.id, organization_id=org.id, role=Role.EMPLOYEE
+    )
+    db.add(invited)
+    db.add(org)
+    db.add(membership)
+
+    resolved, org_id, is_new_user, _ = await IdentityService(db).google_signin(
+        email=EMAIL, google_sub=GOOGLE_SUB, full_name="An Invitee", create_workspace=False
+    )
+
+    assert resolved.id == invited.id
+    assert org_id == org.id
+    assert is_new_user is False
+    # Their Google subject is linked to the stub the invite created, rather
+    # than a second account being made for the same address.
+    assert resolved.google_sub == GOOGLE_SUB
+    assert len(db.store.get(Organization, [])) == 1
+
+
+@pytest.mark.asyncio
+async def test_creation_remains_the_default_for_every_existing_caller():
+    """`create_workspace` defaults to True, so the Application is unchanged.
+
+    Asserted on the SIGNATURE rather than by creating an org, because the
+    create branch writes through `OrgLifecycleSeam` and the audit service,
+    which `FakeSession` does not model (see this module's docstring).
+    """
+    import inspect
+
+    default = inspect.signature(IdentityService.google_signin).parameters[
+        "create_workspace"
+    ].default
+    assert default is True

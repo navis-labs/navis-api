@@ -113,6 +113,28 @@ class AgentCredentialOut(BaseModel):
     revoked: bool
     last_used_at: datetime | None = None
     created_at: datetime
+    expires_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When this credential stops authenticating. Null means it does not "
+            "expire, which is the case for every credential minted before "
+            "expiry was offered — it is not a missing value. Distinct from "
+            "revocation: this is a limit chosen at creation, `revoked` is a "
+            "decision somebody made."
+        ),
+    )
+    status: str = Field(
+        default="active",
+        description=(
+            "`active` | `expiring` | `expired` | `revoked`. Derived from "
+            "`revoked` and `expires_at` by the server, so the console and this "
+            "API cannot disagree about whether a credential works.\n\n"
+            "`expiring` means it expires within 7 days and STILL AUTHENTICATES "
+            "— it is a prompt to rotate, not a refusal. `revoked` outranks "
+            "`expired` when both apply, because revocation is the decision that "
+            "actually stopped it."
+        ),
+    )
 
 
 class AgentCredentialPageOut(BaseModel):
@@ -181,6 +203,25 @@ class CreateAgentRequest(_AgentFields):
             "unless the CALLER already holds it, so creation can never escalate."
         ),
     )
+    credential_expires_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When the credential minted by this request should stop working. "
+            "OPTIONAL, and omitting it means the credential does not expire — "
+            "which is how every credential behaved before this field existed, "
+            "so leaving it out changes nothing.\n\n"
+            "NAMED FOR THE CREDENTIAL, NOT THE AGENT, because only one of the "
+            "two can expire. The agent is the identity that outlives its "
+            "secrets: it is what keeps historical runs attributed after a "
+            "credential is rotated out, and `service_accounts` has no expiry "
+            "column. An `expires_at` here would read as an agent that stops "
+            "existing, which is not something this API can do — revocation is "
+            "the only way an agent ends.\n\n"
+            "Mint further credentials, with their own lifetimes, through "
+            "`POST /developer/agents/{agent_id}/credentials`. Must be in the "
+            "future; a credential born expired authenticates nothing."
+        ),
+    )
 
 
 class UpdateAgentRequest(_AgentFields):
@@ -212,6 +253,22 @@ class CreateAgentCredentialRequest(BaseModel):
     name: str = Field(
         max_length=_NAME_MAX,
         description="How this credential is recognised in the list — 'CI', 'laptop'.",
+    )
+    expires_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When this credential should stop working. OPTIONAL, and omitting "
+            "it means the credential does not expire — which is how every "
+            "credential behaved before this field existed, so leaving it out "
+            "changes nothing.\n\n"
+            "Set it for anything you can rotate: a CI runner, a short-lived "
+            "experiment, a laptop. Rotate by minting the replacement, pointing "
+            "the tool at it, and revoking the old one once the new one works — "
+            "an expiry that arrives before you have done that is an outage, not "
+            "a safeguard.\n\n"
+            "Must be in the future; a credential born expired authenticates "
+            "nothing."
+        ),
     )
 
     @field_validator("name")

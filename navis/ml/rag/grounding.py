@@ -34,6 +34,33 @@ class Grounding:
     # positional ones in tests/ml — is unaffected. Never rendered into the prompt;
     # `render()` emits `source` only, so this adds no tokens.
     lineage: tuple[str, ...] = ()
+    # ── WHICH entity this fact is about ──────────────────────────────────────
+    #
+    # `source` cannot answer this, because what it points at DEPENDS ON `kind`:
+    # a state fact's source IS its entity_id, but a reasoning fact's source is
+    # the signal_id of the conclusion — which identifies the reasoning, not its
+    # subject. So a consumer reading `source` uniformly gets the subject for one
+    # layer and something else entirely for another, with no way to tell which.
+    #
+    # That is how "relationship is cooling" reached an agent with no machine
+    # answer to "WHICH relationship?". `reasoning_text` had already been taught
+    # to name the subject in prose, so a human reader was served; nothing
+    # carried the canonical id, so no consumer could join the conclusion to the
+    # entity, fetch it, or agree with the other surface about what it was about.
+    #
+    # NULL IS A REAL ANSWER HERE, not a gap to fill. An org-wide conclusion
+    # (priority_load, meeting_overload) and a Learning aggregate have no single
+    # subject, and `ReasoningSignal.entity_type/entity_id` are themselves
+    # nullable for exactly that reason. Never inferred from `text` — a subject
+    # guessed out of claim wording is the failure mode this field exists to
+    # remove, not a fallback for it.
+    #
+    # Optional and last, following `lineage`: every existing construction site,
+    # including the positional ones in tests, is unaffected. NOT rendered into
+    # the prompt — `render_line` is unchanged, so the token budget and the
+    # Application's prompt bytes are identical and this costs no tokens.
+    subject_type: str | None = None
+    subject_id: str | None = None
 
     def render_line(self, index: int) -> str:
         """This fact EXACTLY as it appears in the prompt.

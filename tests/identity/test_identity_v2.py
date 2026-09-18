@@ -14,7 +14,7 @@ from navis.identity.apikeys import ApiKeyService, _hash
 from navis.identity.audit import AuditAction, AuditService
 from navis.identity.authz import Principal, require_permission
 from navis.identity.members import MemberError, MemberService
-from navis.identity.models import Membership, Role, User
+from navis.identity.models import Membership, OrganizationKind, Role, User
 from navis.identity.permissions import Permission
 from navis.identity.service_accounts import ServiceAccountService
 from navis.identity.tokens import TokenRevocationService, token_predates_bulk_revoke
@@ -30,8 +30,12 @@ FORBIDDEN = {"signals", "memory", "state", "reasoning", "decisions",
 
 def test_default_role_permissions_are_data():
     assert P.Permission.EXECUTE_ACTIONS in P.default_permissions_for_role("founder")
+    # `employee` is the minimal APPLICATION role. Since P1-6 it no longer carries
+    # `view_decisions` — a Developer-surface permission that gated
+    # `/developer/decisions`, so holding it gave every employee a Developer read
+    # nobody had granted them.
     assert P.default_permissions_for_role("employee") == frozenset(
-        {Permission.VIEW_DECISIONS, Permission.VIEW_SIGNALS}
+        {Permission.VIEW_SIGNALS}
     )
     assert Permission.EXECUTE_ACTIONS not in P.default_permissions_for_role("employee")
 
@@ -343,6 +347,234 @@ async def test_member_invite_assign_remove():
     # And every mutation was audited.
     actions = {a.action for a in await AuditService(db).list_for_org(ORG_A)}
     assert {AuditAction.MEMBER_INVITE, AuditAction.ROLE_CHANGE, AuditAction.MEMBER_REMOVE} <= actions
+
+
+# ---- P0-4: the personal workspace -------------------------------------------
+#
+# A solo developer had to invent a company to reach the Developer surface, and
+# the tenant that came out was indistinguishable from a real one. These pin the
+# smallest model that fixes it: `organizations.kind` carries PRODUCT meaning,
+# and nothing else changes. Authorization still reads `memberships.role` alone.
+
+
+def test_signup_can_omit_an_organization_name():
+    """Omitting it is the explicit signal for "I have no company"."""
+    from navis.identity.schemas import SignupRequest
+
+    named = SignupRequest(
+        email="dev@acme.com", password="Str0ngPass!x", organization_name="Acme"
+    )
+    assert named.organization_name == "Acme"
+
+    solo = SignupRequest(email="dev@acme.com", password="Str0ngPass!x")
+    assert solo.organization_name is None, (
+        "a solo developer must be able to sign up without naming a company"
+    )
+
+
+def test_a_personal_workspace_is_named_after_the_person_not_their_address():
+    """The label is rendered in the console and in `/developer/me`; an email
+    address is more than a display name needs to carry."""
+    from navis.identity.service import _personal_workspace_name
+
+    assert _personal_workspace_name("Dana Reed", "dana@acme.com") == "Dana Reed"
+    assert _personal_workspace_name(None, "dana@acme.com") == "dana"
+    assert _personal_workspace_name("   ", "dana@acme.com") == "dana"
+    # Total, never empty: `OrgLifecycleSeam.create` rejects a blank name and a
+    # signup must not fail for want of a display string.
+    assert _personal_workspace_name(None, "@acme.com") == "Personal workspace"
+
+
+def test_org_creation_still_defaults_to_a_company():
+    """Every existing call site produces exactly the row it produced before."""
+    import inspect
+
+    from navis.identity.models import OrganizationKind
+    from navis.identity.org_service import OrgLifecycleSeam
+
+    default = inspect.signature(OrgLifecycleSeam.create).parameters["kind"].default
+    assert default is OrganizationKind.COMPANY
+
+
+async def test_a_personal_workspace_refuses_a_second_member():
+    """"One person's own space" with three members is a false statement about
+    the tenant, and the classification is read by the console and the
+    Developer surface."""
+    from navis.identity.models import Organization, OrganizationKind
+    from navis.identity.permissions import ALL_PERMISSIONS
+
+    db = FakeSession()
+    workspace = Organization(name="Dana Reed", slug="dana-reed", kind=OrganizationKind.PERSONAL.value)
+    workspace.id = ORG_A
+    db.add(workspace)
+
+    with pytest.raises(MemberError, match="personal workspace"):
+        await MemberService(db).invite(
+            org_id=ORG_A, email="colleague@acme.com", role=Role.EMPLOYEE,
+            actor_id=ACTOR, actor_permissions=ALL_PERMISSIONS,
+        )
+
+
+async def test_a_company_still_accepts_members():
+    """The guard is about the workspace KIND, not a new restriction on invites."""
+    from navis.identity.models import Organization, OrganizationKind
+    from navis.identity.permissions import ALL_PERMISSIONS
+
+    db = FakeSession()
+    company = Organization(name="Acme", slug="acme", kind=OrganizationKind.COMPANY.value)
+    company.id = ORG_A
+    db.add(company)
+
+    membership = await MemberService(db).invite(
+        org_id=ORG_A, email="colleague@acme.com", role=Role.EMPLOYEE,
+        actor_id=ACTOR, actor_permissions=ALL_PERMISSIONS,
+    )
+    assert membership.role == Role.EMPLOYEE
+
+
+def test_a_workspace_owner_can_administer_their_own_workspace():
+    """WHY THE CREATOR'S APPLICATION ROLE IS NOT COSMETIC (P0-9B).
+
+    P0-9B asked whether a workspace creator should really be an Application
+    `founder`, since the console was rendering "Application role: Founder" on
+    a one-person workspace and making it look like a company. The console was
+    fixed to say "Workspace ownership: Owner" there — a LABEL — and this test
+    is the reason the stored role was left alone.
+
+    These three permissions are the ones a workspace owner needs to administer
+    their OWN workspace, and all three live on the Application role:
+
+        MANAGE_BILLING       PUT /organization/plan — without it a solo
+                             developer can never upgrade their own plan.
+        MANAGE_MEMBERS       PUT /organization/profile.
+        MANAGE_API_KEYS      the /identity/api-keys lifecycle.
+
+    None of them is reachable from any Developer role, so "give the creator
+    Developer owner and no Application role" would produce a tenant whose
+    owner cannot pay for it. Worse, `MemberService._ensure_grantable` requires
+    a granter to already hold what they grant, so nobody could ever restore
+    them — the same unrecoverable state the last-founder and last-Developer-
+    owner guards exist to prevent.
+
+    Kept as a property of the ROLE, not of the workspace kind: authorization
+    must not read `kind` at all, which the test below pins.
+    """
+    from navis.identity.permissions import (
+        DEVELOPER_ROLE_PERMISSIONS,
+        Permission,
+        default_permissions_for_role,
+    )
+
+    founder = default_permissions_for_role(Role.FOUNDER.value)
+    self_administration = {
+        Permission.MANAGE_BILLING,
+        Permission.MANAGE_MEMBERS,
+        Permission.MANAGE_API_KEYS,
+    }
+    assert self_administration <= founder
+
+    # And no Developer role supplies any of them, which is what makes the
+    # Application role load-bearing rather than redundant.
+    for developer_role, granted in DEVELOPER_ROLE_PERMISSIONS.items():
+        assert not (self_administration & granted), (
+            f"Developer role '{developer_role}' now grants workspace "
+            "self-administration — the Application role may no longer be the "
+            "only thing standing between an owner and their own billing"
+        )
+
+
+def test_workspace_kind_is_not_an_authorization_input():
+    """THE INVARIANT THIS WHOLE CHANGE RESTS ON.
+
+    `kind` classifies what a tenant IS. If it ever reaches
+    `effective_permissions` or a gate, Navis has a second authorization input
+    and the two are free to disagree — which is the failure the surface-RBAC
+    migration deliberately avoided by shipping storage only.
+    """
+    import inspect
+
+    from navis.identity import authz, permissions
+
+    for module in (permissions, authz):
+        source = inspect.getsource(module)
+        assert "OrganizationKind" not in source, (
+            f"{module.__name__} reads the workspace kind — authorization must "
+            "depend on memberships.role alone"
+        )
+        # A TENANT's kind specifically. `Permission.kind` is an unrelated field
+        # on the permission vocabulary itself, so a bare `.kind` match would
+        # read that as a violation and this test would be noise.
+        for attribute in ("organization.kind", "org.kind", "Organization.kind"):
+            assert attribute not in source, (
+                f"{module.__name__} branches on {attribute} — a tenant's "
+                "classification must not reach an authorization decision"
+            )
+
+
+# ---- P0-5: workspace ownership at the Google edge ---------------------------
+#
+# P0-4 made the PASSWORD path able to create a personal workspace. Google could
+# not: it created a company named after the person for everybody, so a solo
+# developer arriving through the only button the console shows got a tenant
+# that claimed to be a company. These pin the fix and, more importantly, its
+# blast radius — intent is honoured when STATED and inferred never.
+
+
+def test_google_signup_can_state_a_workspace_kind():
+    from navis.identity.schemas import GoogleAuthRequest
+
+    personal = GoogleAuthRequest(code="x", workspace_kind=OrganizationKind.PERSONAL)
+    assert personal.workspace_kind is OrganizationKind.PERSONAL
+
+    company = GoogleAuthRequest(
+        code="x", workspace_kind=OrganizationKind.COMPANY, organization_name="Dignatara Space"
+    )
+    assert company.organization_name == "Dignatara Space"
+
+
+def test_google_signup_without_a_stated_kind_is_unchanged():
+    """THE COMPATIBILITY PROPERTY. Every caller that existed before this field
+    sends neither, and must keep creating exactly the company it created."""
+    from navis.identity.schemas import GoogleAuthRequest
+
+    request = GoogleAuthRequest(code="x")
+    assert request.workspace_kind is None
+    assert request.organization_name is None
+
+
+def test_a_personal_google_workspace_refuses_a_company_name():
+    """A caller asking for a personal workspace AND naming a company believes
+    it is creating something other than what it asked for. Refused rather than
+    silently dropped — dropping it is how somebody discovers a week later that
+    their workspace is called their own name."""
+    import pydantic
+
+    from navis.identity.schemas import GoogleAuthRequest
+
+    with pytest.raises(pydantic.ValidationError, match="named after its owner"):
+        GoogleAuthRequest(
+            code="x",
+            workspace_kind=OrganizationKind.PERSONAL,
+            organization_name="Dignatara Space",
+        )
+
+
+def test_the_session_contract_publishes_the_workspace_kind():
+    """Published so a surface can stop asking for what cannot apply.
+
+    `OnboardingStage` is an Application ladder — profile, Gmail, calendar,
+    first brief. A personal workspace never climbs it, so a console that
+    cannot tell the kinds apart nags a developer forever about onboarding they
+    have nothing to finish. That is the fake Application activation step this
+    field removes.
+    """
+    from navis.identity.schemas import OrganizationOut
+
+    assert "kind" in OrganizationOut.model_fields
+    rendered = OrganizationOut(
+        id=ORG_A, name="Dana Reed", slug="dana-reed", kind=OrganizationKind.PERSONAL
+    )
+    assert rendered.kind is OrganizationKind.PERSONAL
 
 
 async def test_refresh_is_bound_to_its_user():

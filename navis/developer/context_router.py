@@ -48,7 +48,11 @@ from navis.developer.schemas import DEVELOPER_ERRORS_GATED, DeveloperContextBund
 from navis.identity.permissions import Permission
 from navis.identity.throttle import rate_limit
 from navis.organization.contract import Capability
-from navis.orchestration.context import ContextLayers, build_grounded_context
+from navis.orchestration.context import (
+    DEVELOPER_STATE_TIMEOUT_S,
+    ContextLayers,
+    build_grounded_context,
+)
 from navis.platform.database import AsyncSessionLocal, get_session
 from navis.platform.monitoring import get_logger
 
@@ -306,6 +310,24 @@ async def developer_context_for_task(
             # It is also what makes the concurrency below safe — see
             # `build_grounded_context`, which gates on exactly this flag.
             read_only=True,
+            # NOT AN INTERACTIVE TURN, so not bounded like one. The chat bound
+            # (4.0s) was sized when a warm read measured p95 1.6s; on this
+            # deployment the same read is p50 3.3s with excursions past 4.0s,
+            # which is what made this boundary shed the State and Reasoning
+            # layers roughly one call in six. An agent request already runs
+            # 17-25s end to end, so waiting for the projection is strictly
+            # better for it than a fast, thinner answer. A genuinely cold fold
+            # is still refused and still degrades explicitly.
+            state_timeout_s=DEVELOPER_STATE_TIMEOUT_S,
+            # DATA MINIMIZATION FOR AN EXTERNAL AGENT. The memory layer is
+            # re-rendered from the stored record without raw message bodies:
+            # what is right to EMBED for similarity is not automatically right
+            # to hand a model running outside Navis. Holding `view_memory` on
+            # this organization authorizes the organizational fact — the subject
+            # line, the participants, the commitment — not the inbox. `/chat`
+            # does not set this; see `minimize_memory_facts` for why the
+            # asymmetry is deliberate.
+            minimize_memory=True,
             layers=layers,
             since=body.since,
             until=body.until,
@@ -341,6 +363,15 @@ async def developer_context_for_task(
             # the drill-down for a fact that was DERIVED rather than retrieved.
             # Empty for a fact whose single `source` already IS its provenance.
             "lineage": list(f.lineage),
+            # WHICH entity the claim is about, when the producing layer knows.
+            # Emitted as null — not omitted, and never guessed — when it does
+            # not: an org-wide conclusion has no subject, and inventing one from
+            # the claim text would be a fabricated attribution.
+            "subject": (
+                {"entity_type": f.subject_type, "entity_id": f.subject_id}
+                if f.subject_type is not None and f.subject_id is not None
+                else None
+            ),
         }
         for f in context.facts
     ]
@@ -371,6 +402,14 @@ async def developer_context_for_task(
             ),
             "state_watermark": composed.state_watermark,
             "state_available": composed.state_available,
+            # WHY the state layer is missing, when it is: "absent" (no
+            # snapshot, cold organization), "timeout" (a snapshot exists but
+            # the read exceeded this caller's bound — retrying may succeed),
+            # "failed" (the read raised), "withheld" (this credential may not
+            # read it; also in `layers.withheld`). Null when state IS
+            # available. Reported so a reader stops having to guess which of
+            # four situations a bare `false` meant.
+            "state_degraded_reason": composed.state_degraded_reason,
         },
         "sources": {
             # Intent, exactly as before — same labels, same order, same rule.

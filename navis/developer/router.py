@@ -88,7 +88,13 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from navis.developer.gateway import DeveloperContext, get_developer_context, require_developer
+from navis.developer.gateway import (
+    AGENT_MANAGEMENT_PERMISSIONS,
+    DeveloperContext,
+    get_developer_context,
+    require_developer,
+    require_developer_any,
+)
 from navis.developer.schemas import (
     DEVELOPER_ERRORS,
     DEVELOPER_ERRORS_GATED,
@@ -209,7 +215,7 @@ async def developer_me(
 )
 async def developer_permissions(
     ctx: DeveloperContext = Depends(
-        require_developer(Permission.MANAGE_SERVICE_ACCOUNTS, Capability.STATE)
+        require_developer_any(AGENT_MANAGEMENT_PERMISSIONS, Capability.STATE)
     ),
 ) -> DeveloperPermissionCatalogOut:
     """The canonical catalog, served from the module that DEFINES the vocabulary.
@@ -228,8 +234,14 @@ async def developer_permissions(
     A client that ignored both fields entirely could not escalate past the Core,
     because the Core re-checks the grant itself.
 
-    GATED ON `manage_service_accounts`, matching the agent surface it serves. It
-    reports no organizational data at all — a fixed vocabulary, plus a
+    GATED ON THE SAME PAIR AS THE AGENT ROUTES — `manage_service_accounts` or
+    `manage_own_agents` (P1-7) — matching the agent surface it serves. When it
+    required the organization-wide permission alone, a self-serve developer was
+    allowed to register an agent and handed an empty catalog to choose its
+    permissions from, so the form they could submit had nothing to tick. The
+    shared `AGENT_MANAGEMENT_PERMISSIONS` is what keeps the two in step.
+
+    It reports no organizational data at all — a fixed vocabulary, plus a
     projection of the caller's own permissions, which `/developer/me` already
     returns to that same caller.
     """
@@ -265,7 +277,7 @@ async def developer_context(
     ),
     db: AsyncSession = Depends(get_session),
 ) -> Any:
-    """Exactly what `GET /context` serves, to a machine caller.
+    """Exactly what `GET /context` serves, to a machine caller, plus event time.
 
     Delegates to `context_router.context_bundle`, so the scoped view, the policy
     resolution, the state fold and the audit log line are the web edge's own —
@@ -274,10 +286,65 @@ async def developer_context(
     `user_id` is NOT accepted. The web edge takes it for frontend compatibility
     and ignores it (Phase 1 scoping is org-wide); repeating an ignored identity
     parameter on a machine contract would invite a client to depend on it.
+
+    ── WHY THIS ROUTE ADDS ONE FIELD THE WEB EDGE DOES NOT ──────────────────
+    `ScopedView` publishes `as_of`, which is OBSERVATION time — when Navis last
+    folded something. On its own it reads as "this is current", and it is not:
+    the newest fact a projection holds can be weeks older than the moment it
+    was folded. A person reading the console has the organization around the
+    answer and notices; an agent has the answer alone and does not, and an
+    agent that presents a three-week-old organization as current makes
+    decisions on it.
+
+    `POST /developer/context` has published `newest_fact_at` beside `as_of`
+    since the freshness contract was written. This route did not, so the two
+    Developer context routes disagreed about what freshness means — and this
+    is the one an MCP client reaches first.
+
+    ── THE VALUE IS READ, NEVER COMPUTED ───────────────────────────────────
+    `state.fold_frontier.last_event_timestamp` — the same field, from the same
+    Core service, that `orchestration.context.state_groundings` reads for the
+    POST route. State has always maintained it for its own correctness (it is
+    how an out-of-order record is detected and forced into a rebuild). There is
+    no second freshness calculation here and no new source: nothing is derived,
+    no connector is consulted, and no synchronization is triggered.
+
+    ── READ-ONLY, AND ONE STATE READ MORE THAN BEFORE ──────────────────────
+    `read_only_state` never folds, never rebuilds and never disposes — the same
+    read the POST route takes, for the same reason. `context_bundle` has just
+    saved and cached this projection, so this resolves on `StateService`'s warm
+    path rather than re-deriving anything.
+
+    ── A MISMATCHED PAIR IS REPORTED AS ABSENT ─────────────────────────────
+    If State moved between the scoping read and this one, the frontier belongs
+    to a different projection than `as_of` does. Publishing it anyway would
+    understate the gap — the one direction that matters, because the whole
+    point of the field is to expose staleness. So the watermarks are compared
+    and a mismatch answers null, which the contract already defines as unknown.
     """
     from navis.api.context_router import context_bundle
+    from navis.state.v2 import StateService
 
-    return await context_bundle(user_id=None, p=ctx.principal, db=db)
+    body = await context_bundle(user_id=None, p=ctx.principal, db=db)
+
+    state = await StateService(db).read_only_state(ctx.organization_id)
+    newest_fact_at = None
+    if state is not None:
+        watermark = (
+            str(state.watermark.last_memory_id)
+            if state.watermark.last_memory_id
+            else None
+        )
+        # `scope_for` builds `state_watermark` from this exact field, so equality
+        # here means the two values describe one projection rather than two.
+        if watermark == body.get("state_watermark"):
+            frontier = state.fold_frontier.last_event_timestamp
+            newest_fact_at = frontier.isoformat() if frontier else None
+
+    # ADDITIVE. Every key `context_bundle` returned is untouched and in the same
+    # place; the dict it hands back is this route's to extend, and the web edge
+    # returns its own — the Application's `GET /context` is not reached by this.
+    return {**body, "newest_fact_at": newest_fact_at}
 
 
 @router.get(

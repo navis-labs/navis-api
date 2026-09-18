@@ -233,8 +233,18 @@ def test_free_text_is_bounded_and_scrubbed():
     with pytest.raises(PayloadTooLarge):
         sanitize_text("x" * 11, field="description", limit=10)
 
+    # ── The credential goes; the sentence stays ───────────────────────
+    # This asserted `== REDACTED` — the whole value replaced — until that
+    # rule destroyed a 2,637-character agent checkpoint in production over
+    # one credential-shaped phrase. Free text is now scrubbed span by span.
+    # The property that matters is unchanged and is asserted directly: the
+    # secret must not be in the output.
     pasted = "curl -H 'Authorization: Bearer abcdefghijklmnop' https://x"
-    assert sanitize_text(pasted, field="description", limit=200) == REDACTED
+    cleaned = sanitize_text(pasted, field="description", limit=200)
+
+    assert "abcdefghijklmnop" not in cleaned
+    assert REDACTED in cleaned
+    assert cleaned.startswith("curl -H")
 
 
 def test_the_redaction_marker_is_not_a_hash_or_a_prefix():
@@ -257,3 +267,100 @@ def test_page_sizes_are_bounded():
 
 def test_a_run_cannot_hold_unlimited_steps():
     assert L.MAX_STEPS_PER_RUN > 0
+
+
+# ── Free text is scrubbed, not destroyed ────────────────────────────────────
+
+
+class TestFreeTextRedactsSpansNotDocuments:
+    """THE PRODUCTION DATA LOSS THIS CLOSES.
+
+    `sanitize_text` used to return `[redacted]` for the WHOLE value when any
+    pattern matched anywhere in it. On a metadata value that is defensible —
+    the value is the credential. On free text it is destruction: these fields
+    hold a task description and an agent's outcome summary, which are
+    paragraphs.
+
+    Observed on this platform's own ledger: a 2,637-character checkpoint
+    recording a day of engineering work was stored as the ten characters
+    "[redacted]", because it contained the phrase "Bearer tokens". The write
+    returned 200, the client reported success, the next session restored an
+    empty checkpoint — and the blanked row, being newest, hid an older intact
+    one underneath it.
+    """
+
+    NAVIS_KEY = "navis_f364260edba0f931_rdixdSnD-2_OivkRHZYPZXBmyAhtwHRJddokU"
+    BEARER = "sk-live-9fA3kZ2mQ7xR4tB8nW1cY6vE0pL5dH"
+    PEM_BODY = "MIIEowIBAAKCAQEA7x9ZqSecretKeyMaterialHere"
+
+    def _clean(self, text: str) -> str:
+        return sanitize_text(text, field="summary", limit=4000)
+
+    def test_a_paragraph_mentioning_bearer_tokens_survives(self):
+        """The exact phrase that destroyed a real checkpoint."""
+        note = (
+            "CURRENT TASK: work state\n"
+            "OPEN:\n"
+            "- item 3 is about Bearer tokens in headers, keeping the header name\n"
+            "- and several other things that must not be lost"
+        )
+        assert self._clean(note) == note
+
+    def test_one_credential_costs_only_the_credential(self):
+        note = (
+            "OPEN:\n"
+            "- the failing request was:\n"
+            f'  curl -H "Authorization: Bearer {self.BEARER}" https://api\n'
+            "- everything after this line must survive"
+        )
+        cleaned = self._clean(note)
+
+        assert self.BEARER not in cleaned
+        assert "everything after this line must survive" in cleaned
+        assert "the failing request was" in cleaned
+
+    # ── Span replacement is only safe if a pattern eats the WHOLE secret ──
+    # While a match blanked the entire field, a prefix-only pattern was still
+    # safe. Replacing the span alone, it deletes the recognisable part and
+    # publishes the rest.
+
+    def test_a_navis_key_is_consumed_whole(self):
+        cleaned = self._clean(f"the {self.NAVIS_KEY} key")
+        assert "rdixdSnD" not in cleaned
+        assert self.NAVIS_KEY not in cleaned
+
+    def test_a_private_key_block_is_consumed_whole(self):
+        pem = (
+            f"-----BEGIN RSA PRIVATE KEY-----\n{self.PEM_BODY}\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        cleaned = self._clean(f"here it is:\n{pem}\ndone")
+
+        assert self.PEM_BODY not in cleaned
+        assert "here it is:" in cleaned and "done" in cleaned
+
+    def test_a_truncated_private_key_is_still_consumed(self):
+        cleaned = self._clean(f"-----BEGIN RSA PRIVATE KEY-----\n{self.PEM_BODY}")
+        assert self.PEM_BODY not in cleaned
+
+    @pytest.mark.parametrize(
+        "secret",
+        [
+            "ghp_abcdefghijklmnopqrstuvwxyz012345",
+            "xoxb-1234567890-abcdefghij",
+            "AKIAIOSFODNN7EXAMPLE",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijk",
+        ],
+    )
+    def test_every_vendor_shape_is_still_redacted(self, secret: str):
+        assert secret not in self._clean(f"the value is {secret} in a sentence")
+
+    def test_sanitizing_twice_changes_nothing(self):
+        """No pattern may match `[redacted]`, or a value degrades on every
+        pass through the boundary."""
+        once = self._clean(f'Authorization: Bearer {self.BEARER}')
+        assert self._clean(once) == once
+
+    def test_ordinary_prose_is_returned_byte_for_byte(self):
+        prose = "Bearer of bad news; the authorization model needs review."
+        assert self._clean(prose) == prose

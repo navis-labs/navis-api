@@ -148,6 +148,19 @@ class ChatCitation(BaseModel):
     # Empty for a fact that is already its own lowest level (a memory record) or
     # that recorded no lineage. Never synthesised.
     lineage: list[str] = Field(default_factory=list)
+    # WHICH entity the cited fact is about, as `{"entity_type", "entity_id"}`.
+    #
+    # The SAME canonical pair `POST /developer/context` publishes, from the same
+    # `Grounding` — so the Application and an agent cannot disagree about who a
+    # conclusion concerns. Previously a reasoning citation reached the frontend
+    # carrying only the signal_id, which identifies the conclusion and not its
+    # subject.
+    #
+    # Additive and defaulted: an older client that does not read it is
+    # unaffected, exactly as with `lineage` above. `None` where the producing
+    # layer holds no authoritative subject — an org-wide conclusion has none —
+    # and never inferred from `detail`.
+    subject: dict[str, str] | None = None
 
 
 class ChatEntity(BaseModel):
@@ -457,7 +470,12 @@ _CITATION_TYPE_BY_KIND: dict[str, str] = {
 
 
 def _citation(
-    kind: str, source: str, text: str, lineage: tuple[str, ...] = ()
+    kind: str,
+    source: str,
+    text: str,
+    lineage: tuple[str, ...] = (),
+    subject_type: str | None = None,
+    subject_id: str | None = None,
 ) -> ChatCitation:
     """One grounded fact as a wire citation, carrying its drill-down.
 
@@ -477,6 +495,14 @@ def _citation(
         source=source,
         detail=(text or "")[:200] or None,
         lineage=list(lineage),
+        # Both halves or nothing: a subject missing either one is not a
+        # resolvable identity, and shipping a partial would invite the frontend
+        # to link to an entity it cannot fetch.
+        subject=(
+            {"entity_type": subject_type, "entity_id": subject_id}
+            if subject_type is not None and subject_id is not None
+            else None
+        ),
     )
 
 
@@ -594,7 +620,7 @@ async def _grounded_answer(
         return (
             "The reasoning model is temporarily unavailable, but here's "
             f"what your memory has on this:\n\n{cited_lines}",
-            [_citation(f.kind, f.source, f.text, f.lineage) for f in context.facts[:5]],
+            [_citation(f.kind, f.source, f.text, f.lineage, f.subject_type, f.subject_id) for f in context.facts[:5]],
             state_watermark,
         )
 
@@ -604,7 +630,7 @@ async def _grounded_answer(
     # citation refers to.
     fact_by_source = {f.source: f for f in context.facts}
     citations = [
-        _citation(f.kind, f.source, f.text, f.lineage)
+        _citation(f.kind, f.source, f.text, f.lineage, f.subject_type, f.subject_id)
         for src in narrative.sources[:5]
         if (f := fact_by_source.get(src)) is not None
     ]

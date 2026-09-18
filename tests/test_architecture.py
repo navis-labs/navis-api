@@ -198,6 +198,15 @@ def _closure_values(dep) -> set:
     `require_capability` closures, and the strings live one level further in. A
     walker that read only the outermost cells would find nothing and report every
     route as ungated — which is a test that fails safe, but never passes.
+
+    ALSO FLATTENS CAPTURED TUPLES AND LISTS. `require_developer_any` takes the
+    several permissions that may reach a route (P1-7: organization-wide agent
+    administration OR the self-serve own-agents grant) and closes over the
+    SEQUENCE, so the permission strings sit one container deep. Without this the
+    agent routes read as `permissions=[]` and the gate test below reported them
+    ungated, which was a false alarm about real gates rather than a real finding.
+    The invariant it protects is unchanged: at least one genuine `Permission`
+    must still be discoverable per route.
     """
     found: set = set()
     seen_fns: set[int] = set()
@@ -213,6 +222,18 @@ def _closure_values(dep) -> set:
                 continue
             if callable(value):
                 read_fn(value)
+                continue
+            # A sequence of gate arguments — record the MEMBERS, not the
+            # container, so a permission inside one is as visible as a
+            # permission captured directly. Deliberately not recursive beyond
+            # one level and deliberately not applied to str/bytes (which are
+            # themselves iterable and would explode into characters).
+            if isinstance(value, (tuple, list, frozenset, set)):
+                for member in value:
+                    try:
+                        found.add(member)
+                    except TypeError:
+                        continue
                 continue
             try:
                 found.add(value)

@@ -361,6 +361,9 @@ async def test_freshness_travels_with_the_bundle(monkeypatch):
         "newest_fact_at": NEWEST_FACT_AT.isoformat(),
         "state_watermark": WATERMARK,
         "state_available": True,
+        # Null BECAUSE state is available — the field explains an absence, so
+        # on the healthy path there is nothing for it to say.
+        "state_degraded_reason": None,
     }
 
 

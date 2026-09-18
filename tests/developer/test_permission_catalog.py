@@ -157,10 +157,35 @@ def test_the_catalog_route_reports_grantability_from_the_caller_not_the_catalog(
 
 def test_the_catalog_route_is_gated_and_names_no_organization():
     """Consistent with the agent surface it serves, and — like every Developer
-    route — it takes no tenant parameter."""
+    route — it takes no tenant parameter.
+
+    SINCE P1-7 "consistent with the agent surface" IS THE ASSERTION, rather than
+    a particular permission name. The agent routes accept either
+    `manage_service_accounts` or `manage_own_agents`, and this route has to
+    accept exactly the same callers: a self-serve developer allowed to register
+    an agent and handed an empty catalog would be given a form with nothing to
+    tick. Pinning the SHARED constant is what makes the two unable to drift,
+    which naming one permission here could not do.
+    """
+    from navis.developer.gateway import AGENT_MANAGEMENT_PERMISSIONS
+
     source = inspect.getsource(developer_permissions)
-    assert "Permission.MANAGE_SERVICE_ACCOUNTS" in source
+    assert "require_developer_any(AGENT_MANAGEMENT_PERMISSIONS" in source
+    # And the constant is the pair the agent routes gate on.
+    assert set(AGENT_MANAGEMENT_PERMISSIONS) == {
+        Permission.MANAGE_SERVICE_ACCOUNTS,
+        Permission.MANAGE_OWN_AGENTS,
+    }
 
     signature = inspect.signature(developer_permissions)
     assert "organization_id" not in signature.parameters
     assert "organization" not in signature.parameters
+
+
+def test_the_catalog_and_the_agent_routes_admit_the_same_callers():
+    """The invariant the previous test's constant exists to protect, stated
+    directly: both modules must gate on the SAME object, not on equal copies."""
+    from navis.developer.agents_router import _AGENT_PERMISSIONS
+    from navis.developer.gateway import AGENT_MANAGEMENT_PERMISSIONS
+
+    assert _AGENT_PERMISSIONS is AGENT_MANAGEMENT_PERMISSIONS

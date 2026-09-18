@@ -84,6 +84,15 @@ class ApiKey(UUIDPrimaryKey, Timestamped, Base):
     )
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: When this credential stops authenticating. NULL means it does not expire,
+    #: which is what every credential minted before 0052 is.
+    #:
+    #: SEPARATE FROM `revoked_at` ON PURPOSE. `revoked_at` is a decision somebody
+    #: made; this is a limit chosen when the credential was minted. A key can be
+    #: both, an audit needs to tell them apart, and authentication refuses
+    #: either. See `credential_status_of` for the one derivation both the API and
+    #: the console read.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ServiceAccount(UUIDPrimaryKey, Timestamped, Base):

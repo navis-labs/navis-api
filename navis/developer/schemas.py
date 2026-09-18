@@ -179,10 +179,38 @@ class DeveloperStateOut(BaseModel):
 
 
 class DeveloperContextOut(BaseModel):
-    """The intent-scoped view over State — `ScopedView.to_dict`, verbatim."""
+    """The intent-scoped view over State — `ScopedView.to_dict`, plus freshness.
+
+    `newest_fact_at` is the ONE field this contract adds to the web edge's view,
+    and it is additive: every other key is `ScopedView.to_dict` verbatim, in the
+    same place, with the same value. The Application's `GET /context` is
+    unchanged and does not carry it.
+
+    IT IS HERE BECAUSE A MACHINE CALLER CANNOT ASK TWICE. A human reading the
+    console sees the organization around the answer; an agent sees the answer
+    alone, and `as_of` on its own reads as "this is current". See
+    `DeveloperContextFreshnessOut`, which `POST /developer/context` already
+    publishes — this makes the two routes agree about what freshness means.
+    """
 
     intent: str
     as_of: str | None
+    #: EVENT time: when the most recent fact in this projection actually
+    #: happened. Read from the same `state.fold_frontier` the POST route
+    #: publishes, at the same watermark this view was scoped at.
+    #:
+    #: NOT the same as `as_of`, and the gap between them is the point. `as_of`
+    #: is OBSERVATION time — when Navis last folded something. A backfill or a
+    #: replay writes memory rows today carrying last month's event timestamps,
+    #: which advances `as_of` while the organization's actual knowledge stands
+    #: still. `as_of` moving while this does not is the signature of a broken
+    #: ingestion pipeline.
+    #:
+    #: Null when State holds no usable snapshot, when nothing has been folded
+    #: yet, or when State moved between the scoping read and this one — in that
+    #: last case a value would describe a different moment than `as_of`, and an
+    #: honest absence is better than a mismatched pair.
+    newest_fact_at: str | None = None
     state_watermark: str | None
     policy_version: int | None
     counts: dict[str, int]
@@ -370,6 +398,29 @@ class DeveloperDecisionsOut(BaseModel):
     reasoning_version: int | None = None
 
 
+class DeveloperFactSubjectOut(BaseModel):
+    """WHICH organizational entity a fact is about.
+
+    The canonical `(entity_type, entity_id)` pair, passed through from the layer
+    that produced the fact. Resolve it with `GET /developer/entities/{type}/{id}`
+    — it is the same id State and the Application use, not a Developer-only
+    handle.
+
+    Distinct from the fact's `source`, which identifies WHERE THE CLAIM CAME
+    FROM. For a state fact the two coincide; for a reasoning fact `source` is
+    the signal_id of the conclusion and this is the entity it concerns. A
+    consumer reading only `source` therefore gets the subject for some layers
+    and the wrong thing for others.
+
+    No `name` field: State's label is already rendered into the fact's `text` by
+    the layer that owns what an entity is called. Repeating it here would be a
+    second naming path that could disagree with the first.
+    """
+
+    entity_type: str = Field(description="Canonical entity type, e.g. `relationship`.")
+    entity_id: str = Field(description="Canonical entity id, as State holds it.")
+
+
 class DeveloperGroundedFactOut(BaseModel):
     """One cited fact, exactly as `ml.rag.grounding.Grounding` carries it.
 
@@ -399,6 +450,19 @@ class DeveloperGroundedFactOut(BaseModel):
             "`source` already is its provenance."
         ),
     )
+    subject: DeveloperFactSubjectOut | None = Field(
+        default=None,
+        description=(
+            "WHICH entity this fact is about, when the producing layer knows. "
+            "NULL IS MEANINGFUL AND COMMON: an org-wide conclusion "
+            "(`priority_load`, `meeting_overload`) and a Learning aggregate have "
+            "no single subject, and a memory fact carries its subject through "
+            "`source` instead. A null subject means Navis does not hold an "
+            "authoritative one — it is never a cue to infer the entity from the "
+            "claim text, and doing so would attribute a real conclusion to the "
+            "wrong entity."
+        ),
+    )
 
 
 class DeveloperContextFreshnessOut(BaseModel):
@@ -421,10 +485,12 @@ class DeveloperContextFreshnessOut(BaseModel):
     ingestion pipeline, and it is the single most useful thing on this object.
     Cross-reference `sources` before concluding an organization is merely quiet.
 
-    `state_available: false` means the organization has no usable snapshot and
-    this route DECLINED TO BUILD ONE — a read must not trigger a full fold of an
-    organization's memory. It is not the same as an organization with nothing in
-    it, and an agent that reports it that way is wrong.
+    `state_available: false` means the State and Reasoning layers are not in this
+    bundle. It is NOT the same as an organization with nothing in it, and an
+    agent that reports it that way is wrong. Read `state_degraded_reason` to find
+    out which situation you are actually in — a cold organization, a read that
+    ran out of time, an error, and a permission gate are four different things
+    and only one of them is "there is nothing here".
     """
 
     as_of: str | None = Field(
@@ -448,6 +514,25 @@ class DeveloperContextFreshnessOut(BaseModel):
     )
     state_available: bool = Field(
         description="Whether the State and Reasoning layers reached this bundle at all."
+    )
+    state_degraded_reason: str | None = Field(
+        default=None,
+        description=(
+            "WHY the State layer is missing, when it is. Null when "
+            "`state_available` is true.\n\n"
+            "`absent` — no usable snapshot exists and this route declined to "
+            "build one. The organization is cold; nothing is broken.\n"
+            "`timeout` — a snapshot EXISTS and reading it exceeded this route's "
+            "bound. The organization is NOT cold, this bundle is thinner than "
+            "the data supports, and retrying may succeed. Do not report it as "
+            "an empty organization.\n"
+            "`failed` — the read raised. An error, not a cold tenant.\n"
+            "`withheld` — this credential may not read State; see "
+            "`layers.withheld` for the permission that would open it.\n\n"
+            "No stale state is ever served in any of these cases, and nothing "
+            "is fabricated — this field explains an absence, it does not soften "
+            "one."
+        ),
     )
 
 
@@ -610,8 +695,15 @@ class DeveloperContextBundleOut(BaseModel):
     count: int
     token_estimate: int = Field(
         description=(
-            "What this bundle costs to render, counted the way the budget counts "
-            "it — the whole cited line per fact, not the text alone."
+            "RENDER COST, NOT RESPONSE SIZE. What the facts cost as prompt lines "
+            "— the whole cited line per fact, not the text alone — counted the "
+            "way `CONTEXT_TOKEN_BUDGET` counts it, because this is the figure "
+            "admission control bounds. It is therefore capped near that budget "
+            "by construction and must not be read as the size of this JSON "
+            "document, which is several times larger: the wire response also "
+            "carries per-fact lineage, freshness, layers and source health, none "
+            "of which is rendered into a prompt. A caller predicting its own "
+            "context consumption should measure the response, not read this."
         )
     )
     freshness: DeveloperContextFreshnessOut

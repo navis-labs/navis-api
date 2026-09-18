@@ -415,6 +415,19 @@ class RecordOutcomeRequest(BaseModel):
     )
     produced_at: datetime | None = None
     metadata: dict | None = None
+    if_newer: bool = Field(
+        default=False,
+        description=(
+            "Refuse this write with 409 when the stored outcome already carries a "
+            "`produced_at` at or after the one submitted. A conditional write for "
+            "callers that publish a monotonic series of observations about the same "
+            "run, so a retry or a delayed request cannot replace a newer statement "
+            "with an older one. Ignored when either side has no `produced_at`, since "
+            "a write that does not say when it was observed makes no claim to "
+            "compare. Default `false`: an evaluator or a backfill revising a verdict "
+            "long after the fact is not a stale writer and must not be refused."
+        ),
+    )
 
 
 class OutcomeOut(BaseModel):
@@ -451,6 +464,28 @@ class OutcomeOut(BaseModel):
         )
 
 
+class LatestOutcomeOut(BaseModel):
+    """The newest outcome of one task, with the attempt that produced it.
+
+    BOTH HALVES, because either alone is unusable. The outcome carries the
+    content and the reality clock; the run carries `correlation_id`, which is
+    how a caller knows WHICH session wrote it — the provenance that makes two
+    concurrent sessions distinguishable rather than merely ordered.
+
+    Composed from the existing `OutcomeOut` and `RunOut` rather than flattened
+    into a third shape: a client that already renders a run or an outcome
+    renders these unchanged, and no field means something different here than
+    it does at `/runs/{id}` or `/runs/{id}/outcome`.
+    """
+
+    outcome: OutcomeOut
+    run: RunOut
+
+    @classmethod
+    def of(cls, outcome, run) -> "LatestOutcomeOut":
+        return cls(outcome=OutcomeOut.of(outcome), run=RunOut.of(run))
+
+
 # ── Telemetry rollup ────────────────────────────────────────────────────────
 #
 # WHY A ROLLUP EXISTS AT ALL, when `/runs/{id}`, `/runs/{id}/steps` and
@@ -471,17 +506,65 @@ class OutcomeOut(BaseModel):
 
 
 class ModelUsageOut(BaseModel):
-    """One provider/model pair's share of a run, summed over its generations."""
+    """One provider/model pair's share of a run, summed over its generations.
+
+    EVERY TOKEN FIGURE IS NULLABLE, AND THAT IS THE WHOLE CONTRACT. `null` means
+    no generation of this model reported that measurement; `0` means one did and
+    the count really was zero. They are different facts and this object refuses
+    to merge them.
+
+    It used to. Each field was a non-nullable `int` summed with `or 0`, so a
+    generation whose usage nobody recorded contributed a silent zero — and the
+    row still counted in `generations`. A reader got `generations: 1,
+    input_tokens: 0`, which is indistinguishable from a model that genuinely
+    consumed nothing, and there was no field anywhere that said otherwise. The
+    step rows underneath reported `null` correctly the whole time, so the two
+    routes over one row disagreed about whether a measurement existed.
+
+    THE SEMANTICS MIRROR `EconomicsOut`, deliberately, because this is the same
+    question about a different column:
+
+        null            nothing reported it — the sum would be a fabrication
+        a number        the sum over the generations that DID report it
+        untokened_generations   how many did not, so a partial total is readable
+                                as partial rather than as complete
+
+    A PARTIAL SUM IS STILL PUBLISHED. If two of three generations reported
+    input tokens, `input_tokens` is the sum of those two — a real measurement of
+    a real subset — and `untokened_generations` is 1. Withholding it entirely
+    would lose a figure that was honestly obtained; publishing it without the
+    counter would present two thirds of a run as all of it.
+
+    THE FIELDS ARE INDEPENDENT. A provider may report input and output but not
+    cache or reasoning tokens, so each is decided on its own evidence rather
+    than on whether the generation reported anything at all.
+    """
 
     provider: str | None
     model: str | None
+    #: How many generations of this model the run recorded. A COUNT of rows,
+    #: always known — never null, and never affected by what they measured.
     generations: int
-    input_tokens: int
-    output_tokens: int
-    cached_tokens: int
-    cache_read_tokens: int
-    cache_write_tokens: int
-    reasoning_tokens: int
+    #: Generations above that reported NEITHER input nor output tokens.
+    #:
+    #: The token counterpart of `EconomicsOut.uncosted_generations`, and scoped
+    #: per model rather than per run because that is where the sums it qualifies
+    #: live: "the run has three unmeasured generations" cannot say which model
+    #: they belonged to, and the answer changes what a reader does about it.
+    #:
+    #: Cache and reasoning tokens are deliberately NOT part of this test. Most
+    #: providers never return them, so requiring all six would make every
+    #: ordinary generation look unmeasured and the counter would mean nothing.
+    untokened_generations: int = 0
+    input_tokens: int | None
+    output_tokens: int | None
+    cached_tokens: int | None
+    cache_read_tokens: int | None
+    cache_write_tokens: int | None
+    reasoning_tokens: int | None
+    #: Wall time across this model's generations. NOT a token measurement and
+    #: not covered by the rule above — it is still summed with `or 0`, which is
+    #: its own unknown-versus-zero question and a separate change.
     latency_ms: int
 
 
@@ -560,6 +643,96 @@ class LatencyOut(BaseModel):
     context_ms: int
 
 
+class _TokenTotal:
+    """A running sum that remembers whether anything was ever added to it.
+
+    THE POINT IS THE FLAG, not the sum. `0` is the correct answer for a column
+    that was measured as zero and the wrong answer for one nobody measured, and
+    an `int` alone cannot tell the two apart — which is exactly how `or 0`
+    turned unmeasured generations into zero-token ones. `seen` is what makes
+    `resolve()` able to answer `None` instead of guessing.
+
+    Mirrors the `estimated`/`saw_estimated` pair `EconomicsOut` is built from;
+    this is that pair given a name, because tokens need six of it.
+    """
+
+    __slots__ = ("total", "seen")
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.seen = False
+
+    def add(self, value: int | None) -> None:
+        """A `None` is NOT a zero. It is skipped, and it does not set `seen`."""
+        if value is None:
+            return
+        self.total += value
+        self.seen = True
+
+    def resolve(self) -> int | None:
+        return self.total if self.seen else None
+
+
+class _ModelAccumulator:
+    """One provider/model pair, accumulating across a run's generations.
+
+    Exists because the aggregation needs SEVEN pieces of state per model (six
+    token totals with their flags, plus the untokened count) and the previous
+    rebuild-an-immutable-model-per-step loop had nowhere to keep the flags.
+    Private and local to `RunTelemetryOut.of`, which stays the only place this
+    arithmetic lives.
+    """
+
+    __slots__ = (
+        "provider", "model", "generations", "untokened", "latency_ms",
+        "input", "output", "cached", "cache_read", "cache_write", "reasoning",
+    )
+
+    def __init__(self, *, provider: str | None, model: str | None) -> None:
+        self.provider = provider
+        self.model = model
+        self.generations = 0
+        self.untokened = 0
+        self.latency_ms = 0
+        self.input = _TokenTotal()
+        self.output = _TokenTotal()
+        self.cached = _TokenTotal()
+        self.cache_read = _TokenTotal()
+        self.cache_write = _TokenTotal()
+        self.reasoning = _TokenTotal()
+
+    def add(self, step, latency: int) -> None:
+        self.generations += 1
+        self.latency_ms += latency
+        # UNTOKENED IS DECIDED ON INPUT AND OUTPUT ALONE. Cache and reasoning
+        # tokens are absent from most providers' responses, so counting a
+        # generation as unmeasured because it lacked them would mark nearly
+        # every real generation and the number would carry no information.
+        if step.input_tokens is None and step.output_tokens is None:
+            self.untokened += 1
+        self.input.add(step.input_tokens)
+        self.output.add(step.output_tokens)
+        self.cached.add(step.cached_tokens)
+        self.cache_read.add(step.cache_read_tokens)
+        self.cache_write.add(step.cache_write_tokens)
+        self.reasoning.add(step.reasoning_tokens)
+
+    def resolve(self) -> ModelUsageOut:
+        return ModelUsageOut(
+            provider=self.provider,
+            model=self.model,
+            generations=self.generations,
+            untokened_generations=self.untokened,
+            input_tokens=self.input.resolve(),
+            output_tokens=self.output.resolve(),
+            cached_tokens=self.cached.resolve(),
+            cache_read_tokens=self.cache_read.resolve(),
+            cache_write_tokens=self.cache_write.resolve(),
+            reasoning_tokens=self.reasoning.resolve(),
+            latency_ms=self.latency_ms,
+        )
+
+
 class RunTelemetryOut(BaseModel):
     """One agent attempt, whole — WHO, WHAT, WHICH MODEL, and what it cost."""
 
@@ -592,7 +765,7 @@ class RunTelemetryOut(BaseModel):
         run = source.run
         steps = list(source.steps)
 
-        models: dict[tuple[str | None, str | None], ModelUsageOut] = {}
+        models: dict[tuple[str | None, str | None], _ModelAccumulator] = {}
         tools: dict[tuple[str | None, str | None], ToolUsageOut] = {}
         ctx_fetches = ctx_items = ctx_tokens = ctx_retrievals = 0
         model_ms = tool_ms = context_ms = 0
@@ -610,32 +783,11 @@ class RunTelemetryOut(BaseModel):
                 key = (step.model_provider, step.model_name)
                 current = models.get(key)
                 if current is None:
-                    current = ModelUsageOut(
-                        provider=step.model_provider,
-                        model=step.model_name,
-                        generations=0,
-                        input_tokens=0,
-                        output_tokens=0,
-                        cached_tokens=0,
-                        cache_read_tokens=0,
-                        cache_write_tokens=0,
-                        reasoning_tokens=0,
-                        latency_ms=0,
+                    current = _ModelAccumulator(
+                        provider=step.model_provider, model=step.model_name
                     )
-                models[key] = ModelUsageOut(
-                    provider=current.provider,
-                    model=current.model,
-                    generations=current.generations + 1,
-                    input_tokens=current.input_tokens + (step.input_tokens or 0),
-                    output_tokens=current.output_tokens + (step.output_tokens or 0),
-                    cached_tokens=current.cached_tokens + (step.cached_tokens or 0),
-                    cache_read_tokens=current.cache_read_tokens + (step.cache_read_tokens or 0),
-                    cache_write_tokens=(
-                        current.cache_write_tokens + (step.cache_write_tokens or 0)
-                    ),
-                    reasoning_tokens=current.reasoning_tokens + (step.reasoning_tokens or 0),
-                    latency_ms=current.latency_ms + latency,
-                )
+                    models[key] = current
+                current.add(step, latency)
 
                 # THE SPLIT. An estimate and a provider's own figure accumulate
                 # into different totals and are never added to each other: one is
@@ -714,7 +866,7 @@ class RunTelemetryOut(BaseModel):
                 tokens=ctx_tokens,
                 retrievals=ctx_retrievals,
             ),
-            models=list(models.values()),
+            models=[acc.resolve() for acc in models.values()],
             tools=list(tools.values()),
             latency=LatencyOut(
                 total_ms=_span_ms(run.started_at, run.completed_at),

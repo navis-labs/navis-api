@@ -175,10 +175,26 @@ def test_refresh_and_login_size_limits():
 def test_founder_permissions_are_explicit_not_wildcard():
     # Founder must be an ENUMERATED set, never the ALL_PERMISSIONS wildcard object —
     # so a future permission is not silently auto-granted to founders.
+    #
+    # SINCE P1-6, `FOUNDER_PERMISSIONS` is the founder's total across BOTH
+    # surfaces and the Application role map carries only its Application half,
+    # so the two are no longer the same object. The invariant this test protects
+    # is unchanged and is asserted directly: the Application half is exactly the
+    # enumerated founder set minus Developer authority — never a wildcard, and
+    # never something derived from `ALL_PERMISSIONS`.
     from navis.identity import permissions as P
 
-    assert P.DEFAULT_ROLE_PERMISSIONS["founder"] is P.FOUNDER_PERMISSIONS
     assert P.FOUNDER_PERMISSIONS is not P.ALL_PERMISSIONS
+    assert P.DEFAULT_ROLE_PERMISSIONS["founder"] == (
+        P.FOUNDER_PERMISSIONS - P.DEVELOPER_PERMISSIONS
+    )
+    assert P.DEFAULT_ROLE_PERMISSIONS["founder"] is not P.ALL_PERMISSIONS
+    # The Developer half is enumerated too, for the same reason.
+    assert P.DEVELOPER_ROLE_PERMISSIONS["owner"] is not P.ALL_PERMISSIONS
+    # Together they are still exactly the reviewed founder set.
+    assert (
+        P.DEFAULT_ROLE_PERMISSIONS["founder"] | P.DEVELOPER_ROLE_PERMISSIONS["owner"]
+    ) == P.FOUNDER_PERMISSIONS
 
 
 def test_every_permission_has_a_deliberate_founder_decision():

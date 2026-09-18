@@ -27,13 +27,18 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
-from fastapi import Depends
+from fastapi import Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.authz import Principal, PrincipalKind, get_principal, require_permission
+from navis.identity.permissions import Permission
 from navis.organization.contract import Capability
 from navis.organization.guards import require_capability
 from navis.platform.database import get_session
+from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import metrics
+
+logger = get_logger("developer.gateway")
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +113,85 @@ def require_developer(permission: str, capability: Capability):
         db: AsyncSession = Depends(get_session),
     ) -> DeveloperContext:
         await _perm(principal)      # 403 — this credential lacks the permission
+        await _cap(principal, db)   # 402 — this organization lacks the capability
+        return DeveloperContext.of(principal)
+
+    return _dep
+
+
+#: THE TWO GRANTS THAT REACH THE AGENT SURFACE (P1-7).
+#:
+#: `MANAGE_SERVICE_ACCOUNTS` is organization-wide agent administration and is
+#: UNCHANGED — it means exactly what it meant before, so no existing credential
+#: moved. `MANAGE_OWN_AGENTS` is the self-serve grant a Developer holds by
+#: default: the same operations, bounded to agents they created.
+#:
+#: DEFINED HERE RATHER THAN IN `agents_router`, because TWO modules gate on it.
+#: `/developer/permissions` serves the agent surface — it is the vocabulary the
+#: console offers when registering one — so it has to admit exactly the callers
+#: the agent routes admit. When it was gated on `manage_service_accounts` alone,
+#: a self-serve developer passed `POST /developer/agents` and was handed an
+#: empty permission catalog, so the form they were allowed to submit had nothing
+#: to tick. One constant, so the two cannot drift apart again.
+AGENT_MANAGEMENT_PERMISSIONS: tuple[str, ...] = (
+    Permission.MANAGE_SERVICE_ACCOUNTS,
+    Permission.MANAGE_OWN_AGENTS,
+)
+
+
+def require_developer_any(permissions: tuple[str, ...], capability: Capability):
+    """As `require_developer`, but any ONE of `permissions` is enough (P1-7).
+
+    WHY A DISJUNCTION EXISTS AT ALL, AND WHY IT IS NOT A SECOND AUTHORIZATION
+    SYSTEM. The agent routes are reachable two ways that are genuinely different
+    grants: `manage_service_accounts` (every agent in the organization) and
+    `manage_own_agents` (only the ones you created). Both are real answers to
+    "may you call this route", and the narrower one is the whole of P1-7 — an
+    engineer must not need organization-wide machine-identity administration to
+    register their own development agent.
+
+    The alternative was to gate on the narrower permission alone and have the
+    broader one imply it. That is smaller code and it would have been a
+    CREDENTIAL REGRESSION: `manage_service_accounts` is agent-assignable and a
+    live agent key holds it today, so re-gating the read routes on a permission
+    that key does not carry would have 401'd a running integration. A gate that
+    accepts either is the version with no blast radius.
+
+    NOTHING NEW DECIDES ANYTHING HERE. The input is still
+    `Principal.permissions`, resolved by the one `effective_permissions`; the
+    entitlement half is still `organization.guards.require_capability`; the
+    membership and organization were still settled by `get_principal`. This
+    function asks the existing evaluator a question with an `or` in it, which is
+    the only thing it adds.
+
+    ORDER IS PRESERVED: 403 before 402, so a caller who may not do this at all
+    is never told what the organization's plan includes.
+    """
+    _cap = require_capability(capability)
+
+    async def _dep(
+        principal: Principal = Depends(get_principal),
+        db: AsyncSession = Depends(get_session),
+    ) -> DeveloperContext:
+        if not any(principal.has(permission) for permission in permissions):
+            # Named in the SAME shape `require_permission` uses, and listing
+            # every acceptable permission rather than one of them: a caller
+            # told "missing permission: manage_service_accounts" would go and
+            # ask for organization-wide agent administration when
+            # `manage_own_agents` was all they needed.
+            logger.warning(
+                "permission denied: principal=%s kind=%s org=%s needs one of %s",
+                principal.subject_id, principal.kind, principal.org_id,
+                sorted(permissions),
+            )
+            metrics.incr(
+                "auth.permission_denied",
+                labels={"permission": "|".join(sorted(permissions))},
+            )
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "missing permission: one of " + ", ".join(sorted(permissions)),
+            )
         await _cap(principal, db)   # 402 — this organization lacks the capability
         return DeveloperContext.of(principal)
 

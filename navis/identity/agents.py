@@ -25,6 +25,7 @@ Pure module — no DB, no imports from other domains, mirroring `permissions.py`
 from __future__ import annotations
 
 import enum
+from datetime import datetime, timedelta, timezone
 
 
 class AgentEnvironment(str, enum.Enum):
@@ -84,3 +85,67 @@ class AgentStatus(str, enum.Enum):
 def status_of(revoked_at: object | None) -> str:
     """The wire `status` for a service-account row. One derivation, one answer."""
     return AgentStatus.REVOKED.value if revoked_at is not None else AgentStatus.ACTIVE.value
+
+
+class CredentialStatus(str, enum.Enum):
+    """What state one `api_keys` row is in. Derived, never stored.
+
+    Same reasoning as `AgentStatus`: a `status` column would be a second
+    authority the authentication path never consults. This is computed from the
+    two timestamps that path DOES read, so the console, the API and
+    `verify()` cannot disagree about whether a credential works.
+
+    REVOKED OUTRANKS EXPIRED when a row carries both. Revocation is a decision
+    somebody made and is terminal; an expiry that has also passed adds nothing a
+    reader can act on, and reporting "expired" for a key an operator
+    deliberately cut off would misattribute the reason it stopped.
+
+    EXPIRING IS A WARNING, NOT A STATE THE SERVER ENFORCES. A credential that is
+    expiring still authenticates exactly like an active one — the distinction
+    exists so an operator can rotate before an outage rather than after one.
+    """
+
+    ACTIVE = "active"
+    EXPIRING = "expiring"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+
+
+#: How long before `expires_at` a credential starts reporting `expiring`.
+#:
+#: Seven days is chosen to be longer than a weekend plus a working day: the
+#: point of the warning is that somebody has time to mint a replacement, switch
+#: over and verify it before the old one stops, which is the rotation sequence
+#: OpenAI's guidance describes. A shorter window would fire when it is already
+#: an emergency; a much longer one would sit yellow for so long that it stops
+#: being read as a warning at all.
+CREDENTIAL_EXPIRY_WARNING = timedelta(days=7)
+
+
+def credential_status_of(
+    revoked_at: datetime | None,
+    expires_at: datetime | None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """The wire `status` for a credential. One derivation, one answer.
+
+    `now` is injectable so a caller rendering a page of credentials stamps them
+    all at the same instant — two rows in one response disagreeing about what
+    time it is would be a real, if small, lie.
+    """
+    if revoked_at is not None:
+        return CredentialStatus.REVOKED.value
+    if expires_at is None:
+        return CredentialStatus.ACTIVE.value
+    moment = now or datetime.now(timezone.utc)
+    # A naive `expires_at` cannot come from the database (the column is
+    # timestamptz) but can come from a test or a fixture, and comparing naive to
+    # aware raises. Treat it as UTC rather than failing a status read.
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= moment:
+        return CredentialStatus.EXPIRED.value
+    if expires_at - moment <= CREDENTIAL_EXPIRY_WARNING:
+        return CredentialStatus.EXPIRING.value
+    return CredentialStatus.ACTIVE.value

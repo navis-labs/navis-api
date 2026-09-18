@@ -94,6 +94,36 @@ class AgentTask(UUIDPrimaryKey, Timestamped, Base):
         Index("ix_agent_tasks_org_created", "organization_id", sa_text("created_at DESC")),
         # "What has this agent been asked to do" — the agent detail surface.
         Index("ix_agent_tasks_agent_created", "agent_id", sa_text("created_at DESC")),
+        # ── The continuity lookup: "is there open work under this key" ─────
+        #
+        # ONE metadata key is indexed, and only one. `navisWorkKey` is written
+        # by a client that needs to find its own task again across processes —
+        # a developer tool reopening the work stream for a worktree — and that
+        # question has no other answer here: a task is addressable by id, and
+        # the id is precisely what a fresh process does not have.
+        #
+        # Without this the caller must PAGE the organization's open tasks and
+        # match the key itself, which stops working the moment the tenant has
+        # more open tasks than the client's window. The work stream does not
+        # error then; it silently reads as absent, and a second one is opened
+        # beside the first.
+        #
+        # An EXPRESSION B-TREE, not GIN. The query is a single equality on one
+        # known key, which is what a b-tree answers in one descent; GIN over
+        # the whole document would index every key to serve one, and could not
+        # lead with the tenant. Leading with `organization_id` keeps one
+        # organization's volume off another's scan, exactly as above.
+        #
+        # Tasks without the key index as NULL and cost a row in the index
+        # apiece. Deliberately not partial (`WHERE ... IS NOT NULL`): a partial
+        # index is only usable when the planner can prove the predicate, and
+        # the saving on a table whose rows are mostly keyed is not worth the
+        # plan fragility.
+        Index(
+            "ix_agent_tasks_org_work_key",
+            "organization_id",
+            sa_text("(task_metadata ->> 'navisWorkKey')"),
+        ),
         # Idempotent creation. A client that retries a POST with the same key
         # gets the same task rather than a duplicate. Scoped to the tenant so
         # one organization's key choice can never collide with another's.

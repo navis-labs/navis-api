@@ -248,8 +248,10 @@ def test_cache_reads_and_writes_stay_separate_through_the_rollup():
     assert usage.cache_write_tokens == 1200
     assert usage.reasoning_tokens == 150
     # The legacy total is not synthesized from the pair: a caller that did not
-    # send one has not reported one.
-    assert usage.cached_tokens == 0
+    # send one has not reported one — and "has not reported one" is None, not
+    # zero. This asserted `== 0` while the rollup summed missing counts with
+    # `or 0`, so it was pinning the coercion rather than the intent above it.
+    assert usage.cached_tokens is None
 
 
 def test_generations_group_by_provider_and_model():
