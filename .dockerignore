@@ -1,0 +1,60 @@
+# Without this file, `COPY . .` in the Dockerfile copies the ENTIRE working
+# directory into the image — including .env with real secrets, and .venv.
+#
+# Two consequences, both real:
+#   * the built image carried /app/.env, so every secret in it shipped to ECR
+#     and into production, readable by anyone who can pull the image;
+#   * the image was 1.49GB, almost all of it a Linux-incompatible .venv that
+#     is never used because dependencies are installed from requirements.txt.
+#
+# It also made the image a dishonest test environment: settings silently read
+# /app/.env, so a container run looked correctly configured even when nothing
+# had been passed in — the opposite of CI, which has no .env at all.
+
+# ==================== Secrets ====================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+token.json
+
+# ==================== Virtualenv ====================
+.venv/
+venv/
+env/
+ENV/
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ==================== Tooling / caches ====================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==================== VCS / CI / IDE ====================
+.git/
+.gitignore
+.github/
+.claude/
+.vscode/
+.idea/
+.DS_Store
+
+# ==================== Local data ====================
+*.sqlite3
+*.db
+dev.db
+logs/
+*.log
+celerybeat-schedule*

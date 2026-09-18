@@ -1,0 +1,236 @@
+name: Deploy (reusable)
+
+# The deploy mechanics, written once. deploy-staging.yml and
+# deploy-production.yml call this with different inputs so that staging and
+# production can never drift apart in HOW they deploy — only in what they
+# point at.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub Environment name (staging | production)
+        required: true
+        type: string
+      aws-region:
+        required: true
+        type: string
+      ecr-repository:
+        required: true
+        type: string
+      ecs-cluster:
+        required: true
+        type: string
+      api-service:
+        required: true
+        type: string
+      worker-service:
+        required: true
+        type: string
+      beat-service:
+        required: true
+        type: string
+      migration-subnets:
+        description: Comma-separated subnet IDs for the one-off migration task
+        required: true
+        type: string
+      migration-security-groups:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC; without it the AWS login silently has no token
+
+concurrency:
+  # One deploy per environment at a time. Never cancel-in-progress here: killing
+  # a half-finished deploy can leave migrations applied and services not updated.
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    # Binds the run to the GitHub Environment: its secrets/variables, its
+    # protection rules (required reviewers on production), and its deployment
+    # history. This is where the production approval gate lives — it is a
+    # setting on the Environment, not a line in this file.
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # OIDC: GitHub mints a short-lived token and AWS exchanges it for
+      # temporary credentials. No AWS access keys stored in GitHub secrets, so
+      # there is nothing to rotate and nothing to leak. The IAM trust policy on
+      # the role restricts which repo AND which branch may assume it.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tagged with the commit SHA, never `latest`. An immutable tag means the
+      # running task definition names exactly one build, so "what is in
+      # production right now" is answerable and a rollback is just redeploying
+      # the previous SHA.
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ inputs.ecr-repository }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record image URI
+        id: image
+        run: echo "uri=${{ steps.ecr.outputs.registry }}/${{ inputs.ecr-repository }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Migrations run BEFORE any service is updated, as a one-off task on the
+      # new image — the ECS equivalent of the Procfile's `release:` step.
+      #
+      # Order matters: if services rolled first, new code would briefly run
+      # against an old schema. Running migrations first means old code runs
+      # against a new schema instead, which is safe as long as migrations are
+      # additive (add columns nullable, backfill, drop in a LATER release).
+      # ---------------------------------------------------------------------
+      - name: Run database migrations
+        run: |
+          task_arn=$(aws ecs run-task \
+            --cluster "${{ inputs.ecs-cluster }}" \
+            --task-definition "${{ inputs.ecr-repository }}-migrate" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ inputs.migration-subnets }}],securityGroups=[${{ inputs.migration-security-groups }}],assignPublicIp=DISABLED}" \
+            --overrides '{"containerOverrides":[{"name":"migrate","image":"${{ steps.image.outputs.uri }}","command":["alembic","upgrade","head"]}]}' \
+            --query 'tasks[0].taskArn' --output text)
+
+          echo "migration task: $task_arn"
+          aws ecs wait tasks-stopped --cluster "${{ inputs.ecs-cluster }}" --tasks "$task_arn"
+
+          exit_code=$(aws ecs describe-tasks \
+            --cluster "${{ inputs.ecs-cluster }}" --tasks "$task_arn" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+
+          echo "migration exit code: $exit_code"
+          if [ "$exit_code" != "0" ]; then
+            echo "::error::Migrations failed (exit $exit_code). No service was updated; the previous release is still serving."
+            aws ecs describe-tasks --cluster "${{ inputs.ecs-cluster }}" --tasks "$task_arn" \
+              --query 'tasks[0].stoppedReason' --output text
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------------
+      # All THREE services get the new image. Deploying only the api is the
+      # documented outage this repo already had: the API keeps accepting writes
+      # while nothing relays signals into memory, and the failure looks like a
+      # perfectly healthy API.
+      # ---------------------------------------------------------------------
+      - name: Render api task definition
+        id: td-api
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition-family: ${{ inputs.ecr-repository }}-api
+          container-name: api
+          image: ${{ steps.image.outputs.uri }}
+
+      - name: Deploy api
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.td-api.outputs.task-definition }}
+          service: ${{ inputs.api-service }}
+          cluster: ${{ inputs.ecs-cluster }}
+          wait-for-service-stability: true
+
+      - name: Render worker task definition
+        id: td-worker
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition-family: ${{ inputs.ecr-repository }}-worker
+          container-name: worker
+          image: ${{ steps.image.outputs.uri }}
+
+      - name: Deploy worker
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.td-worker.outputs.task-definition }}
+          service: ${{ inputs.worker-service }}
+          cluster: ${{ inputs.ecs-cluster }}
+          wait-for-service-stability: true
+
+      - name: Render beat task definition
+        id: td-beat
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition-family: ${{ inputs.ecr-repository }}-beat
+          container-name: beat
+          image: ${{ steps.image.outputs.uri }}
+
+      # beat is the clock. Exactly one must ever run — two schedulers means every
+      # periodic task fires twice. Keep this service's desired count at 1 and
+      # deployment config at maximumPercent=100, minimumHealthyPercent=0 so ECS
+      # stops the old one before starting the new, rather than briefly running two.
+      - name: Deploy beat
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.td-beat.outputs.task-definition }}
+          service: ${{ inputs.beat-service }}
+          cluster: ${{ inputs.ecs-cluster }}
+          wait-for-service-stability: true
+
+      # ECS reporting a service as "stable" only means tasks are running and
+      # passing their container health check. This asserts the deployed code is
+      # actually serving, and is the last chance to catch a bad release before
+      # the job reports success.
+      - name: Smoke test
+        run: |
+          url="${{ vars.HEALTHCHECK_URL }}"
+          if [ -z "$url" ]; then
+            echo "::warning::HEALTHCHECK_URL not set for ${{ inputs.environment }} — skipping smoke test."
+            exit 0
+          fi
+          for attempt in 1 2 3 4 5; do
+            code=$(curl -s -o /tmp/health.json -w '%{http_code}' --max-time 10 "$url" || echo 000)
+            echo "attempt $attempt: HTTP $code"
+            if [ "$code" = "200" ]; then
+              cat /tmp/health.json
+              echo "Smoke test passed."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Smoke test failed against $url"
+          exit 1
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy to ${{ inputs.environment }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Image | \`${{ steps.image.outputs.uri }}\` |"
+            echo "| Cluster | ${{ inputs.ecs-cluster }} |"
+            echo "| Services | api, worker, beat |"
+            echo "| Result | ${{ job.status }} |"
+            echo ""
+            echo "Rollback: re-run this workflow on the previous commit, or"
+            echo "\`aws ecs update-service --force-new-deployment\` with the prior task definition revision."
+          } >> "$GITHUB_STEP_SUMMARY"

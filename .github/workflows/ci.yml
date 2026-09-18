@@ -1,0 +1,306 @@
+name: CI
+
+# Every change that is headed for staging (development) or production (main)
+# must pass this before it can be merged. Nothing here talks to AWS — CI proves
+# the code is good; the deploy workflows act on that proof.
+
+on:
+  pull_request:
+    branches: [development, main]
+
+  # Called by deploy-staging.yml / deploy-production.yml on merge. There is
+  # deliberately no `push` trigger: if CI ran on push AND the deploy workflow
+  # also ran on push, the two would race and a deploy could start while its own
+  # tests were still running. Instead the deploy workflow calls this first and
+  # only proceeds if it passes — so merged code is always tested, exactly once.
+  workflow_call:
+
+  # Run the suite on any branch on demand, from the Actions tab.
+  workflow_dispatch:
+
+# A new push to the same branch/PR cancels the previous run. Without this,
+# pushing three times queues three full suites and you pay for all of them.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# GitHub's default shell is `bash -e` — WITHOUT pipefail. That means
+# `pytest | tee log` exits with tee's status, so a failing suite reports green.
+# Naming `bash` explicitly gets `bash --noprofile --norc -eo pipefail`.
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.12" # must match the Dockerfile's base image
+
+jobs:
+  lint:
+    name: Lint (real-bug rules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - run: pip install ruff==0.16.8
+
+      # Deliberately NOT the full default ruleset. The codebase currently has
+      # ~685 default-rule findings (mostly unused imports and formatting); making
+      # those blocking on day one would mean every PR is red for reasons nobody
+      # will act on, and the gate gets disabled within a week.
+      #
+      # E9/F63/F7/F82 are the subset that only fires on things that are actually
+      # broken: syntax errors, undefined names, unreachable comparisons. This
+      # caught a real latent bug on the first run (an undefined `datetime` in a
+      # type annotation, masked by `from __future__ import annotations`).
+      #
+      # Widen this over time: fix a rule family, then add it here so it can
+      # never come back.
+      - name: Lint for real bugs
+        run: ruff check --select E9,F63,F7,F82 navis/ tests/
+
+      - name: Style report (non-blocking, informational)
+        if: always()
+        run: ruff check --statistics navis/ tests/ || true
+
+  test:
+    name: Tests (unit + Postgres integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      # pgvector, NOT plain postgres: migration 0038 runs
+      # `CREATE EXTENSION IF NOT EXISTS vector`, which the stock image cannot do.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: navis
+          POSTGRES_PASSWORD: navis
+          # MUST be named navis_test*. The integration tests assert
+          # `name.startswith("navis_test")` and refuse to run otherwise — a
+          # deliberate allowlist, because these fixtures call create_all and
+          # drop rows, and the guard is what stops that landing on a real
+          # database if NAVIS_TEST_DATABASE_URL is ever pointed somewhere live.
+          # Named `navis` here, all 184 integration tests error on that assert.
+          POSTGRES_DB: navis_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U navis"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      # docker-compose.yml runs Redis on 6380 so internal and host addresses
+      # match. GitHub service containers cannot override a container's command,
+      # so Redis listens on its default 6379 and we map the host side to 6380 —
+      # same REDIS_URL as every other environment, no code change.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Settings supply defaults for everything, so no .env file is needed —
+      # verified by running the suite with .env removed. These are set because
+      # the integration tests and Alembic read them, not to satisfy imports.
+      DATABASE_URL: postgresql://navis:navis@localhost:5432/navis_test
+      REDIS_URL: redis://localhost:6380/0
+      SECRET_KEY: ci-only-not-a-secret-value-at-least-32-chars
+      # Must be one of development|staging|production — settings rejects anything
+      # else outright (it gates encryption enforcement and the production config
+      # checks, so it is never guessed). "test" is NOT a valid value.
+      ENVIRONMENT: development
+
+      # Fernet keys for FieldCipher and TokenCipher. Without them the ciphers
+      # fall back to passthrough, and the 12 tests that assert PII and OAuth
+      # tokens are sealed at rest fail — they are the suite's encryption-at-rest
+      # guarantees, so they must run with real keys, not be skipped.
+      #
+      # Generated for CI and nothing else. They encrypt only rows created and
+      # dropped inside the job, protect nothing, and are deliberately in the
+      # workflow rather than in secrets: a value in `secrets` would be masked in
+      # logs and imply it matters, and rotating it would silently change what
+      # the suite tests. The real keys live in the ECS task definitions.
+      FIELD_ENCRYPTION_KEYS: FVLksBH-IvYfC5m2UHB03yDm8cHofFCd_YVdQzCEyHk=
+      SIGNALS_TOKEN_KEYS: Oe50JzQrZG9pbS1RzLXnhfKdEKaBZ_dpaeSeRpvrQXI=
+
+      # THE line that decides whether this job means anything.
+      #
+      # All 21 tests/integration/*_postgres.py modules are gated on
+      # `pytest.mark.skipif(not os.environ.get("NAVIS_TEST_DATABASE_URL"))`.
+      # Without it they skip silently and CI reports green while never touching
+      # a database — 184 tests of cross-tenant isolation, replay determinism and
+      # concurrency quietly not running.
+      #
+      # Must carry the +asyncpg driver: it is handed straight to
+      # create_async_engine(), which rejects a bare postgresql:// URL.
+      NAVIS_TEST_DATABASE_URL: postgresql+asyncpg://navis:navis@localhost:5432/navis_test
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Enable pgvector
+        run: PGPASSWORD=navis psql -h localhost -U navis -d navis_test -c 'CREATE EXTENSION IF NOT EXISTS vector'
+
+      # `python -m pytest`, NOT `pytest`. The module form puts the working
+      # directory on sys.path; the console script does not. There is no
+      # tests/__init__.py but the subdirectories have one, so pytest's own
+      # path insertion stops at `tests/` and never adds the repo root — the
+      # bare `pytest` command fails to import `navis` at all (106 collection
+      # errors, reproduced in a python:3.12-slim container).
+      #
+      # `-rs` reports the reason for every skip, which the next step inspects.
+      # The suite runs exactly once; nothing below re-runs it.
+      - name: Run test suite
+        run: python -m pytest -q -rs --durations=15 | tee /tmp/pytest.txt
+
+      # Proves the integration tests actually ran. If NAVIS_TEST_DATABASE_URL
+      # ever stops reaching them, this fails loudly instead of the suite going
+      # quietly green with 184 skips and no database ever touched.
+      - name: Assert Postgres integration tests were not skipped
+        run: |
+          if grep -q "NAVIS_TEST_DATABASE_URL to run" /tmp/pytest.txt; then
+            echo "::error::Integration tests skipped — NAVIS_TEST_DATABASE_URL is not reaching them."
+            grep "NAVIS_TEST_DATABASE_URL to run" /tmp/pytest.txt | head -5
+            exit 1
+          fi
+          echo "Postgres integration tests ran."
+
+  migrations:
+    name: Migrations apply cleanly
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: navis
+          POSTGRES_PASSWORD: navis
+          POSTGRES_DB: navis
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U navis"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://navis:navis@localhost:5432/navis
+      SECRET_KEY: ci-only-not-a-secret-value-at-least-32-chars
+      # Must be one of development|staging|production — settings rejects anything
+      # else outright (it gates encryption enforcement and the production config
+      # checks, so it is never guessed). "test" is NOT a valid value.
+      ENVIRONMENT: development
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Two heads means `alembic upgrade head` is ambiguous and the release step
+      # fails mid-deploy. This repo has already had to ship a merge commit for
+      # exactly that (3db4449 "chore(migrations): merge alembic heads"), so the
+      # guard pays for itself.
+      - name: Exactly one Alembic head
+        run: |
+          heads=$(alembic heads | grep -c '(head)' || true)
+          alembic heads
+          if [ "$heads" -ne 1 ]; then
+            echo "::error::Expected 1 Alembic head, found $heads. Merge them before deploying."
+            exit 1
+          fi
+
+      # The Procfile's `release: alembic upgrade head` is what runs in front of
+      # every deploy. This is that exact command against an empty database.
+      - name: Upgrade from empty database
+        run: alembic upgrade head
+
+      # A migration that cannot be undone is a deploy you cannot roll back.
+      - name: Downgrade one step, then re-apply
+        run: |
+          alembic downgrade -1
+          alembic upgrade head
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Build only — pushing to ECR happens in the deploy workflows, after this
+      # has passed. A broken Dockerfile should fail here, not halfway to staging.
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          # `load: true` is required, not optional: with buildx, push:false leaves
+          # the image in the build cache only. Without load the next step's
+          # `docker run navis-api:ci` fails with "image not found".
+          load: true
+          tags: navis-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The image serves three roles (api / worker / beat). Only the API is the
+      # default CMD, so a broken worker or beat entrypoint would otherwise be
+      # discovered in production, where a dead worker stalls the whole pipeline
+      # behind a healthy-looking API.
+      - name: All three process entrypoints import
+        run: |
+          docker run --rm --entrypoint python navis-api:ci -c "import navis.main"
+          docker run --rm --entrypoint python navis-api:ci -c "from navis.platform.queue.celery_app import celery_app"
+
+  # One required check to protect branches with, instead of wiring each job into
+  # branch protection separately (and silently not protecting any job you forget).
+  ci-passed:
+    name: CI passed
+    runs-on: ubuntu-latest
+    needs: [lint, test, migrations, docker]
+    if: always()
+    steps:
+      # Checked with a loop, not `grep -v success`: grep matches line-by-line, so
+      # "success failure success" still contains the word success and would be
+      # reported as passing. Every result must equal success individually.
+      - name: Verify every job succeeded
+        run: |
+          failed=0
+          for result in ${{ join(needs.*.result, ' ') }}; do
+            echo "job result: $result"
+            if [ "$result" != "success" ]; then failed=1; fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::One or more CI jobs did not succeed."
+            exit 1
+          fi
+          echo "All CI jobs passed."
