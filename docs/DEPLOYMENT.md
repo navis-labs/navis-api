@@ -858,11 +858,17 @@ migration-security-groups: sg-REPLACE_ME
 
 with the two subnet IDs from Part 2.1 and the **tasks** security group from Part 2.2.
 
-Both environments in this runbook run in public subnets, so **production also needs
-`assign-public-ip: ENABLED`** — add it to `deploy-production.yml` alongside the other inputs.
-It currently defaults to `DISABLED`, which is correct only for private subnets with a NAT
-gateway. If you leave it disabled here, the migration task can never pull its image: it sits
-there until the job times out, with no error that explains why.
+Both environments run in public subnets, so both need `assign-public-ip: ENABLED`. **This is
+already set in both workflow files** — staging had it, and production has it now. You do not
+need to change it; this section explains why it is there.
+
+The input defaults to `DISABLED`, which is correct only for private subnets with a NAT
+gateway. Left at the default, the migration task can never pull its image: it sits there
+until the job times out, with no error that explains why.
+
+When production later moves to private subnets behind a NAT instance, **delete the
+`assign-public-ip` line** from `deploy-production.yml` rather than setting it to `DISABLED`,
+so the safer default applies again.
 
 ---
 
@@ -1010,8 +1016,16 @@ Fill these in as you go. This table is the description of your infrastructure.
 or resolve a secret. Check `stoppedReason` on the stopped task. Almost always a missing
 `kms:Decrypt` (Part 5.1) or a wrong SSM parameter ARN.
 
-**Migration task runs forever and times out.** It cannot reach ECR. Confirm
-`assign-public-ip: ENABLED` in the workflow and that the subnet auto-assigns public IPs.
+**Migration task never starts.** Almost always it cannot reach ECR. Confirm
+`assign-public-ip: ENABLED` in the workflow and that the subnet auto-assigns public IPs. The
+deploy step now reads ECS's `failures` array and prints the reason, so check the step log
+before guessing.
+
+**Migration step gives up after 20 minutes.** That is the `migration-timeout-minutes` input
+on `deploy.yml`. The task may still be running and may still commit, so **check it before
+redeploying — the schema may already have moved**. This repo has 47 migrations, and on a
+first run against a distant Neon region each one pays the full round-trip latency, so raise
+the input rather than re-running blindly.
 
 **Production crash-loops on boot with "Insecure production config".** Expected and working as
 designed — the exception lists every offending setting. See Part 8.3.
