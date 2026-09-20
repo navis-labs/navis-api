@@ -71,3 +71,19 @@ jobs:
       beat-service: navis-beat-prod
       migration-subnets: subnet-REPLACE_ME_A,subnet-REPLACE_ME_B
       migration-security-groups: sg-REPLACE_ME
+      # Production runs in PUBLIC subnets for now — the same shape as staging.
+      # The database is Neon, which lives outside the VPC and is reached over the
+      # internet, so a task needs an outbound path either way: a NAT gateway
+      # (~$41/month) or its own public IP ($0). Tight security groups are what
+      # keep the tasks unreachable — inbound is allowed only from the ALB's
+      # security group — so the public IP buys egress to Neon, ECR and the LLM
+      # providers, not exposure.
+      #
+      # The default is DISABLED, which is correct ONLY for private subnets with a
+      # NAT gateway. Left at the default here, the migration task can never pull
+      # its image: it sits until the job times out, with no error saying why.
+      #
+      # When this moves to private subnets behind a NAT instance (planned for
+      # after the first enterprise users), delete this line rather than setting
+      # it to DISABLED, so the safer default applies again.
+      assign-public-ip: ENABLED

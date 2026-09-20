@@ -34,3 +34,8 @@ jobs:
       beat-service: navis-beat-staging
       migration-subnets: subnet-REPLACE_ME_A,subnet-REPLACE_ME_B
       migration-security-groups: sg-REPLACE_ME
+      # Staging runs in PUBLIC subnets, deliberately: a NAT gateway costs about
+      # $35/month and staging does not need the isolation production does.
+      # Public subnets have no NAT, so the task needs its own public IP to reach
+      # ECR at all. Production keeps the default (DISABLED) with a NAT gateway.
+      assign-public-ip: ENABLED

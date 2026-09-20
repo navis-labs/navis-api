@@ -391,7 +391,7 @@ def test_learning_never_reaches_back_into_execution_observation_or_a_provider():
     )
     violations = []
     for py in Path(pkg.__file__).parent.rglob("*.py"):
-        tree = ast.parse(py.read_text(), filename=str(py))
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
         for node in ast.walk(tree):
             mods = []
             if isinstance(node, ast.Import):
@@ -418,7 +418,7 @@ def test_intelligence_consumes_learning_through_the_contract_not_the_tables():
 
     import navis.intelligence.repository as repo_mod
 
-    source = Path(repo_mod.__file__).read_text()
+    source = Path(repo_mod.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     imported = set()
     for node in ast.walk(tree):

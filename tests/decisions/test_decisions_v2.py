@@ -119,7 +119,7 @@ def test_decision_domain_has_no_clock_or_uuid4():
     the cache-row `created_at` is allowed (server-side metadata, not decision content)."""
     root = pathlib.Path(__file__).resolve().parent.parent.parent / "navis" / "decisions"
     for py in root.rglob("*.py"):
-        tree = ast.parse(py.read_text(), filename=str(py))
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 if node.func.attr not in _FORBIDDEN_CALLS:

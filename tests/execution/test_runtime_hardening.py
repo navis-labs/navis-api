@@ -652,7 +652,7 @@ def test_generic_execution_contains_no_drive_or_docs_branch():
     )
     offenders: list[str] = []
     for name in generic:
-        source = (execution_dir / name).read_text()
+        source = (execution_dir / name).read_text(encoding="utf-8")
         tree = ast.parse(source)
         for node in ast.walk(tree):
             # String constants only — prose in comments and docstrings is fine,

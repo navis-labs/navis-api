@@ -106,7 +106,7 @@ async def test_empty_learning_yields_no_insights():
 def test_no_forbidden_pipeline_imports():
     violations = []
     for py in PKG.rglob("*.py"):
-        tree = ast.parse(py.read_text(), filename=str(py))
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
         mods = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -127,7 +127,7 @@ def test_no_nondeterministic_calls():
     banned = {"now", "utcnow", "uuid4", "uuid1", "random", "randint", "choice", "shuffle"}
     offenders = []
     for py in PKG.rglob("*.py"):
-        tree = ast.parse(py.read_text(), filename=str(py))
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 if node.func.attr in banned:

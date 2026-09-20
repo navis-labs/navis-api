@@ -204,7 +204,7 @@ def test_scope_module_contains_no_connector_specific_branching():
     import pathlib
 
     path = pathlib.Path(__file__).resolve().parents[2] / "navis" / "state" / "v2" / "scope.py"
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     docstrings = set()
     for node in ast.walk(tree):
@@ -376,7 +376,7 @@ def test_state_does_not_import_ml_or_reasoning():
 
     root = pathlib.Path(__file__).resolve().parents[2] / "navis" / "state"
     for py in root.rglob("*.py"):
-        tree = ast.parse(py.read_text(), filename=str(py))
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
         for node in ast.walk(tree):
             mods = []
             if isinstance(node, ast.Import):
@@ -395,7 +395,7 @@ def test_scope_performs_no_io():
     import pathlib
 
     path = pathlib.Path(__file__).resolve().parents[2] / "navis" / "state" / "v2" / "scope.py"
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for node in ast.walk(tree):
         mods = []
         if isinstance(node, ast.Import):

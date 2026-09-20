@@ -37,6 +37,27 @@ on:
       migration-security-groups:
         required: true
         type: string
+      assign-public-ip:
+        description: >-
+          ENABLED for public subnets, DISABLED for private subnets with a NAT
+          gateway. Wrong value and the migration task cannot reach ECR: it never
+          pulls its image and sits until the job times out, with no error that
+          says why. Defaults to DISABLED, the safer of the two.
+        required: false
+        default: DISABLED
+        type: string
+      migration-timeout-minutes:
+        description: >-
+          How long to wait for the one-off migration task to stop before giving
+          up. This replaces `aws ecs wait tasks-stopped`, whose default waiter is
+          100 attempts six seconds apart — a hard, undocumented TEN MINUTE cap.
+          A migration that ran longer than that failed the deploy while still
+          succeeding in the database, leaving the schema ahead of every running
+          service with nothing in the log saying so. Raise it for a large
+          migration rather than discovering the cap during one.
+        required: false
+        default: 20
+        type: number
 
 permissions:
   contents: read
@@ -111,26 +132,67 @@ jobs:
       # additive (add columns nullable, backfill, drop in a LATER release).
       # ---------------------------------------------------------------------
       - name: Run database migrations
+        env:
+          CLUSTER: ${{ inputs.ecs-cluster }}
+          TIMEOUT_MINUTES: ${{ inputs.migration-timeout-minutes }}
         run: |
-          task_arn=$(aws ecs run-task \
-            --cluster "${{ inputs.ecs-cluster }}" \
+          # `--output json`, not `--query 'tasks[0].taskArn'`. When ECS refuses to
+          # place the task at all — a subnet that does not exist, a missing task
+          # definition, no capacity — it answers with an EMPTY `tasks` array and a
+          # populated `failures` array. The narrow query then yields the literal
+          # string "None", which was handed straight to the waiter below, and the
+          # job died on "None is not a valid task ID" while the actual reason sat
+          # unread in `failures`. Read the whole response and say what it said.
+          run_json=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
             --task-definition "${{ inputs.ecr-repository }}-migrate" \
             --launch-type FARGATE \
-            --network-configuration "awsvpcConfiguration={subnets=[${{ inputs.migration-subnets }}],securityGroups=[${{ inputs.migration-security-groups }}],assignPublicIp=DISABLED}" \
+            --started-by "gha-${{ github.run_id }}" \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ inputs.migration-subnets }}],securityGroups=[${{ inputs.migration-security-groups }}],assignPublicIp=${{ inputs.assign-public-ip }}}" \
             --overrides '{"containerOverrides":[{"name":"migrate","image":"${{ steps.image.outputs.uri }}","command":["alembic","upgrade","head"]}]}' \
-            --query 'tasks[0].taskArn' --output text)
+            --output json)
 
+          if [ "$(echo "$run_json" | jq '.failures | length')" -ne 0 ]; then
+            echo "::error::ECS refused to start the migration task. No service was updated; the previous release is still serving."
+            echo "$run_json" | jq -r '.failures[] | "  \(.arn // "?") — \(.reason) \(.detail // "")"'
+            exit 1
+          fi
+
+          task_arn=$(echo "$run_json" | jq -r '.tasks[0].taskArn // empty')
+          if [ -z "$task_arn" ]; then
+            echo "::error::run-task reported no failure and no task. Raw response:"
+            echo "$run_json"
+            exit 1
+          fi
           echo "migration task: $task_arn"
-          aws ecs wait tasks-stopped --cluster "${{ inputs.ecs-cluster }}" --tasks "$task_arn"
+
+          # Polled explicitly rather than with `aws ecs wait tasks-stopped`, whose
+          # waiter gives up after ten minutes and cannot be configured on the CLI.
+          # Exceeding it failed the deploy while the migration kept running and
+          # committed, which is the worst of both outcomes: schema moved, services
+          # did not. See `migration-timeout-minutes`.
+          deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          while :; do
+            status=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task_arn" \
+              --query 'tasks[0].lastStatus' --output text)
+            [ "$status" = "STOPPED" ] && break
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Migration task is still $status after ${TIMEOUT_MINUTES}m. It may still be running — check it before redeploying, because the schema may already have moved."
+              echo "task: $task_arn"
+              exit 1
+            fi
+            echo "  status=$status — waiting"
+            sleep 10
+          done
 
           exit_code=$(aws ecs describe-tasks \
-            --cluster "${{ inputs.ecs-cluster }}" --tasks "$task_arn" \
+            --cluster "$CLUSTER" --tasks "$task_arn" \
             --query 'tasks[0].containers[0].exitCode' --output text)
 
           echo "migration exit code: $exit_code"
           if [ "$exit_code" != "0" ]; then
             echo "::error::Migrations failed (exit $exit_code). No service was updated; the previous release is still serving."
-            aws ecs describe-tasks --cluster "${{ inputs.ecs-cluster }}" --tasks "$task_arn" \
+            aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task_arn" \
               --query 'tasks[0].stoppedReason' --output text
             exit 1
           fi

@@ -64,7 +64,7 @@ _CREDENTIAL_MODULES = ("navis.signals.google.resolve", "navis.signals.google.oau
 
 
 def _imports(path: pathlib.Path) -> set[str]:
-    tree = ast.parse(path.read_text())
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     out: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
@@ -327,7 +327,7 @@ def test_the_execution_context_carries_no_credential_fields():
     """`__ctx__` is what the worker threads into every payload. It must carry
     identifiers only — adding a token here would put one in the row, the outbox
     and every Observation event at once."""
-    source = (EXECUTION_DIR / "worker.py").read_text()
+    source = (EXECUTION_DIR / "worker.py").read_text(encoding="utf-8")
     ctx = source[source.index('"__ctx__": {'):source.index('"__ctx__": {') + 260]
     for forbidden in ("token", "secret", "credential", "authorization", "Bearer"):
         assert forbidden not in ctx.lower()
