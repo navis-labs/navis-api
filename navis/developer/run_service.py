@@ -49,6 +49,7 @@ from navis.developer.lifecycle import (
 from navis.developer.run_models import AgentRun, AgentRunOutcome, AgentRunStep, AgentTask
 from navis.developer.sanitize import PayloadTooLarge, sanitize_metadata, sanitize_text
 from navis.identity.enterprise_models import ServiceAccount
+from navis.platform.monitoring.metrics import timed
 
 
 class LifecycleError(Exception):
@@ -871,6 +872,33 @@ class AgentLifecycleService:
         mismatched tenant, at which point redundancy is the only thing that
         catches it. `None` for a task that is not this tenant's, which the
         route turns into 404: a cross-tenant task id reveals nothing.
+
+        ── WHY IT IS TIMED ─────────────────────────────────────────────────
+        This is the one Developer read whose cost grows with how much an
+        organization has DONE, rather than with what it asked for. Measured on
+        Postgres 18 with the indexes as shipped, the plan is a full scan of the
+        organization's outcomes joined to the task's runs, and it costs 1.3ms
+        at 1,000 outcomes, 2.7ms at 10,000 and 11.7ms at 100,000 — linear in
+        the organization's total, not in the task's. Nothing about that is
+        visible from a request count, so the latency is published here: an
+        operator sees the slope arrive instead of inferring it after a
+        complaint.
+
+        The fix, when the slope matters, is NOT the ordering index it looks
+        like it should be. An index on
+        `(organization_id, produced_at DESC NULLS LAST, updated_at DESC,
+        run_id DESC)` makes a RECENT task 9x faster and an OLD one 55x slower
+        (1.4ms -> 77ms, 382,000 buffers), because it walks newest-first and an
+        old task's first match is at the far end — and resuming old work is
+        exactly what this route is for. Only putting the task IN the index
+        helps uniformly, which means denormalizing `task_id` onto
+        `agent_run_outcomes` as `agent_id` already is (0.3ms flat, 4 buffers).
+
+        The four candidates were measured against both the recent-task and the
+        ancient-task case; the numbers above are that run's results. No
+        migration is written, deliberately: at the current workload this query
+        is ~1.3ms, and the series published here is what says when that has
+        stopped being true.
         """
         # Existence is checked against the TASK, so "this task has no
         # checkpoint yet" (404 with the task present) and "no such task" are
@@ -878,24 +906,25 @@ class AgentLifecycleService:
         if await self.get_task(org_id, task_id) is None:
             return None
 
-        row = (
-            await self._db.execute(
-                select(AgentRunOutcome, AgentRun)
-                .join(AgentRun, AgentRun.id == AgentRunOutcome.run_id)
-                .where(
-                    AgentRunOutcome.organization_id == org_id,
-                    AgentRun.organization_id == org_id,
-                    AgentRun.task_id == task_id,
-                    AgentRunOutcome.summary != "",
+        with timed("developer.latest_outcome_ms"):
+            row = (
+                await self._db.execute(
+                    select(AgentRunOutcome, AgentRun)
+                    .join(AgentRun, AgentRun.id == AgentRunOutcome.run_id)
+                    .where(
+                        AgentRunOutcome.organization_id == org_id,
+                        AgentRun.organization_id == org_id,
+                        AgentRun.task_id == task_id,
+                        AgentRunOutcome.summary != "",
+                    )
+                    .order_by(
+                        nulls_last(AgentRunOutcome.produced_at.desc()),
+                        AgentRunOutcome.updated_at.desc(),
+                        AgentRunOutcome.run_id.desc(),
+                    )
+                    .limit(1)
                 )
-                .order_by(
-                    nulls_last(AgentRunOutcome.produced_at.desc()),
-                    AgentRunOutcome.updated_at.desc(),
-                    AgentRunOutcome.run_id.desc(),
-                )
-                .limit(1)
-            )
-        ).first()
+            ).first()
 
         return None if row is None else (row[0], row[1])
 

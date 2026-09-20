@@ -1,0 +1,121 @@
+name: CI
+
+# The gate this repository did not have.
+#
+# Until now nothing ran the Core suite automatically: there was no `.github`
+# directory at all, so 2,765 unit tests and 287 Postgres integration tests
+# were only ever run by whoever remembered to. The integration half was worse
+# than unrun — it was SKIPPED by default (`NAVIS_TEST_DATABASE_URL` unset),
+# so a green local `pytest` reported success while 263 tests did nothing.
+#
+# ── WHY A SERVICE CONTAINER AND NOT THE REAL DATABASE ───────────────
+# The fixtures are destructive by design: several modules call
+# `Base.metadata.drop_all`, and the suite's own guard refuses any database
+# whose name does not start with `navis_test`. Pointing this at a shared or
+# production Neon branch would drop every table. A throwaway container is
+# both safer and faster — the same suite takes ~73s beside the database and
+# hours across a WAN, because eleven modules build and drop ~62 tables PER
+# TEST and that cost is almost entirely round trips.
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+    branches: [main, development]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here publishes, comments, tags or deploys.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: core unit · postgres integration
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # pgvector's image rather than plain `postgres`, because
+        # `memory_embeddings.embedding_vec` is a `vector` column and the
+        # retrieval path is exercised by the integration suite. Pinned to the
+        # same major (18) that Neon runs, so migrations and SQL behave the
+        # same here as in production.
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: navis
+          POSTGRES_PASSWORD: navis
+          POSTGRES_DB: navis_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U navis -d navis_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      # `navis_test` satisfies the suite's own `startswith("navis_test")`
+      # guard. Both URLs are asyncpg: the fixtures build async engines.
+      NAVIS_TEST_DATABASE_URL: postgresql+asyncpg://navis:navis@127.0.0.1:5432/navis_test
+      NAVIS_MIGRATION_TEST_DATABASE_URL: postgresql+asyncpg://navis:navis@127.0.0.1:5432/navis_test_migrations
+      # The event-bus handlers are given a real budget; the default is tuned
+      # for a laptop talking to a remote database and is needlessly tight here.
+      EVENT_HANDLER_TIMEOUT_SECONDS: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # The interpreter the platform is developed and deployed against.
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── The second database ─────────────────────────────────────────
+      # `test_cleanup_migration_postgres` asserts on what a MIGRATION does to
+      # an existing schema, so it needs a database carrying real Alembic
+      # history — not one built by `create_all`. Ten tests skip without it.
+      - name: Create and migrate the migration-test database
+        env:
+          PGPASSWORD: navis
+        run: |
+          psql -h 127.0.0.1 -U navis -d navis_test -c 'CREATE DATABASE navis_test_migrations'
+          DIRECT_DATABASE_URL="$NAVIS_MIGRATION_TEST_DATABASE_URL" \
+          DATABASE_URL="$NAVIS_MIGRATION_TEST_DATABASE_URL" \
+            python -m alembic upgrade head
+
+      # Separated from the integration run so a red build names its own cause:
+      # a logic regression and a database-fixture problem are different jobs
+      # for whoever picks it up.
+      - name: Core unit tests
+        run: python -m pytest tests/ -q --ignore=tests/integration
+
+      # ── The step that must not silently pass ────────────────────────
+      # `-p no:randomly` keeps module order stable, and `-rs` prints every
+      # skip REASON. A skip here is a test that did not run, which is exactly
+      # how 263 of these hid for so long; printing the reasons means a new
+      # credential gate shows up in the log instead of in the pass count.
+      - name: Postgres integration tests
+        run: python -m pytest tests/integration -q -rs
+
+      # The suite is allowed to skip ONLY the live third-party tests (Google,
+      # Slack), which need real external credentials. Anything else skipping
+      # means a database or fixture gate regressed, and that must fail the
+      # build rather than read as success.
+      - name: No unexpected skips
+        run: |
+          python -m pytest tests/integration -q -rs 2>&1 | tee /tmp/integration.txt
+          UNEXPECTED=$(grep '^SKIPPED' /tmp/integration.txt \
+            | grep -vciE 'GOOGLE_TEST|SLACK_TEST' || true)
+          if [ "$UNEXPECTED" -ne 0 ]; then
+            echo "::error::$UNEXPECTED integration test(s) skipped for a reason other than live third-party credentials"
+            grep '^SKIPPED' /tmp/integration.txt | grep -viE 'GOOGLE_TEST|SLACK_TEST'
+            exit 1
+          fi

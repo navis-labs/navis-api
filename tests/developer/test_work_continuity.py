@@ -31,7 +31,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from navis.developer.run_schemas import RecordOutcomeRequest
-from navis.developer.run_service import loses_to_stored_outcome
+from navis.developer.lifecycle import ALLOWED_RUN_TRANSITIONS, may_transition
+from navis.developer.run_service import _TERMINAL_RUN_STATUSES, loses_to_stored_outcome
 from navis.developer.sanitize import REDACTED, sanitize_metadata
 
 _T0 = datetime(2026, 9, 18, 12, 0, 0, tzinfo=timezone.utc)
@@ -214,3 +215,49 @@ def test_a_correlation_id_reported_as_session_id_is_still_redacted():
     there rather than asking the deny-list to get narrower."""
     out = sanitize_metadata({"sessionId": str(uuid.uuid4())}, field="metadata")
     assert out["sessionId"] == REDACTED
+
+
+# ── Run lifecycle: finishing twice the same way is not a conflict ───────────
+#
+# WHY THIS MATTERS FOR CONTINUITY, AND WHERE IT STOPS MATTERING. A run's status
+# is NOT what continuity depends on — the checkpoint lives on the outcome, and
+# `record_outcome` never inspects the run's status, so a closed run can still
+# receive one. Closing a run therefore cannot destroy work state, which is what
+# makes closing it safe to do at all.
+#
+# What it does affect is whether the ledger can be reasoned about: a run that
+# never closes has a NULL `completed_at`, so every duration and every
+# reliability rate computed over `agent_runs` is wrong. On the live tenant 307
+# of 321 runs were still `running`.
+
+
+def test_finishing_a_run_twice_the_same_way_is_idempotent():
+    """The caller that hits this cannot avoid it.
+
+    A session closes its run as the process is torn down — exactly when a
+    response is most likely to be lost — and the documented remedy for a lost
+    response is to retry. Answering the retry with 409 tells a client its
+    shutdown failed when the ledger already says what it was trying to say."""
+    assert may_transition("running", "completed")
+    # The transition table gives a terminal run no outgoing edges...
+    assert not may_transition("completed", "completed")
+    # ...so the idempotent repeat cannot be expressed there, and is handled in
+    # `finish_run` ahead of the transition check. This pins the vocabulary that
+    # decision reads, so a new terminal status cannot silently miss it.
+    assert _TERMINAL_RUN_STATUSES == {"completed", "failed", "cancelled"}
+
+
+def test_a_different_terminal_status_is_still_a_conflict():
+    """`completed` becoming `failed` is a REWRITE of history, not a retry. An
+    execution ledger that can be edited is not a ledger, so this stays refused
+    — the idempotence above is deliberately narrow."""
+    for other in ("failed", "cancelled"):
+        assert not may_transition("completed", other)
+
+
+def test_terminal_statuses_are_derived_from_the_transition_table():
+    """Not written out a second time. A status added to the vocabulary with no
+    outgoing edges becomes terminal everywhere at once, rather than in the one
+    place somebody remembered."""
+    for status in _TERMINAL_RUN_STATUSES:
+        assert ALLOWED_RUN_TRANSITIONS[status] == frozenset()

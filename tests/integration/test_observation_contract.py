@@ -1310,6 +1310,13 @@ async def test_the_projected_lineage_scan_returns_the_same_maps(Session, orgs):
 
     for e in events:
         eid = str(e.id)
+        # KEYED BY OUTCOME TYPE TOO, and in this position, because that is what
+        # `_lineage` does. This recomputation exists to prove the projected
+        # select returns the same maps as the entity scan, so it has to model
+        # the same rule — omitting this made the comparison assert that the
+        # projection had DROPPED a key it is supposed to produce.
+        if e.outcome_type:
+            _add(lineage, e.outcome_type, eid)
         sigs = [str(x) for x in (e.reasoning_signal_ids or [])]
         for sid in sigs:
             _add(lineage, sid, eid)

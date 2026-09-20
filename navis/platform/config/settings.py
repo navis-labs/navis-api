@@ -214,6 +214,22 @@ class Settings(BaseSettings):
     # keeps them isolated — no bad hits, just a re-embed on the next backfill).
     azure_openai_embed_deployment: str | None = None
     azure_openai_api_version: str = "2024-12-01-preview"
+    # ---- Outbound bounds on the Azure call ----
+    #
+    # WITHOUT THESE THE SDK DEFAULT APPLIES, AND IT IS 600 SECONDS. That default
+    # is `Timeout(connect=5.0, read=600.0, write=600.0, pool=600.0)`, so a hung
+    # Azure response could hold a context build for ten minutes — far longer
+    # than any caller waits and long enough to exhaust the worker while the
+    # request is still nominally in flight. An embedding of one short task
+    # string returns in ~1.5s measured, so 30s is already a wide outlier.
+    #
+    # `max_retries` is the SDK's own bounded retry with exponential backoff and
+    # jitter; it is surfaced here so a deployment can lower it rather than
+    # patch the provider. Retries multiply the ceiling, so the worst case a
+    # caller can see is roughly (1 + retries) x timeout.
+    azure_openai_timeout_seconds: float = 30.0
+    azure_openai_connect_timeout_seconds: float = 5.0
+    azure_openai_max_retries: int = 2
 
     # ---- Embedding read pin (migration control) ----
     # Retrieval reads a SPECIFIC (model, version) index. Writes go to whatever

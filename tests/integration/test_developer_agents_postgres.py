@@ -236,8 +236,10 @@ async def tenants(Session):
             )
             s.add_all([founder, admin])
             await s.flush()
-            s.add(Membership(user_id=founder.id, organization_id=org_id, role=Role.FOUNDER))
-            s.add(Membership(user_id=admin.id, organization_id=org_id, role=Role.ADMIN))
+            s.add(Membership(user_id=founder.id, organization_id=org_id, role=Role.FOUNDER,
+                             developer_role='owner'))
+            s.add(Membership(user_id=admin.id, organization_id=org_id, role=Role.ADMIN,
+                             developer_role='admin'))
             await OrganizationService(s).bootstrap(org_id, plan=Plan.ENTERPRISE)
             await s.flush()
 

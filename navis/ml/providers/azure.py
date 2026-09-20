@@ -17,10 +17,22 @@ If either is unset, that capability degrades gracefully:
 """
 from __future__ import annotations
 
+import asyncio
 import time
+import weakref
+from typing import Any
+
+import httpx
 
 from navis.ml.providers.base import EmbedResult, GenRequest, GenResult, MLProvider, ProviderInfo
 from navis.platform.config import settings
+
+#: One Azure client per event loop. See `AzureProvider._client` for why the key
+#: is the loop rather than the process. `WeakKeyDictionary` so a finished loop
+#: does not keep its client (and its socket pool) alive.
+_CLIENTS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any]" = (
+    weakref.WeakKeyDictionary()
+)
 
 DEFAULT_DEPLOYMENT = "gpt-4o-mini"
 # Reported when no embed deployment is configured — kept so ProviderInfo has a
@@ -60,13 +72,55 @@ class AzureProvider(MLProvider):
         return self._embed_deployment is not None
 
     def _client(self):
+        """The client for THIS event loop, built once and then reused.
+
+        ── WHY IT IS CACHED ────────────────────────────────────────────
+        This used to construct a fresh `AsyncAzureOpenAI` on every call, so
+        every embedding paid a new TLS handshake and no connection was ever
+        reused — and because nothing closed them, each one leaked its httpx
+        pool. The SDK is designed to be built once and shared.
+
+        ── WHY IT IS KEYED BY EVENT LOOP, NOT A PLAIN MODULE GLOBAL ────
+        httpx connection pools are NOT shareable across asyncio event loops:
+        a pool created on one loop and used from another fails at the
+        transport, which is the same class of fault as the cross-loop
+        contamination already seen in this repo's test suite. A single global
+        would work in the server (one loop for the process lifetime) and break
+        under pytest, workers, or anything that creates a loop per unit of
+        work. Keyed by the running loop, both are correct and each loop still
+        reuses exactly one pool.
+
+        Dead loops are dropped on lookup so the map cannot grow without bound.
+        """
         from openai import AsyncAzureOpenAI
 
-        return AsyncAzureOpenAI(
+        loop = asyncio.get_running_loop()
+        cached = _CLIENTS.get(loop)
+        if cached is not None:
+            return cached
+
+        for dead in [lp for lp in _CLIENTS if lp.is_closed()]:
+            _CLIENTS.pop(dead, None)
+
+        client = AsyncAzureOpenAI(
             api_key=settings.azure_openai_api_key,
             azure_endpoint=settings.azure_openai_endpoint or "",
             api_version=settings.azure_openai_api_version,
+            # BOUNDED, because the SDK default read timeout is 600s. See the
+            # note on these settings; a hung Azure response must not be able
+            # to hold a context build for ten minutes.
+            timeout=httpx.Timeout(
+                settings.azure_openai_timeout_seconds,
+                connect=settings.azure_openai_connect_timeout_seconds,
+            ),
+            # The SDK's own retry: bounded, with exponential backoff and
+            # jitter. Left at the configured value rather than disabled — a
+            # single 429 from Azure is the common case and is worth one retry
+            # — but it is the reason the worst case is (1 + retries) x timeout.
+            max_retries=settings.azure_openai_max_retries,
         )
+        _CLIENTS[loop] = client
+        return client
 
     async def generate(self, req: GenRequest) -> GenResult:
         client = self._client()

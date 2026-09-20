@@ -302,7 +302,17 @@ async def test_auth_me_reports_only_the_authenticated_organizations_permissions(
         assert body["organization"]["id"] == str(a_id)
         assert body["role"] == "employee"
         assert "execute_actions" not in body["permissions"], "Org B's grant leaked over HTTP"
-        assert sorted(body["permissions"]) == ["view_decisions", "view_signals"]
+        # `view_signals` ALONE, and the missing one is P1-6 rather than a bug.
+        # `employee`'s literal in `DEFAULT_ROLE_PERMISSIONS` still names
+        # VIEW_DECISIONS, but `_application_only` strips it: VIEW_DECISIONS is
+        # in `DEVELOPER_PERMISSIONS`, so no Application role carries it and the
+        # Developer surface is reached through `memberships.developer_role`.
+        #
+        # Kept as an EXACT set rather than relaxed to a membership check. The
+        # assertion above proves the cross-tenant grant did not leak; this one
+        # proves nothing ELSE arrived either, which is the property that would
+        # decay first if a future role change quietly widened the default.
+        assert sorted(body["permissions"]) == ["view_signals"]
 
         # Multi-org is REPORTED (F-2) — both seats visible, one flagged current,
         # neither non-current entry carrying a role or permission.

@@ -270,6 +270,11 @@ async def _principal_from_jwt(db: AsyncSession, token: str) -> Principal:
         return cached
     metrics.incr("auth.cache.miss")
 
+    # FOUR HOPS ON A CACHE MISS — revocation, user, membership, grants — and
+    # the cache above means most requests take none of them. Counted as one
+    # labelled step rather than four so the JWT path is comparable with the
+    # API-key path without inventing a fifth label.
+    metrics.incr("auth.db_query", labels={"step": "jwt_resolve"})
     revocation = TokenRevocationService(db)
     if await revocation.is_jti_revoked(jti):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token revoked")
@@ -343,6 +348,14 @@ async def _principal_from_api_key(db: AsyncSession, plaintext: str) -> Principal
     from navis.identity.apikeys import ApiKeyService, CredentialRefusal
     from navis.identity.enterprise_models import ServiceAccount
 
+    # EACH AUTH ROUND TRIP IS COUNTED, labelled by which step it is.
+    #
+    # "How many SQL statements on the request path are authentication?" was the
+    # question the last production audit could only answer by instrumenting a
+    # laptop. Counting the hops here makes it a division on the running system:
+    # `auth.db_query` over `auth.resolved`. The labels are three fixed strings,
+    # so this adds three series and no tenant cardinality.
+    metrics.incr("auth.db_query", labels={"step": "api_key"})
     checked = await ApiKeyService(db).check(plaintext)
     key = checked.key
     if key is None:
@@ -379,6 +392,12 @@ async def _principal_from_api_key(db: AsyncSession, plaintext: str) -> Principal
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid api key")
     kind = PrincipalKind.API_KEY
     if key.service_account_id is not None:
+        # CONDITIONAL, and that is worth being able to see: a bare API key never
+        # takes this hop, so an organization whose agents all run on service
+        # accounts pays one more round trip per request than one using bare
+        # keys. The ratio between this counter and `auth.resolved` is what says
+        # which shape a deployment actually serves.
+        metrics.incr("auth.db_query", labels={"step": "service_account"})
         sa = await db.get(ServiceAccount, key.service_account_id)
         if sa is None or sa.revoked_at is not None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "service account revoked")
@@ -426,6 +445,26 @@ async def get_principal(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     db: AsyncSession = Depends(get_session),
 ) -> Principal:
+    # WHY A SUCCESSFUL AUTHENTICATION IS MEASURED AT ALL.
+    #
+    # Until now this function emitted a metric only when it REFUSED. A
+    # successful resolution — the overwhelming majority, and the one that
+    # spends the round trips — was invisible: `/metrics` on a running Core
+    # could not say how many requests authenticated, by what kind of
+    # credential, or how long identity resolution took. So the one question a
+    # production audit asks first ("what does authentication cost us?") had no
+    # answer from the running system, and had to be reconstructed from a
+    # laptop.
+    #
+    # It is a COUNTER AND A HISTOGRAM, not a log line. Nothing here records
+    # which credential was presented, which organization it belongs to, or any
+    # part of the secret: `kind` is one of three fixed strings, so the series
+    # cardinality is bounded and no tenant is identifiable from the metric.
+    # Per-organization attribution already exists on the logging context
+    # (`set_org_id` below) and does not belong in a metric label, where it
+    # would multiply every series by the tenant count.
+    started = time.perf_counter()
+    kind = "none"
     try:
         # Ambiguous intent: an X-API-Key AND a bearer token in the same request. We
         # refuse to silently pick one credential to authenticate as — reject so the
@@ -436,12 +475,15 @@ async def get_principal(
                 "provide either an API key or a bearer token, not both",
             )
         if x_api_key:
+            kind = "api_key_header"
             principal = await _principal_from_api_key(db, x_api_key)
         elif creds and creds.scheme.lower() == "bearer":
             # A navis_ prefixed bearer is an API key; otherwise a JWT.
             if creds.credentials.startswith("navis_"):
+                kind = "api_key_bearer"
                 principal = await _principal_from_api_key(db, creds.credentials)
             else:
+                kind = "jwt"
                 principal = await _principal_from_jwt(db, creds.credentials)
         else:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing credentials")
@@ -449,10 +491,27 @@ async def get_principal(
         # log line emitted for the rest of this request (and any sync work on this task)
         # carries org_id. Runs only after auth succeeds; rejections never set it.
         set_org_id(str(principal.org_id))
+        metrics.observe_ms(
+            "auth.resolution_ms",
+            (time.perf_counter() - started) * 1000.0,
+            labels={"credential": kind, "principal": str(principal.kind)},
+        )
+        metrics.incr(
+            "auth.resolved",
+            labels={"credential": kind, "principal": str(principal.kind)},
+        )
         return principal
     except HTTPException as exc:
         # One place that counts every auth rejection (401 invalid/revoked vs 403).
         metrics.incr("auth.rejected", labels={"status": str(exc.status_code)})
+        # Timed on the refusal path too, and labelled as such. A deployment
+        # under credential-stuffing spends real time here, and a latency series
+        # that covered only successes would show that as a drop in load.
+        metrics.observe_ms(
+            "auth.resolution_ms",
+            (time.perf_counter() - started) * 1000.0,
+            labels={"credential": kind, "principal": "rejected"},
+        )
         raise
 
 

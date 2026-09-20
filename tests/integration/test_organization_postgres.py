@@ -43,7 +43,15 @@ async def _make_org(engine) -> uuid.UUID:
 
     from navis.identity.models import Organization
 
-    async with AsyncSession(engine) as s:
+    # `expire_on_commit=False` MATCHES PRODUCTION, and that is the whole fix.
+    # `AsyncSessionLocal` is built with it (platform/database/session.py); a bare
+    # `AsyncSession(engine)` defaults to True, which expires every attribute on
+    # commit. The `org.id` below then becomes a lazy refresh — IO issued from a
+    # plain attribute access, outside the greenlet SQLAlchemy's async bridge
+    # needs — and raises MissingGreenlet. Production never hits it because
+    # production never builds the session this way, so this was a harness fault
+    # dressed as six failures in the enum and concurrency tests.
+    async with AsyncSession(engine, expire_on_commit=False) as s:
         org = Organization(name="Acme", slug=f"acme-{uuid.uuid4().hex[:6]}")
         s.add(org)
         await s.commit()
