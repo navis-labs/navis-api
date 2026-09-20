@@ -273,7 +273,7 @@ def test_require_approver():
 def test_no_forbidden_pipeline_imports():
     violations = []
     for py in PKG.rglob("*.py"):
-        tree = ast.parse(py.read_text(), filename=str(py))
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
         mods = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -305,7 +305,7 @@ def test_adaptive_does_not_import_the_intelligence_orm_model():
     """
     offenders = []
     for py in PKG.rglob("*.py"):
-        tree = ast.parse(py.read_text(), filename=str(py))
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module == "navis.intelligence.models":
                 offenders.append(f"{py.name}:{node.lineno} imports {node.module}")
@@ -341,7 +341,7 @@ def test_no_nondeterministic_calls_in_projection():
     banned = {"now", "utcnow", "uuid4", "uuid1", "random", "randint", "choice", "shuffle"}
     offenders = []
     for name in projection:
-        tree = ast.parse((PKG / name).read_text())
+        tree = ast.parse((PKG / name).read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 if node.func.attr in banned:

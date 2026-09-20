@@ -413,7 +413,7 @@ def test_the_generic_worker_never_imports_a_connector():
     branch on it. Every connector needing a write-back would have added another
     branch. Connector knowledge now reaches the worker only through ActionSpec.
     """
-    tree = ast.parse((EXECUTION_DIR / "worker.py").read_text())
+    tree = ast.parse((EXECUTION_DIR / "worker.py").read_text(encoding="utf-8"))
     imported = {
         node.module
         for node in ast.walk(tree)
@@ -428,7 +428,7 @@ def test_the_generic_router_and_worker_do_not_branch_on_action_type():
     for every new connector. The spec is how those questions get answered now."""
     offenders: list[str] = []
     for name in ("worker.py", "router.py", "summary.py", "service.py"):
-        source = (EXECUTION_DIR / name).read_text()
+        source = (EXECUTION_DIR / name).read_text(encoding="utf-8")
         for node in ast.walk(ast.parse(source)):
             if not isinstance(node, ast.Compare):
                 continue

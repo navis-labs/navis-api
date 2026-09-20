@@ -6,15 +6,23 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# System deps for asyncpg / cryptography builds
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
-
+# No build-essential / libpq-dev here, deliberately. asyncpg, bcrypt,
+# cryptography and greenlet all publish manylinux wheels for cp312, and nothing
+# in this project uses psycopg — so the toolchain compiled nothing and shipped
+# in the final image anyway. Removing it took the image from 1.04GB to 605MB,
+# which is 435MB off every ECR push, every task cold start and every rollback.
+#
+# If a future dependency genuinely needs to compile, add a builder stage rather
+# than putting the toolchain back in the runtime image.
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
+
+# Run as a normal user. Nothing here needs root, and a container that does is a
+# container where a code-execution bug owns the whole filesystem.
+RUN useradd --create-home --uid 10001 navis && chown -R navis:navis /app
+USER navis
 
 EXPOSE 8000
 

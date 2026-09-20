@@ -35,7 +35,7 @@ BUSINESS_DOMAINS = {
 
 
 def _imported_modules(path: pathlib.Path) -> set[str]:
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     mods: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
