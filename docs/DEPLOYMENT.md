@@ -17,8 +17,27 @@ you later move to Terraform (`terraform import`).
 
 ## What you need before starting
 
-- An AWS account with admin access, and a chosen region. This runbook assumes
-  **`ap-south-1` (Mumbai)**. If you use a different region, substitute it everywhere.
+- An AWS account with admin access. This runbook uses **`ap-southeast-1` (Singapore)**.
+
+  That is a deliberate choice and not the obvious one, since the team and its users are in
+  India. **Neon has no Mumbai region** — the closest it offers is Singapore — and measuring
+  from an `ap-south-1` CloudShell gave a consistent **~64 ms** round trip to the Singapore
+  endpoint (66.2 / 64.8 / 62.6 ms on `SELECT 1`).
+
+  A single API request here issues many database queries, while the user pays the trip to the
+  load balancer only once, so the arithmetic is decisive:
+
+  | | AWS Mumbai | AWS Singapore |
+  |---|---|---|
+  | User → ALB | ~10 ms | ~65 ms |
+  | Each query | ~64 ms | ~2 ms |
+  | A 15-query request | **~970 ms** | **~95 ms** |
+
+  Put the compute next to the database, not next to the user. This also explains the
+  `SELECT 1` taking 1457 ms that is recorded in `db_pool_pre_ping`'s comment in
+  `navis/platform/config/settings.py` — that was this same problem, unmeasured.
+
+  Revisit only if Neon opens a Mumbai region.
 - A Neon account.
 - Admin access to the `navis-labs/navis-api` GitHub repository.
 - A domain you control, if you want HTTPS (required for production OAuth).
@@ -34,7 +53,7 @@ Budget expectation, per month, at pre-launch scale with no users:
 | Neon | $0 (free tier) | ~$19 (Launch) |
 | **Total** | **~$41** | **~$80** |
 
-These are approximate `ap-south-1` figures — verify in the AWS Pricing Calculator.
+These are approximate `ap-southeast-1` figures — verify in the AWS Pricing Calculator.
 **Container and load-balancer charges are per hour the resource exists, not per request.**
 An idle environment costs very nearly the same as a busy one. LLM provider spend (Azure
 OpenAI / Anthropic) is usage-based and separate from all of the above.
@@ -152,18 +171,32 @@ unaffected by anything you do in staging.
 ### 1.1 Create the projects
 
 1. Neon console -> **New Project**.
-2. Name: `navis-staging`. Postgres version: **16**.
-3. Region: pick the one **closest to `ap-south-1`**. Every query from ECS crosses the public
-   internet to Neon, so this is a latency decision, not a preference.
-4. Repeat for a second project named `navis-production`.
+2. Name: `navis-staging`.
+3. **Postgres version: 16.** Not the newest on offer. CI tests against
+   `pgvector/pgvector:pg16` and local development runs pg16, and a production database on a
+   major version CI never exercises is a blind spot. If you raise this, raise the CI image in
+   the same change.
+4. **Region: AWS Asia Pacific 1 (Singapore)** — the same region the AWS infrastructure runs
+   in. See the region note at the top of this document for why that is Singapore and not
+   Mumbai.
+5. Services: enable **Postgres database** only. Object storage, Functions, AI Gateway and
+   Neon Auth all stay **off** — this project has its own S3 usage, its own provider registry
+   for Azure OpenAI, and a complete identity system in `navis/identity/` that Neon Auth would
+   only collide with.
+6. Database name: `navis`.
+7. Repeat for a second project named `navis-production`. Use two separate **projects**, not
+   two branches of one: branches share the parent's settings and lifecycle, and production
+   should be unaffected by anything done in staging.
 
-> **Verify the latency before you build on it.** This codebase already carries a measurement
-> of `SELECT 1` against a production Neon endpoint taking **1457 ms** on a fresh session (see
-> the `db_pool_pre_ping` comment in `navis/platform/config/settings.py`). That is very high
-> and suggests the endpoint was far from the client. After creating the project, run
-> `psql '<direct-url>' -c '\timing' -c 'SELECT 1'` from an EC2 instance in `ap-south-1`. If a
-> round trip is much more than ~50 ms, choose a different Neon region before going further —
-> every API request pays this cost.
+> Neon names a project's default branch `production`. That is Neon's own terminology and has
+> nothing to do with this deployment's environments — the branch called `production` inside
+> the `navis-staging` project **is the staging database**.
+
+> **If you ever change the Neon region, re-measure before building on it.** From an
+> `ap-southeast-1` CloudShell, `psql '<direct-url>' -c '\timing' -c 'SELECT 1'` three times
+> and read the last two — the first includes connection setup. Same-region should be a few
+> milliseconds. Anything above ~50 ms means the compute and the database are not co-located,
+> and every API request will pay it many times over.
 
 ### 1.2 Enable pgvector
 
@@ -237,9 +270,9 @@ and correct route tables — exactly the topology this runbook needs, and buildi
 is a dozen screens of opportunity for a typo.
 
 1. **VPC console -> Your VPCs** -> confirm a VPC marked "Default VPC: Yes" exists in
-   `ap-south-1`. If someone deleted it, use **Actions -> Create default VPC**.
+   `ap-southeast-1`. If someone deleted it, use **Actions -> Create default VPC**.
 2. **Subnets** -> filter by that VPC. Pick **two subnets in different availability zones**
-   (e.g. `ap-south-1a` and `ap-south-1b`). An ALB requires at least two AZs.
+   (e.g. `ap-southeast-1a` and `ap-southeast-1b`). An ALB requires at least two AZs.
 3. Confirm each has **Auto-assign public IPv4 address = Yes**.
 
 `-> RECORD`: VPC ID (`vpc-…`) and the two subnet IDs (`subnet-…`, `subnet-…`).
@@ -309,7 +342,7 @@ Without one, every deploy leaves an image behind forever. On each repository,
 - Match criteria: **Image count more than** `10`
 - Action: **Expire**
 
-`-> RECORD`: the registry URI, e.g. `<account-id>.dkr.ecr.ap-south-1.amazonaws.com`.
+`-> RECORD`: the registry URI, e.g. `<account-id>.dkr.ecr.ap-southeast-1.amazonaws.com`.
 
 ---
 
@@ -388,14 +421,14 @@ The role **ECS itself** uses to pull the image and fetch secrets before your con
     {
       "Effect": "Allow",
       "Action": ["ssm:GetParameters", "ssm:GetParameter"],
-      "Resource": "arn:aws:ssm:ap-south-1:<ACCOUNT_ID>:parameter/navis/staging/*"
+      "Resource": "arn:aws:ssm:ap-southeast-1:<ACCOUNT_ID>:parameter/navis/staging/*"
     },
     {
       "Effect": "Allow",
       "Action": ["kms:Decrypt"],
       "Resource": "*",
       "Condition": {
-        "StringEquals": { "kms:ViaService": "ssm.ap-south-1.amazonaws.com" }
+        "StringEquals": { "kms:ViaService": "ssm.ap-southeast-1.amazonaws.com" }
       }
     }
   ]
@@ -592,7 +625,7 @@ being unhealthy.
 Required for production, because OAuth callbacks from Google and Slack will not accept a
 plain HTTP redirect URI.
 
-1. **ACM (in `ap-south-1`) -> Request a public certificate** for e.g. `api.navis.app` and
+1. **ACM (in `ap-southeast-1`) -> Request a public certificate** for e.g. `api.navis.app` and
    `staging-api.navis.app`. Validate by DNS.
 2. Add an **HTTPS:443** listener on the ALB using that certificate, forwarding to the target
    group.
@@ -665,7 +698,7 @@ Create each with **ECS -> Task definitions -> Create new task definition**:
 - Container image: `<registry>/navis-api-staging:bootstrap` (a placeholder — every deploy
   overwrites it with the commit SHA)
 - Port mappings: **8000/tcp** on the `api` task definition only
-- Log configuration: **awslogs**, group `/ecs/navis-staging`, region `ap-south-1`, stream
+- Log configuration: **awslogs**, group `/ecs/navis-staging`, region `ap-southeast-1`, stream
   prefix matching the container name
 
 **Commands** (enter as comma-separated values in the console's Command field):
@@ -712,7 +745,7 @@ Set these as plain **Environment variables** in all four task definitions:
 | `CELERY_RESULT_BACKEND` | `redis://<endpoint>:6379/3` | same shape |
 | `EXECUTION_INLINE_FALLBACK` | `false` | **`false`** |
 | `SIGNALS_REJECT_LEGACY_PLAINTEXT` | `false` | **`true`** |
-| `AWS_REGION` | `ap-south-1` | `ap-south-1` |
+| `AWS_REGION` | `ap-southeast-1` | `ap-southeast-1` |
 | `GOOGLE_REDIRECT_URI` | staging callback URL | production callback URL |
 | `GOOGLE_GMAIL_REDIRECT_URI` | staging Gmail callback URL | production equivalent |
 | `SLACK_REDIRECT_URI` | staging callback URL | production callback URL |
@@ -879,7 +912,7 @@ The deploy workflows expect the ECS services to already exist, so bootstrap once
 1. Build and push a first image locally:
 
 ```bash
-aws ecr get-login-password --region ap-south-1 \
+aws ecr get-login-password --region ap-southeast-1 \
   | docker login --username AWS --password-stdin <registry>
 
 docker build -t <registry>/navis-api-staging:bootstrap .
@@ -991,7 +1024,7 @@ Fill these in as you go. This table is the description of your infrastructure.
 
 | | Staging | Production |
 |---|---|---|
-| AWS region | `ap-south-1` | `ap-south-1` |
+| AWS region | `ap-southeast-1` | `ap-southeast-1` |
 | VPC ID | | |
 | Subnet A / B | | |
 | SG — ALB | | |

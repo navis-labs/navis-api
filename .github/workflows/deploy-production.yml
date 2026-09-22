@@ -63,7 +63,7 @@ jobs:
     with:
       environment: production
       # ---- EDIT THESE to match your AWS account ----
-      aws-region: ap-south-1
+      aws-region: ap-southeast-1
       ecr-repository: navis-api-prod
       ecs-cluster: navis-prod
       api-service: navis-api-prod
