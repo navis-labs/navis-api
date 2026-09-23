@@ -352,7 +352,7 @@ def test_embedding_subscriber_registered_for_every_memory_event():
         )
 
 
-async def test_the_azure_client_is_bounded_and_reused_within_a_loop():
+async def test_the_azure_client_is_bounded_and_reused_within_a_loop(monkeypatch):
     """Two production faults, pinned together because they share one line.
 
     THE TIMEOUT. The client used to be built with no `timeout=`, so the SDK
@@ -372,6 +372,20 @@ async def test_the_azure_client_is_bounded_and_reused_within_a_loop():
     from navis.ml.providers.azure import AzureProvider
     from navis.platform.config import settings
 
+    # `_client()` builds the SDK client for real, and `AsyncAzureOpenAI` refuses
+    # to construct without a credential. Nothing below is about authentication
+    # and no request is ever made, so a placeholder is enough — but it has to be
+    # supplied, because read from the environment this passed on a laptop with a
+    # populated `.env` and failed in CI, which has none. Same environment
+    # coupling `test_azure_provider_gates_embedding_on_separate_deployment`
+    # guards against below. `or` keeps a real configured key in play where one
+    # exists, so a developer with Azure set up still exercises their own value.
+    monkeypatch.setattr(
+        settings,
+        "azure_openai_api_key",
+        settings.azure_openai_api_key or "not-a-real-key-no-request-is-made",
+    )
+
     az = AzureProvider(deployment="gpt", embed_deployment="my-embed")
     client = az._client()
 
@@ -388,13 +402,22 @@ async def test_the_azure_client_is_bounded_and_reused_within_a_loop():
     assert AzureProvider(deployment="gpt", embed_deployment="my-embed")._client() is client
 
 
-def test_the_azure_client_cache_does_not_leak_across_event_loops():
+def test_the_azure_client_cache_does_not_leak_across_event_loops(monkeypatch):
     """httpx pools are not shareable between asyncio loops, so a plain module
     global would be reused from the wrong loop and fail at the transport. Each
     loop must get its own."""
     import asyncio
 
     from navis.ml.providers.azure import AzureProvider
+    from navis.platform.config import settings
+
+    # Same reason as the test above: the SDK will not construct without a
+    # credential, and this test is about loop affinity, not authentication.
+    monkeypatch.setattr(
+        settings,
+        "azure_openai_api_key",
+        settings.azure_openai_api_key or "not-a-real-key-no-request-is-made",
+    )
 
     async def _grab():
         return AzureProvider(deployment="gpt", embed_deployment="my-embed")._client()
