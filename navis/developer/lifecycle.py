@@ -281,3 +281,13 @@ MAX_STEPS_PER_RUN = 1000
 #: Default and maximum page sizes for every list endpoint in this domain.
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
+
+#: Runs one economics rollup will reduce in a single request.
+#:
+#: NOT a page size — the rollup groups runs, so paging the SCAN would silently
+#: change the answer rather than continue it. A ceiling is still needed because
+#: the query is unbounded in the tenant's history, so it is set high enough that
+#: no real organization reaches it soon and reported honestly when it does:
+#: `runs_truncated` tells the caller the figures describe a prefix. An aggregate
+#: that quietly summarises half the evidence is worse than one that refuses.
+MAX_ECONOMICS_RUNS = 5000

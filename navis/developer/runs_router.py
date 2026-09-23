@@ -55,10 +55,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.developer.gateway import DeveloperContext, require_developer
-from navis.developer.lifecycle import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+from navis.developer.lifecycle import DEFAULT_PAGE_SIZE, MAX_ECONOMICS_RUNS, MAX_PAGE_SIZE
 from navis.developer.run_schemas import (
     CloseTaskRequest,
     CreateTaskRequest,
+    EconomicsRollupOut,
     FinishRunRequest,
     LatestOutcomeOut,
     OutcomeOut,
@@ -598,6 +599,74 @@ async def get_run_telemetry(
     if telemetry is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such run in this organization")
     return RunTelemetryOut.of(telemetry)
+
+
+@router.get(
+    "/economics",
+    response_model=EconomicsRollupOut,
+    responses=_ERRORS,
+    dependencies=[_READ_LIMIT],
+    summary="Cross-run economics: what reaching a successful outcome cost",
+)
+async def get_economics_rollup(
+    ctx: DeveloperContext = Depends(_reader),
+    db: AsyncSession = Depends(get_session),
+    task_id: uuid.UUID | None = Query(default=None, description="One task's attempts only."),
+    # NO `agent_id` QUERY PARAMETER, deliberately. `agent_id` is allowed only as
+    # a PATH segment on this boundary — the rule
+    # `test_no_developer_route_accepts_an_identity_parameter` enforces — because
+    # an identity supplied alongside an already-resolved resource is how a
+    # filter quietly becomes a scope. The service still takes the argument, and
+    # the Postgres suite exercises agent isolation through it; if narrowing by
+    # agent is wanted at the edge it belongs at `/agents/{agent_id}/economics`,
+    # which is a resource path and is looked up under the tenant.
+    model_name: str | None = Query(
+        default=None,
+        max_length=128,
+        description=(
+            "Runs that used this model at least once. A FILTER, not a grouping "
+            "key — a multi-model run is reported whole, with its whole cost."
+        ),
+    ),
+    context_version: str | None = Query(default=None, max_length=64),
+) -> EconomicsRollupOut:
+    """What a successful outcome costs, grouped by task and by whether Navis
+    context was fetched.
+
+    THE QUESTION THIS ANSWERS. Per-run telemetry already says what one attempt
+    cost; it cannot say what SUCCESS costs, because a retry is another run of
+    the same task and dividing by attempts makes an agent that needed four
+    tries look four times cheaper than one that needed none. So the numerator
+    is every attempt and the denominator is successful outcomes.
+
+    DERIVED, NOT STORED. Every figure is arithmetic over `agent_runs`,
+    `agent_run_steps` and `agent_run_outcomes` — rows this same credential can
+    already read through `/runs`, `/runs/{id}/steps` and `/runs/{id}/outcome`,
+    under the same permission, the same capability and the same tenant filter.
+    No table was added for it, and nothing is cached: recomputing is what keeps
+    the answer right when an outcome is judged after the fact.
+
+    METADATA ONLY. Counts, costs, rates and versions. No context CONTENT, no
+    memory, no source document, no argument value — `ContextUsageOut` already
+    draws that line for one run and this holds it across many.
+
+    ── WHAT IT DOES NOT CLAIM ──────────────────────────────────────────
+    `context_fetched` records that the agent ASKED Navis for context, not that
+    the context caused the outcome. Runs are not assigned to the two groups;
+    they self-select, so a difference between them is a correlation. It also
+    does not identify WHICH context was supplied — Navis issues no context
+    identity today, so two runs in one group may have been given different
+    facts. The response repeats this in `interpretation`, because a number
+    travels further than the endpoint that produced it.
+    """
+    rows = await AgentLifecycleService(db).list_run_economics(
+        ctx.organization_id,
+        task_id=task_id,
+        model_name=model_name,
+        context_version=context_version,
+    )
+    truncated = len(rows) > MAX_ECONOMICS_RUNS
+    return EconomicsRollupOut.of(rows[:MAX_ECONOMICS_RUNS], truncated=truncated)
 
 
 @router.get(

@@ -19,6 +19,7 @@ back only as stored — so a redacted value stays redacted on the way out.
 """
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import datetime
 
@@ -42,7 +43,9 @@ __all__ = [
     "CloseTaskRequest",
     "ContextUsageOut",
     "CreateTaskRequest",
+    "EconomicsGroupOut",
     "EconomicsOut",
+    "EconomicsRollupOut",
     "FinishRunRequest",
     "LatencyOut",
     "ModelUsageOut",
@@ -905,3 +908,231 @@ class StepPageOut(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+# ── Agent Economics: cross-run, derived, read-only ──────────────────────────
+#
+# WHY THIS IS A ROLLUP AND NOT A NEW TABLE. Every figure below is arithmetic
+# over `agent_runs`, `agent_run_steps` and `agent_run_outcomes`, all of which
+# are immutable once written. Storing the aggregate would create a second
+# source of truth that has to be kept in step with the first, and the first is
+# already the evidence. Recomputing is also what keeps the answer correct when
+# an outcome is recorded late.
+#
+# WHY THE UNIT IS THE TASK AND NOT THE RUN. A retry is another RUN of the same
+# task — the ledger already says so structurally, which is why no retry counter
+# exists. Cost per run therefore answers the wrong question: it divides by
+# attempts, and an agent that succeeds on the fourth try looks four times
+# cheaper than one that succeeds immediately. The denominator that matters is
+# SUCCESSFUL OUTCOMES, and the numerator is every attempt spent reaching them.
+
+
+def _percentile(values: list[int], fraction: float) -> int | None:
+    """Nearest-rank percentile over already-sorted-able integers.
+
+    Nearest-rank rather than interpolated: these are counts of micros over a
+    handful of runs, and inventing a value between two observed costs would
+    report a figure no run actually had.
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, math.ceil(fraction * len(ordered)))
+    return ordered[min(rank, len(ordered)) - 1]
+
+
+class EconomicsGroupOut(BaseModel):
+    """One comparable population of attempts, and what reaching success cost.
+
+    THE GROUPING KEY IS (task, context_fetched, context_version). Those three
+    are what make two runs comparable: the same work, asked the same way, with
+    or without the organizational context Navis supplied. Agent and model are
+    FILTERS rather than grouping keys by default — adding them to the key
+    multiplies the groups and produces populations of one, where a success rate
+    is either 0% or 100% and means nothing either way.
+    """
+
+    task_id: uuid.UUID
+    task_description: str
+    #: Whether these runs fetched organizational context from Navis, derived
+    #: from the presence of a `context_fetch` step.
+    #:
+    #: THIS IS OBSERVATIONAL. It records that the agent ASKED Navis for context,
+    #: not that the context caused what followed: runs are not assigned to these
+    #: groups, they self-select, so a difference between them is a correlation.
+    #: It also does not identify WHICH bundle was supplied — Navis issues no
+    #: context identity today, so two runs in the same group may have been given
+    #: materially different facts.
+    context_fetched: bool
+    context_version: str | None
+
+    #: Population size. A rate over three runs is not a rate, and the reader
+    #: needs to see that without computing it.
+    runs: int
+    successful_outcomes: int
+    failed_outcomes: int
+    #: Neither success nor failure: nothing judged the run. Reported separately
+    #: because folding it into failure would invent a verdict.
+    unknown_outcomes: int
+    partial_outcomes: int
+    success_rate: float | None = Field(
+        default=None,
+        description=(
+            "Successful outcomes over runs that were JUDGED. NULL when none "
+            "were judged — which is not a zero success rate, it is no evidence."
+        ),
+    )
+
+    #: ── Cost. The two bases never meet. ─────────────────────────────
+    currency: str | None = None
+    mixed_currency: bool = False
+    estimated_cost_micros: int | None = None
+    provider_reported_cost_micros: int | None = None
+    #: THE HEADLINE FIGURE: every attempt's cost divided by the successes those
+    #: attempts bought. NULL when there were no successes — an infinite cost per
+    #: success is not a number, and reporting the raw total there would read as
+    #: though the spend had achieved something.
+    expected_estimated_cost_per_success_micros: int | None = None
+    expected_reported_cost_per_success_micros: int | None = None
+    #: Spread over RUNS, not over successes: it describes what one attempt
+    #: costs, which is the figure an operator budgets against.
+    p50_run_cost_micros: int | None = None
+    p90_run_cost_micros: int | None = None
+    pricing_versions: list[str] = Field(default_factory=list)
+    #: Model steps that carried no cost at all. A total computed around them is
+    #: incomplete, and the reader must be able to see how incomplete.
+    uncosted_generations: int = 0
+    runs_with_no_cost_recorded: int = 0
+
+    #: Reported beside cost, never folded into it — time is not money here, and
+    #: summing them would invent an exchange rate.
+    p50_latency_ms: int | None = None
+    p90_latency_ms: int | None = None
+
+    #: Quality, where anything judged it. Averaged over the runs that carry a
+    #: score, not over all runs, so an unscored run does not read as a zero.
+    mean_quality_score: float | None = None
+    human_corrections: int = 0
+    models: list[str] = Field(default_factory=list)
+
+
+class EconomicsRollupOut(BaseModel):
+    """Cross-run economics for one organization.
+
+    READ-ONLY AND DERIVED. It adds no fact and no authority: every input is
+    already readable through `/runs`, `/runs/{id}/steps` and
+    `/runs/{id}/outcome` under the same permission and the same tenant filter.
+    """
+
+    groups: list[EconomicsGroupOut]
+    count: int
+    runs_considered: int
+    #: TRUE when the scan hit `MAX_ECONOMICS_RUNS` and these figures therefore
+    #: describe a prefix of the tenant's history rather than all of it.
+    runs_truncated: bool = False
+    #: Restated on the response so a stored or forwarded result cannot be read
+    #: as a causal claim by someone who did not issue the request.
+    interpretation: str = Field(
+        default=(
+            "Observational. Runs self-select into context_fetched; a difference "
+            "between groups is a correlation, not a measured effect of context."
+        ),
+    )
+
+    @classmethod
+    def of(cls, rows, *, truncated: bool = False) -> "EconomicsRollupOut":
+        """Group per-run economics into comparable populations.
+
+        Pure: takes rows, returns totals, touches nothing — the same discipline
+        as `RunTelemetryOut.of`, and for the same reason. The arithmetic that
+        decides whether context is worth its tokens is exactly the arithmetic
+        that must be testable without a database.
+        """
+        buckets: dict[tuple, list] = {}
+        for row in rows:
+            buckets.setdefault(
+                (row.task_id, row.context_fetched, row.context_version), []
+            ).append(row)
+
+        groups: list[EconomicsGroupOut] = []
+        for (task_id, fetched, version), members in buckets.items():
+            successes = sum(1 for r in members if r.outcome_status == OutcomeStatus.SUCCESS.value)
+            failures = sum(1 for r in members if r.outcome_status == OutcomeStatus.FAILURE.value)
+            partials = sum(1 for r in members if r.outcome_status == OutcomeStatus.PARTIAL.value)
+            # `None` and the explicit "unknown" status mean the same thing here:
+            # nothing judged this run.
+            unknown = len(members) - successes - failures - partials
+            judged = successes + failures + partials
+
+            currencies: set[str] = set()
+            pricing: set[str] = set()
+            models: set[str] = set()
+            for r in members:
+                currencies |= r.currencies
+                pricing |= r.pricing_versions
+                models |= r.models
+
+            mixed = len(currencies) > 1
+            est_values = [r.estimated_micros for r in members if r.estimated_micros is not None]
+            rep_values = [r.reported_micros for r in members if r.reported_micros is not None]
+            # Across currencies a total is meaningless, so it is withheld rather
+            # than computed — the same rule `EconomicsOut` applies per run.
+            est_total = sum(est_values) if est_values and not mixed else None
+            rep_total = sum(rep_values) if rep_values and not mixed else None
+
+            per_run = [
+                (r.estimated_micros or 0) + (r.reported_micros or 0)
+                for r in members
+                if r.estimated_micros is not None or r.reported_micros is not None
+            ]
+            latencies = [r.latency_ms for r in members if r.latency_ms is not None]
+            scores = [r.quality_score for r in members if r.quality_score is not None]
+
+            groups.append(
+                EconomicsGroupOut(
+                    task_id=task_id,
+                    task_description=members[0].task_description,
+                    context_fetched=fetched,
+                    context_version=version,
+                    runs=len(members),
+                    successful_outcomes=successes,
+                    failed_outcomes=failures,
+                    unknown_outcomes=unknown,
+                    partial_outcomes=partials,
+                    success_rate=(successes / judged) if judged else None,
+                    currency=None if mixed else next(iter(currencies), None),
+                    mixed_currency=mixed,
+                    estimated_cost_micros=est_total,
+                    provider_reported_cost_micros=rep_total,
+                    expected_estimated_cost_per_success_micros=(
+                        est_total // successes if est_total is not None and successes else None
+                    ),
+                    expected_reported_cost_per_success_micros=(
+                        rep_total // successes if rep_total is not None and successes else None
+                    ),
+                    p50_run_cost_micros=None if mixed else _percentile(per_run, 0.50),
+                    p90_run_cost_micros=None if mixed else _percentile(per_run, 0.90),
+                    pricing_versions=sorted(pricing),
+                    uncosted_generations=sum(r.uncosted_generations for r in members),
+                    runs_with_no_cost_recorded=sum(
+                        1
+                        for r in members
+                        if r.estimated_micros is None and r.reported_micros is None
+                    ),
+                    p50_latency_ms=_percentile(latencies, 0.50),
+                    p90_latency_ms=_percentile(latencies, 0.90),
+                    mean_quality_score=(sum(scores) / len(scores)) if scores else None,
+                    human_corrections=sum(r.human_corrections or 0 for r in members),
+                    models=sorted(models),
+                )
+            )
+
+        # Deterministic: biggest populations first, then a stable tiebreak, so
+        # two identical requests cannot disagree about order.
+        groups.sort(key=lambda g: (-g.runs, str(g.task_id), g.context_fetched))
+        return cls(
+            groups=groups,
+            count=len(groups),
+            runs_considered=len(list(rows)),
+            runs_truncated=truncated,
+        )

@@ -29,20 +29,34 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import String, func, literal_column, nulls_last, select
+from sqlalchemy import (
+    String,
+    and_,
+    case,
+    distinct,
+    exists,
+    func,
+    literal_column,
+    nulls_last,
+    select,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from navis.developer.lifecycle import (
     ALLOWED_RUN_TRANSITIONS,
     DEFAULT_PAGE_SIZE,
+    MAX_ECONOMICS_RUNS,
     MAX_PAGE_SIZE,
     MAX_STEP_LABEL,
     MAX_STEPS_PER_RUN,
     MAX_TASK_DESCRIPTION,
     MAX_TOOL_NAME,
+    CostBasis,
     RunStatus,
     StepStatus,
+    StepType,
     TaskStatus,
     may_transition,
 )
@@ -191,6 +205,45 @@ class Page:
     total: int
     limit: int
     offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class RunEconomics:
+    """ONE run, reduced to the figures a cross-run comparison needs.
+
+    THE UNIT OF THE ROLLUP IS THE RUN, not the step, and that is deliberate.
+    Costs are summed per run in SQL so the Python layer never holds a step row;
+    a tenant with a thousand tasks at a thousand steps each would otherwise ship
+    a million rows to compute a handful of numbers.
+
+    Every field is already recorded on an immutable row. Nothing here is new
+    evidence — it is the same arithmetic `RunTelemetryOut.of` performs for one
+    run, expressed so many runs can be grouped.
+    """
+
+    task_id: uuid.UUID
+    task_description: str
+    agent_id: uuid.UUID | None
+    #: Whether this run asked Navis for organizational context. Derived from the
+    #: presence of a `context_fetch` step, which is the only evidence Navis has
+    #: that context was actually taken. It says the agent FETCHED context; it
+    #: does not identify which bundle, and it is not a claim about causation.
+    context_fetched: bool
+    context_version: str | None
+    #: Split, never summed — see `CostBasis`. NULL stays NULL: a run whose steps
+    #: carried no cost is uncosted, not free.
+    estimated_micros: int | None
+    reported_micros: int | None
+    uncosted_generations: int
+    currencies: frozenset[str]
+    pricing_versions: frozenset[str]
+    #: `None` when nothing has judged the run — which must stay distinguishable
+    #: from a judged failure, or the first metric built on this is poisoned.
+    outcome_status: str | None
+    quality_score: float | None
+    human_corrections: int | None
+    latency_ms: int | None
+    models: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -992,6 +1045,199 @@ class AgentLifecycleService:
             outcome=outcome,
         )
 
+    async def list_run_economics(
+        self,
+        org_id: uuid.UUID,
+        *,
+        task_id: uuid.UUID | None = None,
+        agent_id: uuid.UUID | None = None,
+        model_name: str | None = None,
+        context_version: str | None = None,
+        limit: int | None = None,
+    ) -> list[RunEconomics]:
+        """Every run's economics, reduced in SQL, for cross-run grouping.
+
+        ONE STATEMENT, and the reason is the shape of the data rather than a
+        preference. A run holds up to `MAX_STEPS_PER_RUN` steps; loading the
+        timeline of every run to sum it in Python — which is what
+        `get_run_telemetry` correctly does for ONE run — would be a million rows
+        to produce a dozen numbers. The per-step sums are therefore aggregated
+        by the database and only one row per run crosses the boundary.
+
+        NO FACT AND NO AUTHORITY IS ADDED. Every column here is already readable
+        through `/runs`, `/runs/{id}/steps` and `/runs/{id}/outcome` under the
+        same permission; this groups them. The arithmetic deliberately mirrors
+        `RunTelemetryOut.of` — estimated and provider-reported accumulate
+        separately, a NULL `cost_micros` counts as an uncosted generation rather
+        than as zero — because two places that sum the same rows differently is
+        how a platform starts disagreeing with itself.
+
+        TENANT FILTER ON EVERY TABLE, not only on the run. `agent_run_steps` and
+        `agent_run_outcomes` both carry `organization_id` precisely so a join
+        cannot widen the tenant, and both are constrained here even though the
+        run join already implies it — the redundancy is what catches a future
+        join written the other way round.
+        """
+        est = func.sum(
+            case(
+                (
+                    and_(
+                        AgentRunStep.cost_micros.isnot(None),
+                        AgentRunStep.cost_basis != CostBasis.PROVIDER_REPORTED.value,
+                    ),
+                    AgentRunStep.cost_micros,
+                ),
+                else_=0,
+            )
+        )
+        rep = func.sum(
+            case(
+                (
+                    and_(
+                        AgentRunStep.cost_micros.isnot(None),
+                        AgentRunStep.cost_basis == CostBasis.PROVIDER_REPORTED.value,
+                    ),
+                    AgentRunStep.cost_micros,
+                ),
+                else_=0,
+            )
+        )
+        # Counted, never treated as zero: a model step with no cost figure is
+        # missing evidence, and a total computed around it is incomplete rather
+        # than cheap. `EconomicsOut` already reports this per run.
+        uncosted = func.count(
+            case(
+                (
+                    and_(
+                        AgentRunStep.step_type == StepType.MODEL_GENERATION.value,
+                        AgentRunStep.cost_micros.is_(None),
+                    ),
+                    1,
+                )
+            )
+        )
+        costed = func.count(AgentRunStep.cost_micros)
+        fetches = func.count(
+            case((AgentRunStep.step_type == StepType.CONTEXT_FETCH.value, 1))
+        )
+
+        stmt = (
+            select(
+                AgentRun.id,
+                AgentRun.task_id,
+                AgentTask.description,
+                AgentRun.agent_id,
+                AgentRun.context_version,
+                est.label("estimated"),
+                rep.label("reported"),
+                costed.label("costed"),
+                uncosted.label("uncosted"),
+                fetches.label("fetches"),
+                func.sum(func.coalesce(AgentRunStep.latency_ms, 0)).label("latency_ms"),
+                func.array_agg(distinct(AgentRunStep.cost_currency)).label("currencies"),
+                func.array_agg(distinct(AgentRunStep.pricing_version)).label("pricing"),
+                func.array_agg(distinct(AgentRunStep.model_name)).label("models"),
+                AgentRunOutcome.status,
+                AgentRunOutcome.quality_score,
+                AgentRunOutcome.human_corrections,
+            )
+            .join(AgentTask, AgentTask.id == AgentRun.task_id)
+            # OUTER, because a run with no steps is still an attempt: it
+            # consumed nothing and may still have produced an outcome, and
+            # dropping it would quietly shrink the denominator.
+            .outerjoin(
+                AgentRunStep,
+                and_(
+                    AgentRunStep.run_id == AgentRun.id,
+                    AgentRunStep.organization_id == org_id,
+                ),
+            )
+            # OUTER for the same reason, and because `unknown` is the common
+            # case — an unjudged run is evidence of an attempt's cost.
+            .outerjoin(
+                AgentRunOutcome,
+                and_(
+                    AgentRunOutcome.run_id == AgentRun.id,
+                    AgentRunOutcome.organization_id == org_id,
+                ),
+            )
+            .where(AgentRun.organization_id == org_id, AgentTask.organization_id == org_id)
+            .group_by(
+                AgentRun.id,
+                AgentRun.task_id,
+                AgentTask.description,
+                AgentRun.agent_id,
+                AgentRun.context_version,
+                AgentRunOutcome.status,
+                AgentRunOutcome.quality_score,
+                AgentRunOutcome.human_corrections,
+            )
+        )
+        if task_id is not None:
+            stmt = stmt.where(AgentRun.task_id == task_id)
+        if agent_id is not None:
+            stmt = stmt.where(AgentRun.agent_id == agent_id)
+        if context_version is not None:
+            stmt = stmt.where(AgentRun.context_version == context_version)
+        if model_name is not None:
+            # EXISTS rather than a predicate on the joined step: filtering the
+            # join would also remove that run's OTHER steps from the sums, so a
+            # multi-model run would report a fraction of its own cost.
+            #
+            # ALIASED, and it has to be. `AgentRunStep` is already in the outer
+            # FROM through the join above, so an un-aliased subquery correlates
+            # against that same table and SQLAlchemy is left with no FROM clause
+            # at all — `InvalidRequestError: returned no FROM clauses due to
+            # auto-correlation`. The alias makes this a second, independent
+            # reference to the table.
+            probe = aliased(AgentRunStep)
+            stmt = stmt.where(
+                exists(
+                    select(1)
+                    .select_from(probe)
+                    .where(
+                        probe.run_id == AgentRun.id,
+                        probe.organization_id == org_id,
+                        probe.model_name == model_name,
+                    )
+                )
+            )
+        # BOUNDED SCAN, and the caller is told when it bit. A rollup computed
+        # over a truncated set of runs is a wrong number rather than a partial
+        # one — the same reasoning `get_run_telemetry` gives for loading a whole
+        # timeline — so the ceiling is high, ordered deterministically, and the
+        # schema reports `runs_truncated` when it is reached.
+        stmt = stmt.order_by(AgentRun.id).limit((limit or MAX_ECONOMICS_RUNS) + 1)
+
+        def _clean(values) -> frozenset[str]:
+            return frozenset(v for v in (values or []) if v)
+
+        out: list[RunEconomics] = []
+        for row in (await self._db.execute(stmt)).all():
+            out.append(
+                RunEconomics(
+                    task_id=row.task_id,
+                    task_description=row.description or "",
+                    agent_id=row.agent_id,
+                    context_fetched=bool(row.fetches),
+                    context_version=row.context_version,
+                    # NULL, not 0, when nothing was costed — the distinction
+                    # between "cost nothing" and "we do not know" is the one
+                    # `EconomicsOut` exists to preserve.
+                    estimated_micros=int(row.estimated) if row.costed and row.estimated else None,
+                    reported_micros=int(row.reported) if row.costed and row.reported else None,
+                    uncosted_generations=int(row.uncosted or 0),
+                    currencies=_clean(row.currencies),
+                    pricing_versions=_clean(row.pricing),
+                    outcome_status=row.status,
+                    quality_score=row.quality_score,
+                    human_corrections=row.human_corrections,
+                    latency_ms=int(row.latency_ms) if row.latency_ms is not None else None,
+                    models=_clean(row.models),
+                )
+            )
+        return out
+
 
 __all__ = [
     "AgentLifecycleService",
@@ -999,6 +1245,7 @@ __all__ = [
     "LifecycleError",
     "Page",
     "PayloadTooLarge",
+    "RunEconomics",
     "RunTelemetry",
     "StaleWrite",
     "StepLimitReached",
