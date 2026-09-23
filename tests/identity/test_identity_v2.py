@@ -732,7 +732,7 @@ async def test_api_keys_isolated_per_org():
 # ---- migration bootstrap: base creates the foundational tables ----
 
 def test_base_migration_creates_identity_tables():
-    src = (MIGRATIONS / "0000_identity_base.py").read_text()
+    src = (MIGRATIONS / "0000_identity_base.py").read_text(encoding="utf-8")
     created = {
         n.args[0].value
         for n in ast.walk(ast.parse(src))
@@ -742,8 +742,8 @@ def test_base_migration_creates_identity_tables():
 
 
 def test_chain_is_anchored_to_base():
-    base = (MIGRATIONS / "0000_identity_base.py").read_text()
-    first = (MIGRATIONS / "0001_signal_events_contract.py").read_text()
+    base = (MIGRATIONS / "0000_identity_base.py").read_text(encoding="utf-8")
+    first = (MIGRATIONS / "0001_signal_events_contract.py").read_text(encoding="utf-8")
     assert "down_revision: Union[str, None] = None" in base
     assert '"0000_identity_base"' in first  # 0001 now depends on the base
 
@@ -753,7 +753,7 @@ def test_chain_is_anchored_to_base():
 def test_identity_imports_no_business_domain():
     violations = []
     for py in IDENTITY.rglob("*.py"):
-        for node in ast.walk(ast.parse(py.read_text(), filename=str(py))):
+        for node in ast.walk(ast.parse(py.read_text(encoding="utf-8"), filename=str(py))):
             mods = []
             if isinstance(node, ast.Import):
                 mods = [a.name for a in node.names]

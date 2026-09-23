@@ -1310,11 +1310,13 @@ async def test_the_projected_lineage_scan_returns_the_same_maps(Session, orgs):
 
     for e in events:
         eid = str(e.id)
-        # KEYED BY OUTCOME TYPE TOO, and in this position, because that is what
-        # `_lineage` does. This recomputation exists to prove the projected
-        # select returns the same maps as the entity scan, so it has to model
-        # the same rule — omitting this made the comparison assert that the
-        # projection had DROPPED a key it is supposed to produce.
+        # outcome_type is an aggregate key too — see _lineage()'s docstring in
+        # navis/learning/metrics.py, which calls it "the only TYPE-STABLE key
+        # Learning has" and adds it deliberately so a consumer citing an
+        # outcome counter has events to cite. This rebuild predates that and
+        # was never re-run, because it is gated on NAVIS_TEST_DATABASE_URL.
+        # Added here in the same order the implementation uses, so the two
+        # maps stay comparable entry-for-entry under _MAX_LINEAGE.
         if e.outcome_type:
             _add(lineage, e.outcome_type, eid)
         sigs = [str(x) for x in (e.reasoning_signal_ids or [])]

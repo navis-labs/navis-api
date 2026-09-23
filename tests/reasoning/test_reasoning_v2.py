@@ -176,7 +176,7 @@ def test_reasoning_v2_has_no_clock_llm_or_io_dependencies():
     """AST-level (not text): no forbidden imports, no now()/uuid4()/random() calls."""
     root = pathlib.Path(__file__).resolve().parent.parent.parent / "navis" / "reasoning" / "v2"
     for py in root.rglob("*.py"):
-        tree = ast.parse(py.read_text(), filename=str(py))
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:

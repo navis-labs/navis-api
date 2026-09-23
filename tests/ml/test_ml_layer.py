@@ -313,7 +313,7 @@ def test_ml_does_not_import_to_influence_decision_or_reasoning():
     forbidden = {"reasoning", "decisions", "execution", "signals", "observation", "adaptive"}
     violations = []
     for py in (NAVIS / "ml").rglob("*.py"):
-        for node in ast.walk(ast.parse(py.read_text(), filename=str(py))):
+        for node in ast.walk(ast.parse(py.read_text(encoding="utf-8"), filename=str(py))):
             mods = []
             if isinstance(node, ast.Import):
                 mods = [a.name for a in node.names]

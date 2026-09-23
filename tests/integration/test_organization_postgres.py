@@ -43,14 +43,6 @@ async def _make_org(engine) -> uuid.UUID:
 
     from navis.identity.models import Organization
 
-    # `expire_on_commit=False` MATCHES PRODUCTION, and that is the whole fix.
-    # `AsyncSessionLocal` is built with it (platform/database/session.py); a bare
-    # `AsyncSession(engine)` defaults to True, which expires every attribute on
-    # commit. The `org.id` below then becomes a lazy refresh — IO issued from a
-    # plain attribute access, outside the greenlet SQLAlchemy's async bridge
-    # needs — and raises MissingGreenlet. Production never hits it because
-    # production never builds the session this way, so this was a harness fault
-    # dressed as six failures in the enum and concurrency tests.
     async with AsyncSession(engine, expire_on_commit=False) as s:
         org = Organization(name="Acme", slug=f"acme-{uuid.uuid4().hex[:6]}")
         s.add(org)
@@ -83,7 +75,7 @@ async def test_invalid_enum_values_rejected(engine, table, column, bad):
         sql = (f"INSERT INTO {table} {base_cols} "
                f"VALUES (:o, :stage, 0, 0, '{{}}'::jsonb)")
         params = {"o": str(org_id), "stage": bad}
-    async with AsyncSession(engine) as s:
+    async with AsyncSession(engine, expire_on_commit=False) as s:
         with pytest.raises((IntegrityError, DBAPIError)):
             await s.execute(text(sql), params)
             await s.flush()
@@ -93,7 +85,7 @@ async def test_valid_enum_values_accepted(engine):
     from sqlalchemy.ext.asyncio import AsyncSession
 
     org_id = await _make_org(engine)
-    async with AsyncSession(engine) as s:
+    async with AsyncSession(engine, expire_on_commit=False) as s:
         await s.execute(
             text("INSERT INTO organization_lifecycles (organization_id, status, plan) "
                  "VALUES (:o, 'active', 'enterprise')"),
@@ -117,7 +109,7 @@ async def test_concurrent_ensure_is_race_free(engine, concurrency):
     org_id = await _make_org(engine)
 
     async def ensure_both():
-        async with AsyncSession(engine) as s:
+        async with AsyncSession(engine, expire_on_commit=False) as s:
             repo = OrganizationRepository(s)
             await repo.ensure_lifecycle(org_id)
             await repo.ensure_onboarding(org_id)
@@ -126,7 +118,7 @@ async def test_concurrent_ensure_is_race_free(engine, concurrency):
     # No IntegrityError despite N concurrent first-touch inserts.
     await asyncio.gather(*[ensure_both() for _ in range(concurrency)])
 
-    async with AsyncSession(engine) as s:
+    async with AsyncSession(engine, expire_on_commit=False) as s:
         nl = (await s.execute(text("SELECT count(*) FROM organization_lifecycles WHERE organization_id=:o"), {"o": str(org_id)})).scalar()
         no = (await s.execute(text("SELECT count(*) FROM organization_onboarding WHERE organization_id=:o"), {"o": str(org_id)})).scalar()
         state = (await s.execute(text("SELECT status, plan, stage FROM organization_lifecycles l JOIN organization_onboarding o USING (organization_id) WHERE organization_id=:o"), {"o": str(org_id)})).first()

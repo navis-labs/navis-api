@@ -1,0 +1,89 @@
+name: Deploy production
+
+# main is production. Code reaches it only through a development -> main pull
+# request, so anything deployed here has already run in staging.
+#
+# MANUAL ONLY, on purpose. Production never deploys because something was
+# merged: a person opens Actions, picks this workflow, and runs it against main.
+#
+# That deliberate action IS the approval gate. The gate would normally be the
+# "Required reviewers" rule on the `production` Environment, but on a private
+# repository that rule needs GitHub Enterprise — on Free, Pro and Team it exists
+# only for public repositories. Rather than pretend production is gated when it
+# is not, the trigger itself is the gate.
+#
+# Nothing is skipped by running it by hand: `needs: ci` still runs the full
+# suite against real Postgres and Redis before anything is built or deployed,
+# and the `production` Environment still restricts which branch may deploy.
+#
+# Merging development -> main therefore deploys nothing. It only records what
+# production is ALLOWED to be; running this is what makes it so.
+#
+# If the repository ever moves to Enterprise (or goes public), add
+# `push: branches: [main]` back and turn on Required reviewers instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy" to confirm this goes to PRODUCTION'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # Makes the typed confirmation mean something. Without this the input is
+  # decoration: Actions would accept an empty box and deploy anyway. Runs first
+  # and costs seconds, so a misfire stops before CI spends ten minutes.
+  confirm:
+    name: Confirm this is intentional
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the confirmation text
+        run: |
+          if [ "${{ inputs.confirm }}" != "deploy" ]; then
+            echo "::error::Type deploy in the confirmation box to release to production. Got: '${{ inputs.confirm }}'"
+            exit 1
+          fi
+          echo "Confirmed. Releasing ${{ github.ref_name }} to production."
+
+  # The full suite runs against real Postgres and Redis before anything is built.
+  # Running this workflow by hand skips no checks.
+  ci:
+    needs: confirm
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: [confirm, ci]
+    uses: ./.github/workflows/deploy.yml
+    secrets: inherit
+    with:
+      environment: production
+      # ---- EDIT THESE to match your AWS account ----
+      aws-region: ap-southeast-1
+      ecr-repository: navis-api-prod
+      ecs-cluster: navis-prod
+      api-service: navis-api-prod
+      worker-service: navis-worker-prod
+      beat-service: navis-beat-prod
+      migration-subnets: subnet-REPLACE_ME_A,subnet-REPLACE_ME_B
+      migration-security-groups: sg-REPLACE_ME
+      # Production runs in PUBLIC subnets for now — the same shape as staging.
+      # The database is Neon, which lives outside the VPC and is reached over the
+      # internet, so a task needs an outbound path either way: a NAT gateway
+      # (~$41/month) or its own public IP ($0). Tight security groups are what
+      # keep the tasks unreachable — inbound is allowed only from the ALB's
+      # security group — so the public IP buys egress to Neon, ECR and the LLM
+      # providers, not exposure.
+      #
+      # The default is DISABLED, which is correct ONLY for private subnets with a
+      # NAT gateway. Left at the default here, the migration task can never pull
+      # its image: it sits until the job times out, with no error saying why.
+      #
+      # When this moves to private subnets behind a NAT instance (planned for
+      # after the first enterprise users), delete this line rather than setting
+      # it to DISABLED, so the safer default applies again.
+      assign-public-ip: ENABLED

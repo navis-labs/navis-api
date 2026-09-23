@@ -338,7 +338,7 @@ def test_the_developer_floor_does_not_quietly_become_the_whole_matrix():
 def test_organization_imports_no_business_domain():
     violations = []
     for py in ORG_PKG.rglob("*.py"):
-        for node in ast.walk(ast.parse(py.read_text(), filename=str(py))):
+        for node in ast.walk(ast.parse(py.read_text(encoding="utf-8"), filename=str(py))):
             mods = []
             if isinstance(node, ast.Import):
                 mods = [a.name for a in node.names]

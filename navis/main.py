@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 
@@ -107,9 +107,20 @@ def create_app() -> FastAPI:
         return liveness()
 
     @app.get("/ready", tags=["platform"])
-    async def ready() -> dict:
-        """Readiness: Postgres + Redis reachable. For LB/k8s gating."""
-        return await readiness()
+    async def ready(response: Response) -> dict:
+        """Readiness: Postgres + Redis reachable. For LB/k8s gating.
+
+        Returns 503 when a dependency is down. Returning the body alone was not
+        enough: FastAPI defaults to 200 for any dict return, so a task whose
+        database connection had died still answered `/ready` with 200 and
+        `"status": "degraded"` in the payload. An ALB target group health check
+        reads the STATUS CODE, so it would never have marked such a task
+        unhealthy — the check was decorative, and a dead task stayed in service.
+        """
+        result = await readiness()
+        if result["status"] != "ready":
+            response.status_code = 503
+        return result
 
     @app.get("/metrics", tags=["platform"], include_in_schema=False)
     async def metrics_endpoint() -> PlainTextResponse:
