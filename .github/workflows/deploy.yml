@@ -124,6 +124,13 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # Required before the build: the runner's default builder uses the
+      # `docker` driver, which cannot export a cache. `cache-to: type=gha` then
+      # fails the build outright with "Cache export is not supported for the
+      # docker driver". ci.yml has always had this step; deploy.yml did not, so
+      # the same Dockerfile built in CI and failed here. Keep the two in step.
+      - uses: docker/setup-buildx-action@v4
+
       # Tagged with the commit SHA, never `latest`. An immutable tag means the
       # running task definition names exactly one build, so "what is in
       # production right now" is answerable and a rollback is just redeploying
