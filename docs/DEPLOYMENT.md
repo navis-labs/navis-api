@@ -489,6 +489,36 @@ This is what lets GitHub Actions deploy with no stored AWS access keys.
 The `StringLike` list is the security boundary. Without it, **any** repository on GitHub could
 assume this role. Do not replace it with `repo:navis-labs/navis-api:*`.
 
+#### The `navis-labs` org sends numeric IDs in the subject claim
+
+The four `sub` values above are **not** what this organization's tokens actually carry. The
+org has GitHub's immutable subject claims turned on, which puts the organization ID and the
+repository ID into every `sub`:
+
+```
+repo:navis-labs@277518511/navis-api@1272162578:environment:staging
+```
+
+This is the better setting and should stay on: a repository that is renamed, deleted or
+recreated gets a new ID, so a name cannot be re-registered by someone else and used to assume
+this role. But the trust policy has to match it, so the real list is:
+
+```json
+"repo:navis-labs@277518511/navis-api@1272162578:ref:refs/heads/development",
+"repo:navis-labs@277518511/navis-api@1272162578:ref:refs/heads/main",
+"repo:navis-labs@277518511/navis-api@1272162578:environment:staging",
+"repo:navis-labs@277518511/navis-api@1272162578:environment:production"
+```
+
+Two things follow. If the org setting is ever turned **off**, every deploy breaks until the
+plain `repo:navis-labs/navis-api:...` form is restored. And because the deploy job declares
+`environment:`, its token carries the `:environment:` form, never the `:ref:` form — the two
+`ref:` entries exist only for a future job that runs without an environment.
+
+Note also that the job runs through a reusable workflow (`deploy-staging.yml` calls
+`deploy.yml`). That does not change `sub`, which always describes the **calling** workflow;
+the reusable file shows up in `job_workflow_ref` instead.
+
 5. Attach an inline policy `navis-deploy`:
 
 ```json
@@ -848,10 +878,21 @@ Create three per cluster.
 **`navis-api-staging`**
 - Task definition: `navis-api-staging-api`
 - Desired tasks: **1** (production: 2 once you have users, for zero-downtime deploys)
-- Networking: the two subnets, security group `navis-tasks-staging`,
-  **Public IP: ENABLED** (required — this is the outbound path to Neon and ECR)
+- Networking: **exactly the two subnets the load balancer spans** — no more — security group
+  `navis-tasks-staging`, **Public IP: ENABLED** (required: this is the outbound path to Neon
+  and ECR)
 - Load balancing: **Application Load Balancer**, existing target group `navis-api-staging-tg`
 - Health check grace period: **120** seconds
+
+The subnet list is worth being pedantic about. The default VPC has **three** subnets and the
+load balancer is attached to **two** of them. If the third is left selected on the service,
+ECS is free to place a task in an availability zone the load balancer does not serve. That
+task can never be registered as a target, so it never receives a health check, never becomes
+healthy, and the circuit breaker rolls the deployment back — while the task's own logs show a
+perfectly healthy application answering `/ready` on `127.0.0.1`. The giveaway is in the
+service's Events tab: *Target is in an Availability Zone that is not enabled for the load
+balancer*. Availability Zone rebalancing makes it intermittent rather than constant, so a
+service can deploy fine once and fail the next time with nothing changed.
 - Deployment: enable **Deployment circuit breaker** with **Rollback on failure**
 - Capacity provider: **FARGATE_SPOT** for staging, **FARGATE** for production
 
@@ -1142,3 +1183,29 @@ count is 1.
 
 **Deploy fails at `RegisterTaskDefinition` with an access-denied error.** The deploy role is
 missing `iam:PassRole` (Part 5.3).
+
+**`Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity`,
+and everything in the console looks correct.** AWS returns the same denial whether the role
+does not exist or the token does not match the trust policy, so the console cannot tell you
+which you have. The answer is almost always the `sub` claim — see Part 5.3, which documents
+the numeric-ID format this organization sends. To see the claim GitHub is really signing, add
+a step before the AWS login that fetches the token from `ACTIONS_ID_TOKEN_REQUEST_URL` and
+prints the decoded payload. Print the claims, never the token.
+
+**`Cache export is not supported for the docker driver`.** The job is missing
+`docker/setup-buildx-action` before the build. The runner's default builder uses the `docker`
+driver, which cannot export a cache, so `cache-to: type=gha` fails the build outright.
+`ci.yml` and `deploy.yml` both need this step; a mismatch between them shows up as a
+Dockerfile that builds in CI and fails on deploy.
+
+**`Unknown parameter in overrides.containerOverrides[0]: "image"`.** ECS cannot change a
+container's image at `run-task` time — `containerOverrides` accepts command, environment, cpu
+and memory only. To run a one-off task on a new build, register a revision of its family
+pointing at that image and run the revision. `deploy.yml` does this for migrations.
+
+**A service deploys, the task's own logs look perfectly healthy, and the circuit breaker
+rolls it back anyway.** Read the task's log for the source IPs of the `/ready` requests. Only
+`127.0.0.1` means the container's own health check is passing but the load balancer never
+reached the task at all; ALB node addresses (`172.31.x.x` here) mean it did. If only
+`127.0.0.1` appears, the target was never registered — see the availability-zone trap in Part
+8.4.
