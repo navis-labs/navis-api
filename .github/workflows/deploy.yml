@@ -89,27 +89,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # TEMPORARY — remove once the OIDC trust is working.
-      # AWS answers both "this role does not exist" and "this token does not
-      # match the trust policy" with the same AccessDenied, so it cannot tell us
-      # which one we have. This prints the claims GitHub actually signs, which is
-      # the one thing the console cannot show. The token itself is never printed.
-      - name: Debug - what does GitHub actually claim?
-        run: |
-          python3 - <<'PYEOF'
-          import base64, json, os, urllib.request
-          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=sts.amazonaws.com"
-          req = urllib.request.Request(url, headers={
-              "Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
-          tok = json.load(urllib.request.urlopen(req))["value"]
-          payload = tok.split(".")[1]
-          payload += "=" * (-len(payload) % 4)
-          claims = json.loads(base64.urlsafe_b64decode(payload))
-          for k in ("iss", "aud", "sub", "repository", "repository_owner",
-                    "ref", "environment", "workflow_ref", "job_workflow_ref"):
-              print(f"{k:18} = {claims.get(k)!r}")
-          PYEOF
-
       # OIDC: GitHub mints a short-lived token and AWS exchanges it for
       # temporary credentials. No AWS access keys stored in GitHub secrets, so
       # there is nothing to rotate and nothing to leak. The IAM trust policy on
