@@ -556,9 +556,31 @@ not optional — without it no background work runs.
 6. Subnet group: create one using the **same two subnets** from Part 2
 7. Security group: `navis-redis-staging` from Part 2
 8. Disable automatic backups for staging; keep 1 day for production
+9. **Transit encryption mode: `Preferred`, never `Required`.** See below.
 
-`-> RECORD`: the **Primary endpoint** hostname, e.g.
-`navis-staging.xxxxx.ng.0001.aps1.cache.amazonaws.com`.
+`-> RECORD`: the **Primary endpoint** hostname. For a replication group it is the
+`master.` address, e.g. `master.navis-staging.wxbt2i.apse1.cache.amazonaws.com`.
+
+#### Transit encryption mode must be `Preferred`
+
+If in-transit encryption is left on with mode **`Required`**, the cluster drops plain TCP and
+every client must speak `rediss://`. The cache and event-bus clients would cope —
+`redis.asyncio.from_url` understands `rediss://` — but **Celery would not**: there is no
+`broker_use_ssl` configuration in `navis/platform/queue/celery_app.py`, and kombu refuses a
+`rediss://` broker URL that carries no `ssl_cert_reqs`, so `worker` and `beat` fail to start
+at all.
+
+That failure lands exactly on this product's worst shape: the API comes up healthy, and
+nothing behind it runs.
+
+`Preferred` accepts both plain and TLS connections, so the `redis://` URLs below work
+unchanged while TLS stays available. Note that the **Enable** checkbox itself cannot be
+turned off after the cluster is created — only the mode can be changed — so if you find a
+cluster on `Required`, modify it to `Preferred` (Actions -> Modify, apply immediately)
+rather than trying to disable encryption.
+
+To move to `Required` later, add `broker_use_ssl` and `redis_backend_use_ssl` to the Celery
+config and switch all three URLs to `rediss://` in the same change.
 
 ### 6.1 The three Redis URLs — read this carefully
 
@@ -874,22 +896,43 @@ In **each** environment:
 
 | Kind | Name | Value |
 |---|---|---|
-| Secret | `AWS_DEPLOY_ROLE_ARN` | the role ARN from 5.3 |
-| Variable | `HEALTHCHECK_URL` | `https://staging-api.navis.app/health` (prod equivalent) |
+| Secret | `AWS_DEPLOY_ROLE_ARN` | `arn:aws:iam::806168576303:role/navisGitHubDeployRole` (the role from 5.3; the same role serves both environments) |
+| Variable | `HEALTHCHECK_URL` | staging: `https://staging-api.navislabs.in/ready` — production: `https://api.navislabs.in/ready` |
+
+The health path is `/ready`, not `/health`: `/ready` is the one that actually checks the
+database and Redis, and it is the same path the ALB target group polls.
 
 If `HEALTHCHECK_URL` is unset the deploy's smoke test prints a warning and passes without
 checking anything, so set it.
 
 ### 9.3 Fill in the workflow placeholders
 
-In `.github/workflows/deploy-staging.yml` and `deploy-production.yml`, replace:
+**Staging is already filled in** — `deploy-staging.yml` carries the real subnets, security
+group and service names, and they are in the Recorded values table at the end of this
+document. Production still has the placeholders:
 
 ```yaml
 migration-subnets: subnet-REPLACE_ME_A,subnet-REPLACE_ME_B
 migration-security-groups: sg-REPLACE_ME
 ```
 
-with the two subnet IDs from Part 2.1 and the **tasks** security group from Part 2.2.
+Replace them with the two subnet IDs from Part 2.1 and the **tasks** security group from
+Part 2.2 when production is built.
+
+One thing that is easy to get wrong: the ECS **service** names are not always what you would
+guess. When a service is created from the console without an explicit name, the console
+appends a random suffix — staging's worker and beat are
+`navis-api-staging-worker-service-i49pghsm` and `navis-api-staging-beat-service-hpdb0ws2`,
+while the api service is plain `navis-api-staging-api-service`. That suffix is part of the
+name. Read the real names with:
+
+```bash
+aws ecs list-services --cluster navis-staging --region ap-southeast-1 --output text
+```
+
+A wrong service name does not fail early: migrations run and the api deploys, and only then
+does the worker step fail with `ServiceNotFoundException`, leaving api on new code and
+worker and beat on old.
 
 Both environments run in public subnets, so both need `assign-public-ip: ENABLED`. **This is
 already set in both workflow files** — staging had it, and production has it now. You do not
@@ -1022,24 +1065,46 @@ you do not yet know what size you need.
 
 Fill these in as you go. This table is the description of your infrastructure.
 
+Staging was built on 2026-09-22. Production is not built yet.
+
+The VPC and its subnets are the account's **default** VPC, so production will share them
+unless it is given its own; only the security groups, and everything from Part 3 onward, are
+per-environment.
+
 | | Staging | Production |
 |---|---|---|
 | AWS region | `ap-southeast-1` | `ap-southeast-1` |
-| VPC ID | | |
-| Subnet A / B | | |
-| SG — ALB | | |
-| SG — tasks | | |
-| SG — redis | | |
+| VPC ID | `vpc-038f84f74e0351b35` | *(same default VPC)* |
+| Internet gateway | `igw-0ccaba32a28f13dd0` | *(same)* |
+| Subnet A (`ap-southeast-1a`) | `subnet-0a5bd7ad312ef9acd` | *(same)* |
+| Subnet B (`ap-southeast-1b`) | `subnet-05fc7cbb8c61349d0` | *(same)* |
+| SG — ALB | `sg-0edfa7d9001b00eb2` | |
+| SG — tasks | `sg-058b623824f3bcec9` | |
+| SG — redis | `sg-024c25dedf8d81fc3` | |
+| ECR registry | `806168576303.dkr.ecr.ap-southeast-1.amazonaws.com` | *(same account)* |
 | ECR repository | `navis-api-staging` | `navis-api-prod` |
 | ECS cluster | `navis-staging` | `navis-prod` |
-| Redis primary endpoint | | |
-| ALB DNS name | | |
-| Target group | | |
+| ECS services | `navis-api-staging-api-service`, `navis-api-staging-worker-service-i49pghsm`, `navis-api-staging-beat-service-hpdb0ws2` | |
+| Redis primary endpoint | `master.navis-staging.wxbt2i.apse1.cache.amazonaws.com:6379` | |
+| Redis transit encryption | `preferred` — **not `required`** | `preferred` |
+| ALB DNS name | `navis-staging-alb-1782157424.ap-southeast-1.elb.amazonaws.com` | |
+| Target group | `navis-api-staging-tg` (ip, 8000, `/ready`) | |
+| ACM certificate | `navislabs.in` + `*.navislabs.in` | *(same cert)* |
 | Neon project | `navis-staging` | `navis-production` |
-| Neon pooled host | | |
-| Neon direct host | | |
-| Public hostname | | |
-| Deploy role ARN | | |
+| Neon Postgres version | 16 | 16 |
+| Neon region | AWS Asia Pacific 1 (Singapore) | AWS Asia Pacific 1 (Singapore) |
+| Neon database / role | `navis` / `navis_owner` | |
+| Neon pooled host | `ep-spring-tooth-b3qn525i-pooler.c-4.ap-southeast-1.aws.neon.tech` | |
+| Neon direct host | `ep-spring-tooth-b3qn525i.c-4.ap-southeast-1.aws.neon.tech` | |
+| Public hostname | `staging-api.navislabs.in` | `api.navislabs.in` |
+| Task execution role | `navisTaskExecutionRole-staging` | `navisTaskExecutionRole-production` |
+| Task role | `navisTaskRole-staging` | `navisTaskRole-production` |
+| Deploy role ARN | `arn:aws:iam::806168576303:role/navisGitHubDeployRole` | *(same role, both environments)* |
+| OIDC provider | `arn:aws:iam::806168576303:oidc-provider/token.actions.githubusercontent.com` | *(same)* |
+
+The two values the deploy workflows need from this table are
+`migration-subnets` (both subnet IDs, comma-separated) and `migration-security-groups`
+(the **tasks** security group).
 
 ---
 
