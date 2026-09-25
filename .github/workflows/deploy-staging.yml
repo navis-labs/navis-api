@@ -25,15 +25,18 @@ jobs:
     secrets: inherit
     with:
       environment: staging
-      # ---- EDIT THESE to match your AWS account ----
+      # Real values from the staging account, built 2026-09-22. They are also
+      # recorded in docs/DEPLOYMENT.md under "Recorded values". Two of the
+      # service names carry a random suffix because the ECS console generated
+      # them; that suffix is part of the name and cannot be dropped.
       aws-region: ap-southeast-1
       ecr-repository: navis-api-staging
       ecs-cluster: navis-staging
-      api-service: navis-api-staging
-      worker-service: navis-worker-staging
-      beat-service: navis-beat-staging
-      migration-subnets: subnet-REPLACE_ME_A,subnet-REPLACE_ME_B
-      migration-security-groups: sg-REPLACE_ME
+      api-service: navis-api-staging-api-service
+      worker-service: navis-api-staging-worker-service-i49pghsm
+      beat-service: navis-api-staging-beat-service-hpdb0ws2
+      migration-subnets: subnet-0a5bd7ad312ef9acd,subnet-05fc7cbb8c61349d0
+      migration-security-groups: sg-058b623824f3bcec9
       # Staging runs in PUBLIC subnets, deliberately: a NAT gateway costs about
       # $35/month and staging does not need the isolation production does.
       # Public subnets have no NAT, so the task needs its own public IP to reach

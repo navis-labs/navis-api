@@ -1,0 +1,131 @@
+{
+  "family": "navis-api-staging-migrate",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "256",
+  "memory": "512",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "executionRoleArn": "arn:aws:iam::806168576303:role/navisTaskExecutionRole-staging",
+  "taskRoleArn": "arn:aws:iam::806168576303:role/navisTaskRole-staging",
+  "containerDefinitions": [
+    {
+      "name": "migrate",
+      "image": "806168576303.dkr.ecr.ap-southeast-1.amazonaws.com/navis-api-staging:bootstrap",
+      "essential": true,
+      "environment": [
+        {
+          "name": "ENVIRONMENT",
+          "value": "staging"
+        },
+        {
+          "name": "DEBUG",
+          "value": "false"
+        },
+        {
+          "name": "SHOW_DOCS",
+          "value": "true"
+        },
+        {
+          "name": "LOG_FORMAT",
+          "value": "json"
+        },
+        {
+          "name": "LOG_LEVEL",
+          "value": "INFO"
+        },
+        {
+          "name": "RELOAD",
+          "value": "false"
+        },
+        {
+          "name": "CORS_ORIGINS",
+          "value": "https://staging.navislabs.in"
+        },
+        {
+          "name": "FRONTEND_URL",
+          "value": "https://staging.navislabs.in"
+        },
+        {
+          "name": "REDIS_URL",
+          "value": "redis://master.navis-staging.wxbt2i.apse1.cache.amazonaws.com:6379/0"
+        },
+        {
+          "name": "CELERY_BROKER_URL",
+          "value": "redis://master.navis-staging.wxbt2i.apse1.cache.amazonaws.com:6379/2"
+        },
+        {
+          "name": "CELERY_RESULT_BACKEND",
+          "value": "redis://master.navis-staging.wxbt2i.apse1.cache.amazonaws.com:6379/3"
+        },
+        {
+          "name": "EXECUTION_INLINE_FALLBACK",
+          "value": "false"
+        },
+        {
+          "name": "SIGNALS_REJECT_LEGACY_PLAINTEXT",
+          "value": "false"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "ap-southeast-1"
+        },
+        {
+          "name": "AZURE_OPENAI_ENDPOINT",
+          "value": "https://navis-openai.openai.azure.com/"
+        },
+        {
+          "name": "AZURE_OPENAI_DEPLOYMENT",
+          "value": "navis-gpt"
+        },
+        {
+          "name": "AZURE_OPENAI_EMBED_DEPLOYMENT",
+          "value": "navis-embed"
+        },
+        {
+          "name": "GOOGLE_GMAIL_REDIRECT_URI",
+          "value": "https://staging-api.navislabs.in/api/v1/integrations/google/callback"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "SECRET_KEY",
+          "valueFrom": "arn:aws:ssm:ap-southeast-1:806168576303:parameter/navis/staging/SECRET_KEY"
+        },
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:ssm:ap-southeast-1:806168576303:parameter/navis/staging/MIGRATE_DATABASE_URL"
+        },
+        {
+          "name": "FIELD_ENCRYPTION_KEYS",
+          "valueFrom": "arn:aws:ssm:ap-southeast-1:806168576303:parameter/navis/staging/FIELD_ENCRYPTION_KEYS"
+        },
+        {
+          "name": "SIGNALS_TOKEN_KEYS",
+          "valueFrom": "arn:aws:ssm:ap-southeast-1:806168576303:parameter/navis/staging/SIGNALS_TOKEN_KEYS"
+        },
+        {
+          "name": "AZURE_OPENAI_API_KEY",
+          "valueFrom": "arn:aws:ssm:ap-southeast-1:806168576303:parameter/navis/staging/AZURE_OPENAI_API_KEY"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/navis-staging",
+          "awslogs-region": "ap-southeast-1",
+          "awslogs-stream-prefix": "migrate"
+        }
+      },
+      "command": [
+        "alembic",
+        "upgrade",
+        "head"
+      ]
+    }
+  ]
+}
