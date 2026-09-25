@@ -159,6 +159,34 @@ jobs:
       # against a new schema instead, which is safe as long as migrations are
       # additive (add columns nullable, backfill, drop in a LATER release).
       # ---------------------------------------------------------------------
+      # ECS cannot override a container's image at run-task time.
+      # `containerOverrides` takes command, environment, cpu and memory -- but
+      # NOT `image`, and passing one fails parameter validation before the task
+      # is even placed. The migration therefore goes out the same way the
+      # services do: register a revision of the migrate family pointing at this
+      # build, then run that revision.
+      - name: Register migrate task definition
+        id: td-migrate
+        run: |
+          current=$(aws ecs describe-task-definition \
+            --task-definition "${{ inputs.ecr-repository }}-migrate" \
+            --query taskDefinition)
+
+          # describe returns fields that register will not accept back. Strip
+          # them here rather than keeping a hand-written copy of the definition
+          # in the repository, which would drift from what is actually running.
+          next=$(echo "$current" | jq --arg img "${{ steps.image.outputs.uri }}" '
+            .containerDefinitions |= map(if .name == "migrate" then .image = $img else . end)
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+          ')
+
+          arn=$(aws ecs register-task-definition \
+            --cli-input-json "$next" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "migrate task definition: $arn"
+          echo "arn=$arn" >> "$GITHUB_OUTPUT"
+
       - name: Run database migrations
         env:
           CLUSTER: ${{ inputs.ecs-cluster }}
@@ -173,11 +201,11 @@ jobs:
           # unread in `failures`. Read the whole response and say what it said.
           run_json=$(aws ecs run-task \
             --cluster "$CLUSTER" \
-            --task-definition "${{ inputs.ecr-repository }}-migrate" \
+            --task-definition "${{ steps.td-migrate.outputs.arn }}" \
             --launch-type FARGATE \
             --started-by "gha-${{ github.run_id }}" \
             --network-configuration "awsvpcConfiguration={subnets=[${{ inputs.migration-subnets }}],securityGroups=[${{ inputs.migration-security-groups }}],assignPublicIp=${{ inputs.assign-public-ip }}}" \
-            --overrides '{"containerOverrides":[{"name":"migrate","image":"${{ steps.image.outputs.uri }}","command":["alembic","upgrade","head"]}]}' \
+            --overrides '{"containerOverrides":[{"name":"migrate","command":["alembic","upgrade","head"]}]}' \
             --output json)
 
           if [ "$(echo "$run_json" | jq '.failures | length')" -ne 0 ]; then
