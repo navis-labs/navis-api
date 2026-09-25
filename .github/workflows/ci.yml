@@ -149,6 +149,19 @@ jobs:
       # create_async_engine(), which rejects a bare postgresql:// URL.
       NAVIS_TEST_DATABASE_URL: postgresql+asyncpg://navis:navis@localhost:5432/navis_test
 
+      # The 0047 cleanup migration is asserted against a database carrying REAL
+      # Alembic history, which `create_all` cannot produce — so it gets its own
+      # database, built by `alembic upgrade head` in the step below.
+      #
+      # Without this the 10 tests in test_cleanup_migration_postgres.py skip,
+      # and the guard at the end of this job does NOT catch it: that grep looks
+      # for the literal "NAVIS_TEST_DATABASE_URL to run", and this variable's
+      # skip reason reads "NAVIS_MIGRATION_TEST_DATABASE_URL to run", which does
+      # not contain it. The guard is widened below so it does.
+      #
+      # Name must start with navis_test — the test refuses any other database.
+      NAVIS_MIGRATION_TEST_DATABASE_URL: postgresql+asyncpg://navis:navis@localhost:5432/navis_test_migrations
+
     steps:
       - uses: actions/checkout@v7
 
@@ -161,6 +174,26 @@ jobs:
 
       - name: Enable pgvector
         run: PGPASSWORD=navis psql -h localhost -U navis -d navis_test -c 'CREATE EXTENSION IF NOT EXISTS vector'
+
+      # Built by MIGRATIONS, not create_all: test_cleanup_migration_postgres
+      # asserts what 0047 does to an EXISTING schema, so that schema has to have
+      # been produced the way production's was.
+      #
+      # No CREATE EXTENSION here, unlike navis_test above: this database is built
+      # by the migration chain, and 0038_pgvector_embeddings runs
+      # `CREATE EXTENSION IF NOT EXISTS vector` itself.
+      #
+      # Both URL variables are set to the same value because migrations/env.py
+      # reads DIRECT_DATABASE_URL first and falls back to DATABASE_URL; setting
+      # only one would let the job-level DATABASE_URL (navis_test) win and
+      # migrate the wrong database.
+      - name: Create and migrate the migration-test database
+        run: |
+          PGPASSWORD=navis psql -h localhost -U navis -d navis_test \
+            -c 'CREATE DATABASE navis_test_migrations'
+          DIRECT_DATABASE_URL="$NAVIS_MIGRATION_TEST_DATABASE_URL" \
+          DATABASE_URL="$NAVIS_MIGRATION_TEST_DATABASE_URL" \
+            alembic upgrade head
 
       # `python -m pytest`, NOT `pytest`. The module form puts the working
       # directory on sys.path; the console script does not. There is no
@@ -179,9 +212,9 @@ jobs:
       # quietly green with 184 skips and no database ever touched.
       - name: Assert Postgres integration tests were not skipped
         run: |
-          if grep -q "NAVIS_TEST_DATABASE_URL to run" /tmp/pytest.txt; then
-            echo "::error::Integration tests skipped — NAVIS_TEST_DATABASE_URL is not reaching them."
-            grep "NAVIS_TEST_DATABASE_URL to run" /tmp/pytest.txt | head -5
+          if grep -qE "NAVIS_(MIGRATION_)?TEST_DATABASE_URL to run" /tmp/pytest.txt; then
+            echo "::error::Integration tests skipped — a test database URL is not reaching them."
+            grep -E "NAVIS_(MIGRATION_)?TEST_DATABASE_URL to run" /tmp/pytest.txt | head -5
             exit 1
           fi
           echo "Postgres integration tests ran."

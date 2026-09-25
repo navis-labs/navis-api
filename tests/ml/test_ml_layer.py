@@ -352,6 +352,81 @@ def test_embedding_subscriber_registered_for_every_memory_event():
         )
 
 
+async def test_the_azure_client_is_bounded_and_reused_within_a_loop(monkeypatch):
+    """Two production faults, pinned together because they share one line.
+
+    THE TIMEOUT. The client used to be built with no `timeout=`, so the SDK
+    default applied — `read=600.0`. A hung Azure response could hold a context
+    build for ten minutes. An embedding of one short string returns in well
+    under two seconds, so anything near the default is a stall, not a slow
+    answer.
+
+    THE REUSE. It also built a NEW client per call, so every embedding paid a
+    fresh TLS handshake and no connection was ever reused; nothing closed them
+    either, so each leaked its httpx pool. Measured, the fix took the median
+    embedding from ~1.55s to ~0.40s.
+
+    Asserted on the CLIENT rather than by timing, so it holds on a machine
+    with a different link to Azure and needs no network at all.
+    """
+    from navis.ml.providers.azure import AzureProvider
+    from navis.platform.config import settings
+
+    # `_client()` builds the SDK client for real, and `AsyncAzureOpenAI` refuses
+    # to construct without a credential. Nothing below is about authentication
+    # and no request is ever made, so a placeholder is enough — but it has to be
+    # supplied, because read from the environment this passed on a laptop with a
+    # populated `.env` and failed in CI, which has none. Same environment
+    # coupling `test_azure_provider_gates_embedding_on_separate_deployment`
+    # guards against below. `or` keeps a real configured key in play where one
+    # exists, so a developer with Azure set up still exercises their own value.
+    monkeypatch.setattr(
+        settings,
+        "azure_openai_api_key",
+        settings.azure_openai_api_key or "not-a-real-key-no-request-is-made",
+    )
+
+    az = AzureProvider(deployment="gpt", embed_deployment="my-embed")
+    client = az._client()
+
+    assert client.timeout.read == settings.azure_openai_timeout_seconds
+    assert client.timeout.read < 600, "the 600s SDK default is back"
+    assert client.timeout.connect == settings.azure_openai_connect_timeout_seconds
+    # Bounded, not disabled: one retry through the SDK's backoff+jitter is the
+    # right answer to a single 429, and the ceiling stays (1 + retries) x timeout.
+    assert client.max_retries == settings.azure_openai_max_retries
+
+    # Same loop, same client — including across provider instances, because the
+    # cache is keyed by the loop and not by `self`.
+    assert az._client() is client
+    assert AzureProvider(deployment="gpt", embed_deployment="my-embed")._client() is client
+
+
+def test_the_azure_client_cache_does_not_leak_across_event_loops(monkeypatch):
+    """httpx pools are not shareable between asyncio loops, so a plain module
+    global would be reused from the wrong loop and fail at the transport. Each
+    loop must get its own."""
+    import asyncio
+
+    from navis.ml.providers.azure import AzureProvider
+    from navis.platform.config import settings
+
+    # Same reason as the test above: the SDK will not construct without a
+    # credential, and this test is about loop affinity, not authentication.
+    monkeypatch.setattr(
+        settings,
+        "azure_openai_api_key",
+        settings.azure_openai_api_key or "not-a-real-key-no-request-is-made",
+    )
+
+    async def _grab():
+        return AzureProvider(deployment="gpt", embed_deployment="my-embed")._client()
+
+    first = asyncio.run(_grab())
+    second = asyncio.run(_grab())
+    assert first is not second, "a client crossed event loops"
+
+
 def test_azure_provider_gates_embedding_on_separate_deployment():
     """Azure routes by deployment name; chat and embeddings need SEPARATE
     deployments. If only chat is configured, the registry must not send embed

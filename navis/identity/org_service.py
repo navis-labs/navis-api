@@ -24,7 +24,12 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from navis.identity.models import Integration, IntegrationProvider, Organization
+from navis.identity.models import (
+    Integration,
+    IntegrationProvider,
+    Organization,
+    OrganizationKind,
+)
 
 # 8 hex chars of salt (was 6 -> 16.7M space; 8 -> ~4.3e9) plus the retry loop below.
 # Correctness comes from the retry, not from the (low) collision probability.
@@ -57,7 +62,25 @@ class OrgLifecycleSeam:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
-    async def create(self, *, name: str, slug_salt: str | None = None) -> Organization:
+    async def create(
+        self,
+        *,
+        name: str,
+        slug_salt: str | None = None,
+        kind: OrganizationKind = OrganizationKind.COMPANY,
+    ) -> Organization:
+        """Create a tenant. `kind` says what it IS, never what it may do.
+
+        DEFAULTS TO COMPANY, so every existing call site produces exactly the row
+        it produced before — which is what `0051_surface_rbac_columns` chose the
+        column default for. A caller that wants a personal workspace must ask for
+        one; nothing infers it from the shape of the signup.
+
+        `kind` carries PRODUCT meaning only. It is not read by
+        `effective_permissions`, it is not an input to any gate, and no query
+        branches on it: isolation is the same `organization_id` predicate for
+        both kinds. See `OrganizationKind`.
+        """
         if not name or not name.strip():
             raise OrganizationError("organization name must not be empty")
         name = name.strip()
@@ -69,7 +92,7 @@ class OrgLifecycleSeam:
             slug = _slugify(name, slug_salt or uuid.uuid4().hex)
             try:
                 async with self.db.begin_nested():  # SAVEPOINT
-                    org = Organization(name=name, slug=slug)
+                    org = Organization(name=name, slug=slug, kind=kind.value)
                     self.db.add(org)
                     await self.db.flush()
                 return org

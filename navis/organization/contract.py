@@ -98,18 +98,58 @@ STAGE_EVENT: dict[OnboardingStage, str] = {
 }
 
 # Plan -> the capabilities it grants by default (entitlements seed from this).
+#
+# ── WHY REASONING AND OBSERVATION ARE IN EVERY TIER (P0-4) ──────────────────
+# This matrix was shaped for the APPLICATION, where a tier buys connectors and
+# richer inference. The DEVELOPER surface reads the same capabilities, and on
+# FREE — which is what every self-serve signup gets — that left 7 of its 14
+# route groups answering 402, including the ENTIRE agent execution ledger,
+# because `observation` was ENTERPRISE-only.
+#
+# That is not a pricing position, it is an unusable product: an agent platform
+# whose free tier cannot record what an agent did, and cannot return the
+# organization's own conclusions, has nothing for a developer to evaluate. The
+# two capabilities added here are the ones the Developer surface cannot do
+# without:
+#
+#   observation  the agent run ledger — tasks, runs, steps, outcomes. An agent
+#                WRITES this about itself, so it is the cheapest thing in the
+#                product to serve and the first thing a developer needs. Still
+#                gated a second time on the credential's `record_agent_runs`
+#                permission, which a founder grants deliberately; the plan
+#                decides whether the tenant may, the key decides whether this
+#                caller may.
+#   reasoning    the organization's own conclusions. Without it
+#                `POST /developer/context` withholds the reasoning layer and an
+#                agent gets evidence with no judgement attached.
+#
+# DELIBERATELY STILL PAID: decision, intelligence, learning, execution — the
+# layers that act, or that are expensive to compute. A FREE developer org reads
+# what the organization knows and concluded, and records what its agents did.
+#
+# APPLICATION IMPACT IS NIL, verified rather than assumed. `Capability.REASONING`
+# is referenced only by Developer routes. `Capability.OBSERVATION` adds one
+# Application route (`observation/router.py`) to a FREE tenant's reach, which
+# WIDENS access and cannot break a caller. `/chat` gates on `MEMORY` alone and
+# is untouched.
+#
+# TIERS STAY STRICTLY NESTED (`test_plan_capability_monotonicity`), so
+# `observation` is added to PRO and TEAM as well: a paid tier may never hold
+# less than a free one.
 PLAN_CAPABILITIES: dict[Plan, frozenset[Capability]] = {
     Plan.FREE: frozenset({
         Capability.GMAIL, Capability.CALENDAR, Capability.MEMORY, Capability.STATE,
+        Capability.REASONING, Capability.OBSERVATION,
     }),
     Plan.PRO: frozenset({
         Capability.GMAIL, Capability.CALENDAR, Capability.DRIVE, Capability.MEMORY,
         Capability.STATE, Capability.REASONING, Capability.DECISION,
+        Capability.OBSERVATION,
     }),
     Plan.TEAM: frozenset({
         Capability.GMAIL, Capability.CALENDAR, Capability.DRIVE, Capability.SLACK,
         Capability.MEMORY, Capability.STATE, Capability.REASONING, Capability.DECISION,
-        Capability.EXECUTION, Capability.INTELLIGENCE,
+        Capability.EXECUTION, Capability.INTELLIGENCE, Capability.OBSERVATION,
     }),
     Plan.ENTERPRISE: frozenset(Capability),
 }

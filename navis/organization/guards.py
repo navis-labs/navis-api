@@ -14,6 +14,7 @@ from navis.identity.authz import Principal, get_principal
 from navis.organization.contract import Capability
 from navis.organization.service import OrganizationService
 from navis.platform.database import get_session
+from navis.platform.monitoring.metrics import metrics, timed
 
 
 def require_capability(capability: Capability):
@@ -34,7 +35,19 @@ def require_capability(capability: Capability):
         # env var served every gated route to every org. The gate is now the same
         # code in every environment; dev breadth comes from the plan an org is
         # actually provisioned with (OrganizationService.bootstrap).
-        if not await OrganizationService(db).can_use(principal.org_id, capability):
+        # THE THIRD AUTH ROUND TRIP, and the one that is easiest to forget is
+        # there: it is not in `identity` at all, so a reader tracing
+        # authentication through `authz.py` sees two statements and this one
+        # shows up only in the database. Counted with the other two under the
+        # same metric so `auth.db_query / auth.resolved` is the true number of
+        # authentication statements per request.
+        metrics.incr("auth.db_query", labels={"step": "capability"})
+        with timed("auth.capability_ms"):
+            allowed = await OrganizationService(db).can_use(principal.org_id, capability)
+        if not allowed:
+            metrics.incr(
+                "auth.capability_denied", labels={"capability": capability.value}
+            )
             raise HTTPException(
                 status.HTTP_402_PAYMENT_REQUIRED,
                 f"capability '{capability.value}' not enabled for this organization",

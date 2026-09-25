@@ -11,7 +11,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.identity.audit import AuditAction, AuditService
 from navis.identity.members import normalize_email
-from navis.identity.models import Membership, Organization, Role, Session, User
+from navis.identity.models import (
+    DeveloperRole,
+    Membership,
+    Organization,
+    OrganizationKind,
+    Role,
+    Session,
+    User,
+)
 from navis.identity.org_service import OrgLifecycleSeam
 from navis.identity.schemas import SignupRequest
 from navis.identity.tokens import TokenRevocationService
@@ -31,8 +39,46 @@ class AuthError(Exception):
     """Authentication/registration failure (maps to 400/401 at the edge)."""
 
 
+class NoSuchAccountError(AuthError):
+    """A verified identity that Navis has never seen, on a call that was told
+    not to create one (maps to 404 at the edge).
+
+    NOT AN AUTHENTICATION FAILURE, which is why it is a distinct type and gets
+    a distinct status. Google verified this person; there is simply no Navis
+    account behind the address yet. Reporting it as the generic 401 would tell
+    them their credentials were wrong, which is both false and unactionable —
+    the action they need is to choose what kind of workspace to create.
+
+    It does not enable account enumeration the way a 404 on the PASSWORD path
+    would: reaching this line requires a Google credential the caller has
+    already proved they control, so the only account whose existence it reveals
+    is their own.
+    """
+
+
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+#: Ceiling on a derived workspace name, matching `organizations.name`.
+_MAX_ORG_NAME = 255
+
+
+def _personal_workspace_name(full_name: str | None, email: str) -> str:
+    """What to call a workspace nobody named.
+
+    The person's own name when they gave one, otherwise the local part of their
+    address — which is the only other thing signup knows about them. Never the
+    full address: the name is rendered in the console and in an agent's
+    `/developer/me`, and an email is more than a label needs to carry.
+
+    Always non-empty, because `OrgLifecycleSeam.create` rejects a blank name and
+    a signup must not fail for lack of a display string. An address with no
+    local part cannot reach here — `EmailStr` has already validated it — but the
+    fallback is kept so this function is total rather than nearly total.
+    """
+    candidate = (full_name or "").strip() or email.split("@", 1)[0].strip()
+    return (candidate or "Personal workspace")[:_MAX_ORG_NAME]
 
 
 class IdentityService:
@@ -61,15 +107,49 @@ class IdentityService:
         except IntegrityError:
             raise AuthError("email already registered")
         # Org lifecycle goes through the seam (P2 extraction prep), not inline here.
-        org = await OrgLifecycleSeam(self.db).create(name=data.organization_name)
+        #
+        # NO ORGANIZATION NAME MEANS A PERSONAL WORKSPACE (P0-4). A solo
+        # developer has no company to name, and requiring one produced a tenant
+        # that claimed to be a company and was not. The workspace is named after
+        # the person because that is what it is; the name is a LABEL and carries
+        # no authority — the tenant is still identified by its id everywhere.
+        personal = data.organization_name is None
+        org = await OrgLifecycleSeam(self.db).create(
+            name=_personal_workspace_name(data.full_name, email)
+            if personal
+            else data.organization_name,
+            kind=OrganizationKind.PERSONAL if personal else OrganizationKind.COMPANY,
+        )
         await self.db.flush()
 
-        # First user of an org is the founder.
-        membership = Membership(user_id=user.id, organization_id=org.id, role=Role.FOUNDER)
+        # First user of an org is the founder — on BOTH surfaces (P1-6).
+        #
+        # WHY THE CREATOR IS THE DEVELOPER OWNER, AND WHY THAT IS NOT "SILENT
+        # INHERITANCE". Developer access is explicit everywhere else: it comes
+        # from `memberships.developer_role`, it defaults to NULL on an invite,
+        # and an Application administrator cannot grant it to themselves
+        # (`MemberService._ensure_grantable`). But SOMEBODY has to be able to
+        # grant it first, and the only person who exists when an organization is
+        # created is the person creating it. Leaving them NULL would produce a
+        # tenant whose Developer surface no one in the world could ever open —
+        # not even its owner — which is the same unrecoverable state the
+        # last-founder guard exists to prevent.
+        #
+        # This is also what makes the Developer-solo and Developer-first-company
+        # flows work with no signup change at all: whoever creates the workspace
+        # can immediately register an agent and call the Developer API, and never
+        # touches Application onboarding to do it.
+        membership = Membership(
+            user_id=user.id,
+            organization_id=org.id,
+            role=Role.FOUNDER,
+            developer_role=DeveloperRole.OWNER.value,
+        )
         self.db.add(membership)
         await self.db.flush()
         await AuditService(self.db).record(
-            AuditAction.SIGNUP, org_id=org.id, actor_id=user.id, target_id=str(org.id)
+            AuditAction.SIGNUP, org_id=org.id, actor_id=user.id, target_id=str(org.id),
+            metadata={"role": Role.FOUNDER.value, "developer_role": DeveloperRole.OWNER.value},
         )
         return user, org, membership
 
@@ -89,6 +169,9 @@ class IdentityService:
         email: str,
         google_sub: str,
         full_name: str | None,
+        workspace_kind: OrganizationKind | None = None,
+        organization_name: str | None = None,
+        create_workspace: bool = True,
     ) -> tuple[User, uuid.UUID | None, bool, bool]:
         """Find-or-create a user identified by their Google account.
 
@@ -98,10 +181,42 @@ class IdentityService:
         Behavior:
           • Existing user with google_sub match  → fast path, no writes.
           • Existing user with email match        → backfill google_sub.
-          • Unknown email                         → create User + Org + Membership.
+          • Unknown email, create_workspace=True  → create User + Org + Membership.
+          • Unknown email, create_workspace=False → NoSuchAccountError, no writes.
+
+        `create_workspace=False` IS WHAT MAKES A SIGN-IN A SIGN-IN (P0-8).
+        Authentication proves who somebody is; it is not a request to found a
+        company. With this False the unknown-identity branch below is not
+        reached at all, so a person arriving at the sign-in page cannot end up
+        owning a tenant they were never asked about — which is exactly how
+        three of the four organizations in production came to be `company`
+        rows named after a person, classified by a default nobody chose.
+
+        IT DOES NOT AFFECT AN INVITED PERSON. `MemberService.invite` writes a
+        real `users` row, so an invitee is found by the email lookup below on
+        their very first Google sign-in and resolves to the organization that
+        invited them. The refusal reaches only an identity with no user row
+        and therefore no membership and no invitation.
 
         `onboarding_completed` is True when the org's onboarding stage is at
         or beyond PROFILE_COMPLETE (i.e. the org form was already submitted).
+
+        THE WORKSPACE ARGUMENTS ARE CONSULTED ONLY ON THE CREATE BRANCH, AND
+        THAT IS THE LOAD-BEARING PART. A Google account that already holds a
+        membership resolves to the organization it already belongs to — the
+        `primary_membership` read at the bottom — and neither argument is
+        reachable from there. So a console that sends the same body for
+        sign-in and sign-up (which it must, because one Google button cannot
+        know which it will turn out to be) can never create a second tenant
+        for somebody who already has one, and can never rename the one they
+        have.
+
+        DEFAULTS TO COMPANY when the caller says nothing, which is what this
+        method has always done. The alternative — inferring `personal` from
+        the absence of a name, as the password path does — would silently
+        reclassify every existing Google signup, and `0051_surface_rbac_columns`
+        already declined to infer product meaning from an artefact of a signup
+        flow. Intent is honoured when it is stated and guessed never.
         """
         email = normalize_email(email)
         is_new_user = False
@@ -128,6 +243,13 @@ class IdentityService:
                 user.full_name = full_name
             await self.db.flush()
         else:
+            # A verified identity with no account. Whether that is a sign-up or
+            # a dead end is the CALLER's decision, and it has to be made before
+            # anything is written — once the organization exists there is no
+            # in-product way to ask the question retroactively.
+            if not create_workspace:
+                raise NoSuchAccountError("no Navis account exists for this Google identity")
+
             # Brand-new user — create User + Org + Membership atomically.
             is_new_user = True
             try:
@@ -145,11 +267,45 @@ class IdentityService:
                 raise AuthError("email already registered")
 
             # Create the org. Slug collisions are handled by OrgLifecycleSeam's retry loop.
-            org_name = full_name or email.split("@")[0]
-            org = await OrgLifecycleSeam(self.db).create(name=org_name)
+            #
+            # COMPANY UNLESS THE CALLER SAID OTHERWISE (P0-5). This flow used to
+            # create a company unconditionally, because it never asked: a founder
+            # bringing their company to the Application and a solo developer with
+            # no company reached this line identically, and the result was a
+            # tenant named after a person that claimed to be a company.
+            #
+            # The fix is to let intent be STATED, not to start inferring it. An
+            # absent `workspace_kind` still produces a company, so every existing
+            # caller is unchanged and no existing workspace is reclassified;
+            # `personal` produces the same one-person space the password path
+            # creates when `organization_name` is omitted. Nothing here looks at
+            # the email domain — two people at the same company signing up on
+            # their own get two workspaces, which is the truthful answer until
+            # one of them invites the other.
+            kind = workspace_kind or OrganizationKind.COMPANY
+            org = await OrgLifecycleSeam(self.db).create(
+                # A personal workspace is named after its owner; a company is
+                # named by whoever created it, falling back to the same label
+                # because it is the only other thing Google told us.
+                name=(
+                    organization_name.strip()
+                    if kind is OrganizationKind.COMPANY and organization_name
+                    else _personal_workspace_name(full_name, email)
+                ),
+                kind=kind,
+            )
             await self.db.flush()
 
-            membership = Membership(user_id=user.id, organization_id=org.id, role=Role.FOUNDER)
+            # Founder on both surfaces, for the reason given in `signup` above:
+            # the workspace creator is the only person who can bootstrap
+            # Developer access, so leaving them NULL would make the surface
+            # permanently unreachable for this tenant.
+            membership = Membership(
+                user_id=user.id,
+                organization_id=org.id,
+                role=Role.FOUNDER,
+                developer_role=DeveloperRole.OWNER.value,
+            )
             self.db.add(membership)
             await self.db.flush()
 
@@ -158,7 +314,15 @@ class IdentityService:
                 org_id=org.id,
                 actor_id=user.id,
                 target_id=str(org.id),
-                metadata={"method": "google_sso"},
+                # `workspace_kind` records what was CREATED, so an audit can tell
+                # a stated choice from the default without re-reading the org row
+                # — which may have been renamed since.
+                metadata={
+                    "method": "google_sso",
+                    "workspace_kind": kind.value,
+                    "role": Role.FOUNDER.value,
+                    "developer_role": DeveloperRole.OWNER.value,
+                },
             )
 
         # Resolve org membership for token issuance.

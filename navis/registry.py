@@ -23,6 +23,10 @@ from navis.learning import models as _learning_models  # noqa: F401
 from navis.intelligence import models as _intelligence_models  # noqa: F401
 from navis.adaptive import models as _adaptive_models  # noqa: F401
 from navis.ml.embeddings import models as _ml_embedding_models  # noqa: F401
+# Agent execution lifecycle (0048): Task -> Run -> Step -> Outcome. A VIEW over
+# the existing machine identity — `agent_id` is a `service_accounts.id` — not a
+# second identity model. Registered here so Alembic sees the four tables.
+from navis.developer import run_models as _developer_run_models  # noqa: F401
 
 # --- Event subscribers + Celery task registration ---
 from navis.memory import service as _memory_service  # noqa: F401

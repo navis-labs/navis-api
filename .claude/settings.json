@@ -5,7 +5,8 @@
       "Bash(python -m pytest tests -q -p no:randomly)"
     ],
     "additionalDirectories": [
-      "/Users/abhishekmeena/Desktop/Navis-AI/src/hooks"
+      "/Users/abhishekmeena/Desktop/Navis-AI/src/hooks",
+      "/Users/abhishekmeena/Desktop/Devtool/apps/dashboard/src/features/auth"
     ]
   }
 }

@@ -91,6 +91,34 @@ class MemoryRepository:
         )
         return (await self.db.scalars(stmt)).all()
 
+    async def recent(
+        self, org_id: uuid.UUID, *, limit: int = 100
+    ) -> Sequence[MemoryRecordRow]:
+        """Newest-first facts of EVERY entity_type in an org.
+
+        `list_by_entity_type` above answers "what does Memory know about people?"
+        and is served by `ix_mem_org_type_time`. This answers the different
+        question a machine client asks first — "what has Memory learned lately?"
+        — which cannot use that index at all, because the type is not in the
+        predicate and it leads the key. The ordering here is
+        `(organization_id, event_timestamp, memory_id)`, which is exactly
+        `ix_mem_org_time`, the index the State V2 fold already streams on.
+
+        Ordered by EVENT time, the same clock `list_by_entity_type` uses and the
+        one the fold is defined in — not by `created_at`. `memory_id` breaks the
+        tie so a page boundary is deterministic across calls rather than
+        depending on whatever order the planner returned equal timestamps in.
+        """
+        stmt = (
+            select(MemoryRecordRow)
+            .where(MemoryRecordRow.organization_id == org_id)
+            .order_by(
+                MemoryRecordRow.event_timestamp.desc(), MemoryRecordRow.memory_id.desc()
+            )
+            .limit(limit)
+        )
+        return (await self.db.scalars(stmt)).all()
+
     # --- governance (GDPR erasure cascade) -------------------------------------------------
     async def scan_org(
         self, org_id: uuid.UUID, *, limit: int = 500, after_id: uuid.UUID | None = None

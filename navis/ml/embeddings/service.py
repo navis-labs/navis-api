@@ -152,19 +152,36 @@ def _company_text(p: dict) -> str:
     return f"Company {label} ({domain})" if domain else f"Company {label}"
 
 
-def _thread_text(p: dict) -> str:
+def _thread_head(p: dict) -> str:
+    """A thread WITHOUT its body — subject, participants, category.
+
+    Split out so there is ONE definition of the derived part and the body is a
+    separate decision. `_thread_text` still returns the identical string it
+    always did, so every stored embedding and the chat path are untouched; the
+    Developer boundary renders this head alone (see `memory_text_minimal`).
+
+    Splitting the full string on ": " would NOT be equivalent and must not be
+    used as a shortcut: a real subject contains colons ("Re: Invitation from an
+    unknown sender: ...") and the split would cut inside it.
+    """
     subject = _clean(p.get("subject"))
     participants = _people(p.get("participants"))
-    snippet = _clean(p.get("snippet"))
     category = _clean(p.get("category"))
-    if not (subject or participants or snippet):
-        return ""
     bits = [f'Email thread "{subject}"' if subject else "Email thread"]
     if participants:
         bits.append(f"with {participants}")
     if category and category != "personal":
         bits.append(f"({category})")
-    head = " ".join(bits)
+    return " ".join(bits)
+
+
+def _thread_text(p: dict) -> str:
+    subject = _clean(p.get("subject"))
+    participants = _people(p.get("participants"))
+    snippet = _clean(p.get("snippet"))
+    if not (subject or participants or snippet):
+        return ""
+    head = _thread_head(p)
     return f"{head}: {snippet}" if snippet else head
 
 
@@ -280,6 +297,48 @@ def memory_text(record: MemoryRecord) -> str:
         # the corpus instead of silently embedding an empty string.
         body = f"{record.entity_type} {record.dedup_key}"
     return body[:_MAX_TEXT]
+
+
+#: Entity types whose rendered fact embeds RAW SOURCE CONTENT, and what it is.
+#:
+#: Audited across all eleven renderers. The other eight are metadata only —
+#: names, emails, domains, titles, owners, times, attendees — and carry nothing
+#: from a message body.
+#:
+#:   thread      the email BODY (`snippet`), uncapped by `_clean` and bounded
+#:               only by `_MAX_TEXT`, so up to ~2000 characters of message text.
+#:   commitment  the promise as spoken (`text`).
+#:   decision    the decision as recorded (`text`).
+#:
+#: `commitment` and `decision` are DELIBERATELY NOT minimized. Their quoted text
+#: IS the organizational fact — "somebody committed to something" with the
+#: something removed is not a smaller fact, it is a useless one — and a caller
+#: reaching this bundle already holds `view_memory` on this organization. The
+#: thread snippet is different in kind: the subject line and participants are
+#: the organizational fact, and the body is incidental content that happens to
+#: ride along because similarity search wanted it.
+RAW_CONTENT_ENTITY_TYPES: frozenset[str] = frozenset({"thread", "commitment", "decision"})
+
+
+def memory_text_minimal(entity_type: str, payload: dict | None) -> str | None:
+    """The derived organizational fact, with raw BODY content left out.
+
+    Returns None when there is nothing to substitute — an unknown entity type,
+    an absent payload, or a render that comes back empty — and the caller then
+    keeps what it already had rather than replacing a real fact with a blank.
+    Minimization must never be able to erase a fact.
+
+    Only `thread` currently differs from `memory_text`; see
+    `RAW_CONTENT_ENTITY_TYPES` for why commitment and decision do not.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if entity_type == "thread":
+        return _thread_head(payload) or None
+    renderer = _RENDERERS.get(entity_type)
+    if renderer is None:
+        return None
+    return renderer(payload) or None
 
 
 @dataclass(frozen=True, slots=True)

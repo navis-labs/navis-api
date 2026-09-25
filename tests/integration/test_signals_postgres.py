@@ -21,7 +21,9 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture()
-async def db():
+async def db(monkeypatch):
+    from contextlib import asynccontextmanager
+
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     import navis.registry  # noqa: F401  register all models
@@ -31,6 +33,50 @@ async def db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     Session = async_sessionmaker(engine, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def _scope():
+        async with Session() as s:
+            try:
+                yield s
+                await s.commit()
+            except Exception:
+                await s.rollback()
+                raise
+
+    # ── THE SUBSCRIBERS MUST READ THE TEST DATABASE ────────────────────
+    # `relay_signals_pass` calls `ensure_subscribers()`, so the REAL handlers
+    # run, and each opens its own session through `session_scope` — which it
+    # imported BY VALUE at module import. Patching only
+    # `navis.platform.database.session_scope` misses them.
+    #
+    # Unpatched, those handlers connect to whatever `DATABASE_URL` names, i.e.
+    # PRODUCTION, and then cannot see the org this test just wrote locally:
+    # `on_first_signal` died on
+    # `organization_onboarding_organization_id_fkey`, the relay counted a
+    # failed handler, and the row was correctly withheld from `published_at` —
+    # so the assertion below failed for a reason that had nothing to do with
+    # the outbox contract it exists to prove. The foreign key is the only
+    # reason nothing was written to production.
+    #
+    # Same list-of-hops approach as `test_observation_contract`, which has the
+    # fuller note on why each module needs its own patch.
+    for target in (
+        "navis.identity_resolution.service.session_scope",
+        "navis.memory.service.session_scope",
+        "navis.orchestration.org_provisioning.session_scope",
+        "navis.signals.outbox.session_scope",
+        "navis.signals.router.session_scope",
+        "navis.platform.database.session_scope",
+    ):
+        monkeypatch.setattr(target, _scope, raising=False)
+
+    # Redis is a best-effort mirror and is not running here; waiting on it
+    # would measure the sandbox rather than the contract.
+    from navis.platform.events import event_bus
+
+    monkeypatch.setattr(event_bus, "_mirror_to_redis", False, raising=False)
+
     async with Session() as session:
         yield session
     async with engine.begin() as conn:

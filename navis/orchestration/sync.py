@@ -12,11 +12,12 @@ Signals capture; orchestration persists cursors/tokens/watch. Clean seam.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
 
-from navis.identity.models import Integration, IntegrationProvider
+from navis.identity.models import Integration, IntegrationAuthState, IntegrationProvider
 from navis.orchestration.runtime_policy import scheduled_work_allowed
 from navis.organization.contract import Capability
 from navis.platform.database import session_scope
@@ -78,6 +79,36 @@ def _capability_for(provider: IntegrationProvider) -> Capability | None:
     return _CAPABILITY.get(provider)
 
 
+def _utcnow() -> datetime:
+    """Wall clock, timezone-aware. One reading per sync pass.
+
+    Taken once and reused for `last_attempt_at` and `last_success_at` so the two
+    cannot disagree by the duration of a database round trip — a success stamped
+    microseconds before the attempt that produced it reads as a clock bug.
+    """
+    return datetime.now(timezone.utc)
+
+
+#: Matches `_MAX_FAILURE_REASON` in `navis.signals.sync`, and for the same
+#: reason: the column is VARCHAR(500), so truncating at 300 keeps the cut ours
+#: and visible rather than letting the database raise on an over-long string.
+_MAX_FAILURE_REASON = 300
+
+
+def _bounded_reason(outcome: Any) -> str:
+    """A short, storable description of a NON-auth sync failure.
+
+    Deliberately coarse. The exception never reaches this frame — the sync engine
+    dead-letters it and returns a flat outcome — so this reports the shape of the
+    failure and points at the DLQ, which holds the stack. Writing something more
+    specific here would mean re-plumbing exceptions through a boundary that
+    exists to stop exactly that.
+    """
+    if outcome.dead_lettered:
+        return f"sync failed; {outcome.dead_lettered} event(s) dead-lettered"[:_MAX_FAILURE_REASON]
+    return "sync failed; see dead-letter queue"[:_MAX_FAILURE_REASON]
+
+
 def _build_client(integration: Integration):
     entry = _REGISTRY.get(integration.provider)
     if entry is None:
@@ -135,6 +166,38 @@ async def sync_integration(integration: Integration) -> dict:
                 ):
                     return {"skipped": "not_entitled"}
 
+                # ── AUTH HEALTH GATE ─────────────────────────────────────────
+                # A grant that needs re-consent will be refused identically on
+                # every future attempt, so attempting it is pure waste: it burns
+                # a worker, a provider rate-limit slot and a DLQ row to learn
+                # what the row already records. Checked on the FRESHLY RE-READ
+                # row inside the lock, so a re-consent that landed moments ago is
+                # honoured rather than raced.
+                #
+                # AFTER THE ENTITLEMENT GATE, deliberately. Entitlement is the
+                # more fundamental refusal — a tenant whose plan does not cover
+                # Gmail should be told that, not told its token needs
+                # re-authorising, and a person who re-consents in response to the
+                # wrong diagnosis has wasted a trip through an OAuth flow that
+                # was never going to help.
+                #
+                # `_dispatch_all` already excludes these from the scheduled
+                # fan-out. This is the second gate, and it is the one that covers
+                # the other two producers: the Pub/Sub push and the manual sync
+                # route do not go through the fan-out, so without it a dead
+                # account would still be retried on every notification.
+                #
+                # RECOVERY IS NOT BLOCKED BY THIS. Nothing here writes
+                # `auth_state`, and a new OAuth grant clears it — so the user
+                # re-consents, the callback sets `ok`, and the very next pass
+                # runs normally with no backlog to drain.
+                if fresh.auth_state != IntegrationAuthState.OK.value:
+                    metrics.incr(
+                        "sync.skipped.auth",
+                        labels={"provider": fresh.provider.value, "auth_state": fresh.auth_state},
+                    )
+                    return {"skipped": "auth_" + fresh.auth_state}
+
                 # Tenant log context, bound from the FRESHLY RE-READ row — never
                 # from the caller's argument and never from a task payload (T-21).
                 # Everything below, including the connector's own logging, now
@@ -146,6 +209,19 @@ async def sync_integration(integration: Integration) -> dict:
                     cursor = (fresh.sync_state or {}).get("cursor") or {}
 
                     outcome = await SignalSyncService(db).sync(ctx, connector, client, cursor)
+
+                    # ── HEALTH, RECORDED ON EVERY PATH ───────────────────────
+                    # In the SAME transaction as the cursor, and — unlike the
+                    # cursor — written whether the pass succeeded or not. That
+                    # asymmetry is the whole point: a failure moves no cursor, so
+                    # a health field kept beside the cursor would only ever
+                    # record successes and could never say a source is broken.
+                    #
+                    # `last_attempt_at` FIRST and unconditionally: it is the
+                    # fact that separates "healthy and quiet" from "the
+                    # scheduler stopped visiting this row".
+                    now = _utcnow()
+                    fresh.last_attempt_at = now
 
                     # Persist cursor + refreshed token in the SAME transaction.
                     if not outcome.failed:
@@ -163,6 +239,58 @@ async def sync_integration(integration: Integration) -> dict:
                                 fresh.refresh_token = token_cipher.encrypt(
                                     token_manager.last_token.refresh_token
                                 )
+                        # A PASS THAT REACHED THE PROVIDER IS PROOF THE GRANT
+                        # WORKS, so it clears the failure record.
+                        #
+                        # NOTE WHAT THIS DOES *NOT* DO. It cannot rescue a row
+                        # already marked `reconsent_required`, because the gate
+                        # above refuses that row before the sync runs — so this
+                        # branch is only ever reached by a row that was already
+                        # `ok`. That is deliberate and it is the whole retry-storm
+                        # design: `reconsent_required` is TERMINAL until a new
+                        # OAuth grant, and the callback in `signals/router.py` is
+                        # the single path back. Writing `auth_state` here anyway
+                        # keeps the invariant "a successful pass means ok" true at
+                        # the row level rather than relying on it being true by
+                        # construction, which is the kind of assumption that stops
+                        # holding when somebody later adds a way in.
+                        fresh.last_success_at = now
+                        fresh.auth_state = IntegrationAuthState.OK.value
+                        fresh.last_failure_reason = None
+                    elif outcome.auth_failed:
+                        # THE CREDENTIAL IS DEAD, and this is the branch that
+                        # used to not exist — the exception was dead-lettered and
+                        # the row left claiming to be connected.
+                        #
+                        # `is_active` IS NOT TOUCHED. The user still wants Gmail
+                        # connected; Google just rejected the refresh token.
+                        # Flipping intent here is what made "disconnected by the
+                        # user" and "needs re-authorising" indistinguishable, and
+                        # it would also hide the row from the reconnect UI that
+                        # is supposed to fix it.
+                        #
+                        # NEITHER THE REFRESH TOKEN NOR THE CURSOR IS DELETED.
+                        # The token may be revived by re-consent, and the cursor
+                        # is where ingestion must resume — discarding it would
+                        # turn every re-consent into a full historical resync.
+                        fresh.auth_state = IntegrationAuthState.RECONSENT_REQUIRED.value
+                        fresh.last_failure_reason = outcome.auth_failure_reason
+                        logger.warning(
+                            "integration %s (%s) needs re-consent: %s",
+                            fresh.id, fresh.provider.value, outcome.auth_failure_reason,
+                        )
+                        metrics.incr(
+                            "sync.auth_failed", labels={"provider": fresh.provider.value}
+                        )
+                    else:
+                        # A TRANSIENT FAILURE — a timeout, a 500, a connector
+                        # bug. `auth_state` is deliberately LEFT ALONE: the
+                        # credential was never shown to be bad, and demoting a
+                        # working grant on a network blip would stop syncing an
+                        # account that is fine. The reason is still recorded, so
+                        # an operator can see that attempts are failing even
+                        # while the grant itself is healthy.
+                        fresh.last_failure_reason = _bounded_reason(outcome)
     finally:
         await transport.aclose()
 
@@ -219,13 +347,29 @@ async def ensure_watch_for_integration(integration: Integration) -> dict:
 
 
 async def _dispatch_all() -> int:
-    """Fan-out: enqueue ONE per-integration task per active integration (paginated)."""
+    """Fan-out: enqueue ONE per-integration task per HEALTHY active integration.
+
+    THE RETRY-STORM GATE. `auth_state != 'ok'` is excluded here rather than left
+    for `sync_integration` to refuse, because the cost being avoided is the task
+    itself: a dead grant that reaches the worker has already taken a queue slot,
+    a database session and an advisory lock to learn what this predicate knows
+    for free. Six Google rows on one beat is nothing; six hundred across a
+    tenant base, every beat, forever, is the storm.
+
+    Excluding a row from the fan-out does NOT strand it. `auth_state` is cleared
+    by the OAuth callback the moment the user re-consents, so the row rejoins
+    the very next beat — no backlog to drain, no operator action, no separate
+    retry schedule to get wrong.
+    """
     dispatched, after, page = 0, None, 1000
     while True:
         async with session_scope() as db:
             stmt = (
                 select(Integration.id)
-                .where(Integration.is_active.is_(True))
+                .where(
+                    Integration.is_active.is_(True),
+                    Integration.auth_state == IntegrationAuthState.OK.value,
+                )
                 .order_by(Integration.id)
                 .limit(page)
             )
@@ -427,12 +571,42 @@ async def _process_slack_event(team_id: str | None, envelope: dict) -> dict:
             )
             return {"matched": False, "reason": reason or AmbiguityReason.NO_MATCH}
 
-        # M-1: workspace disconnect / token revocation -> deactivate (don't keep hitting Slack
-        # with a dead token; that failure rate is what trips Slack's 95% auto-disable).
+        # M-1: workspace disconnect / token revocation. BOTH stop us hitting
+        # Slack with a dead token — that failure rate is what trips Slack's 95%
+        # auto-disable — but they are NOT the same event and no longer share a
+        # response.
+        #
+        #   app_uninstalled  the app was REMOVED FROM THE WORKSPACE. That is a
+        #                    person deciding to disconnect, so it moves intent:
+        #                    is_active=False, exactly as before. The token is
+        #                    dead too, so auth_state follows.
+        #
+        #   tokens_revoked   the CREDENTIAL was revoked. Nobody asked to
+        #                    disconnect — an admin rotated a token, or Slack
+        #                    invalidated it. Intent is untouched; only auth_state
+        #                    moves.
+        #
+        # Collapsing the second into the first is the overload this phase
+        # removes. It made an auth failure indistinguishable from a user
+        # disconnect, and it hid the row from the reconnect UI that exists to fix
+        # it: `integrations_for_external_account` filters on `is_active`, so a
+        # deactivated row stops resolving and the workspace goes quiet with no
+        # explanation. Leaving `is_active` True keeps the row visible and keeps
+        # INBOUND events flowing — a webhook envelope carries its own payload and
+        # needs no token to ingest — while `auth_state` stops every OUTBOUND call
+        # and keeps the row out of the sync fan-out.
         if inner_type in ("app_uninstalled", "tokens_revoked"):
-            integration.is_active = False
-            logger.warning("slack %s for team=%s; integration deactivated", inner_type, team_id)
-            return {"matched": True, "deactivated": True}
+            integration.auth_state = IntegrationAuthState.REVOKED.value
+            integration.last_failure_reason = f"slack {inner_type}"
+            integration.last_attempt_at = _utcnow()
+            disconnected = inner_type == "app_uninstalled"
+            if disconnected:
+                integration.is_active = False
+            logger.warning(
+                "slack %s for team=%s; auth_state=revoked is_active=%s",
+                inner_type, team_id, integration.is_active,
+            )
+            return {"matched": True, "deactivated": disconnected, "auth_revoked": True}
 
         # Tenant log context from the RESOLVED integration row (T-21) — bound only
         # after the resolution above proved exactly one organization owns this

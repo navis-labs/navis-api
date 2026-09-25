@@ -39,6 +39,7 @@ exactly what "compose an answer out of memory OR raw signals" is.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
@@ -239,6 +240,80 @@ async def _gmail_facts(
     return out
 
 
+#: Provider -> the name a person recognises. One mapping, used by both readers
+#: below, so a label can never differ between "what is connected" and "how
+#: healthy is it".
+_SOURCE_LABELS = {
+    IntegrationProvider.GMAIL: "Gmail",
+    IntegrationProvider.GOOGLE_CALENDAR: "Google Calendar",
+    IntegrationProvider.DRIVE: "Google Drive",
+    IntegrationProvider.SLACK: "Slack",
+    IntegrationProvider.NOTION: "Notion",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class SourceHealth:
+    """One integration's intent, auth health and ingestion recency.
+
+    THE THREE FIELDS ARE THE THREE QUESTIONS, and the reason this type exists
+    rather than a bare label list. `connected` is what the user wants,
+    `auth_state` is whether the credential works, `last_success_at` is whether
+    data is actually arriving — and a reader needs all three to tell these apart:
+
+        connected=True,  auth_state=ok,                 recent success   HEALTHY
+        connected=True,  auth_state=ok,                 old/no success   STALE
+        connected=True,  auth_state=reconsent_required                   BROKEN
+        connected=False                                                  DISCONNECTED
+
+    Before this, every one of those rendered as "connected".
+    """
+
+    source: str
+    label: str
+    connected: bool
+    auth_state: str
+    last_attempt_at: datetime | None
+    last_success_at: datetime | None
+    last_failure_reason: str | None
+
+
+async def source_health(db: AsyncSession, org_id: uuid.UUID) -> list[SourceHealth]:
+    """Every integration this org has, with its health. THE single reader.
+
+    Returns DISCONNECTED rows too, deliberately: "you disconnected Slack" and
+    "you never connected Slack" are different answers to "why is there nothing
+    from Slack?", and only the row can tell them apart.
+
+    Ordered by label so the output is stable across calls — an unordered list
+    that reshuffles between requests makes a diff in a UI or a test meaningless.
+    """
+    rows = (
+        await db.scalars(
+            select(Integration).where(Integration.organization_id == org_id)
+        )
+    ).all()
+    out: list[SourceHealth] = []
+    for r in rows:
+        label = _SOURCE_LABELS.get(r.provider)
+        if not label:
+            continue  # a provider with no display name is not one we surface
+        provider_value = r.provider.value if hasattr(r.provider, "value") else str(r.provider)
+        out.append(
+            SourceHealth(
+                source=provider_value,
+                label=label,
+                connected=bool(r.is_active),
+                auth_state=r.auth_state,
+                last_attempt_at=r.last_attempt_at,
+                last_success_at=r.last_success_at,
+                last_failure_reason=r.last_failure_reason,
+            )
+        )
+    out.sort(key=lambda s: s.label)
+    return out
+
+
 async def connected_source_labels(
     db: AsyncSession, org_id: uuid.UUID
 ) -> list[str]:
@@ -247,25 +322,27 @@ async def connected_source_labels(
     Used to make the genuinely-empty message specific ("Gmail is connected but
     hasn't synced yet") instead of the blanket "not enough memory", which told
     the founder nothing about what to do next.
+
+    UNCHANGED IN MEANING — still "which sources did the user connect", still
+    filtered on `is_active` alone, still deduplicated by label. Every existing
+    caller keeps the answer it had. It is now DERIVED from `source_health`
+    rather than running its own query, so the two can never disagree about which
+    sources exist; callers that need to know whether a connected source is
+    actually WORKING call `source_health` directly.
+
+    DEDUPLICATION IS LOAD-BEARING and is why this is not simply a list
+    comprehension over `source_health`. One organization legitimately holds
+    several rows for one provider — the Google-family clone writes a Gmail,
+    Calendar and Drive row from a single grant, and a second Google account adds
+    another set — so the row list repeats providers. This function names SYSTEMS
+    to a person ("Gmail is connected but hasn't synced yet"), and "Gmail, Gmail"
+    is not a sentence anybody wants to read. `source_health` deliberately does
+    NOT dedupe: there, each row is a distinct connection with its own credential
+    and its own health, and collapsing two accounts into one would hide a broken
+    one behind a working one.
     """
-    labels = {
-        IntegrationProvider.GMAIL: "Gmail",
-        IntegrationProvider.GOOGLE_CALENDAR: "Google Calendar",
-        IntegrationProvider.DRIVE: "Google Drive",
-        IntegrationProvider.SLACK: "Slack",
-        IntegrationProvider.NOTION: "Notion",
-    }
-    rows = (
-        await db.scalars(
-            select(Integration.provider).where(
-                Integration.organization_id == org_id,
-                Integration.is_active.is_(True),
-            )
-        )
-    ).all()
     out: list[str] = []
-    for provider in rows:
-        label = labels.get(provider)
-        if label and label not in out:
-            out.append(label)
+    for s in await source_health(db, org_id):
+        if s.connected and s.label not in out:
+            out.append(s.label)
     return out

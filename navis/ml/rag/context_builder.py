@@ -20,9 +20,11 @@ own read contract, never its tables.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import Any, Sequence
 
@@ -33,6 +35,7 @@ from navis.ml.rag.grounding import GroundedContext, Grounding
 from navis.ml.retrieval.reranker import _overlap
 from navis.ml.retrieval.retriever import MemoryRetriever
 from navis.platform.monitoring import get_logger
+from navis.platform.monitoring.metrics import timed
 
 logger = get_logger("ml.rag.context")
 
@@ -414,9 +417,96 @@ async def intelligence_groundings(
     return intelligence_facts(await IntelligenceRepository(db).get_insights(org_id))
 
 
+#: How a caller hands this module the ability to open a session of its own.
+#:
+#: A FACTORY, NOT A SESSION, and injected rather than imported. `navis.ml` must
+#: not reach for `navis.platform.database` itself — the composition root (the
+#: route) owns that decision, which is also what keeps `ContextBuilder(object())`
+#: working in `tests/ml/test_ml_layer.py`: no factory, no session, no import.
+SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+
+
 class ContextBuilder:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+
+    async def _gather_layers(
+        self,
+        org_id: uuid.UUID,
+        retrieval_query: str,
+        *,
+        k: int,
+        since: datetime | None,
+        until: datetime | None,
+        include_learning: bool,
+        include_intelligence: bool,
+        sessions: SessionFactory,
+    ) -> tuple[list[Any], list[Grounding], list[Grounding]]:
+        """Retrieval, Learning and Intelligence at the same time, on three sessions.
+
+        WHY THIS EXISTS. These three reads share no data — retrieval embeds the
+        task and scans this organization's vectors, Learning aggregates its own
+        outcomes, Intelligence reads its current insight generation — but they
+        ran one after another, so the route paid for their SUM. Against a
+        database a round trip away that is the whole latency budget: eleven
+        statements at ~1.1s each is twelve seconds of a request spent waiting,
+        with ~3ms of it actually executing.
+
+        ONE SESSION PER BRANCH, and that is the point rather than an accident.
+        An `AsyncSession` is not concurrency-safe: two coroutines awaiting on one
+        session interleave on a single connection and corrupt its state. So each
+        branch opens its own, uses it, and closes it.
+
+        SAFE ONLY BECAUSE EVERY BRANCH IS A READ. Three sessions are three
+        transactions, so a caller that WRITES cannot use this path — which is why
+        `build_grounded_context` gates it on `read_only`. See its note.
+
+        FAILURE SEMANTICS ARE PRESERVED EXACTLY. Retrieval is the answer and its
+        failure propagates; Learning and Intelligence are enrichment and never
+        fail the turn. `return_exceptions=True` keeps one branch's failure from
+        cancelling its siblings, and each result is then unwrapped on the same
+        terms the sequential path uses.
+        """
+
+        async def _retrieve() -> list[Any]:
+            async with sessions() as db:
+                return await MemoryRetriever(db).search(
+                    org_id, retrieval_query, k=k, since=since, until=until
+                )
+
+        async def _learning() -> list[Grounding]:
+            if not include_learning:
+                return []
+            async with sessions() as db:
+                return await learning_groundings(db, org_id)
+
+        async def _intelligence() -> list[Grounding]:
+            if not include_intelligence:
+                return []
+            async with sessions() as db:
+                return await intelligence_groundings(db, org_id)
+
+        with timed("context.layers_concurrent"):
+            hits, learned, insights = await asyncio.gather(
+                _retrieve(), _learning(), _intelligence(), return_exceptions=True
+            )
+
+        # Retrieval IS the answer. A failure here is not degradation, and
+        # swallowing it would return an empty context that looks like a quiet
+        # organization — the same conflation this platform refuses everywhere else.
+        if isinstance(hits, BaseException):
+            raise hits
+        if isinstance(learned, BaseException):
+            logger.exception(
+                "learning groundings unavailable org=%s", org_id, exc_info=learned
+            )
+            learned = []
+        if isinstance(insights, BaseException):
+            logger.exception(
+                "intelligence groundings unavailable org=%s", org_id, exc_info=insights
+            )
+            insights = []
+        return hits, learned, insights
 
     async def build(
         self,
@@ -450,6 +540,12 @@ class ContextBuilder:
         # output is not re-examined. That is what keeps the cost bounded and the
         # path deterministic.
         expand: "Callable[[list[Grounding]], Awaitable[list[Grounding]]] | None" = None,
+        # How to open a session per concurrent branch. `None` keeps the original
+        # sequential path on `self.db` EXACTLY as it was — which is what lets
+        # `ContextBuilder(object())` keep working where the I/O is monkeypatched,
+        # and what makes this change opt-in rather than a new default for every
+        # caller. See `_gather_layers`.
+        sessions: SessionFactory | None = None,
     ) -> GroundedContext:
         # WHAT WE SEARCH FOR vs WHAT WE SHOW THE MODEL. `question` is the
         # founder's own words and is what `GroundedContext.question` renders and
@@ -461,9 +557,28 @@ class ContextBuilder:
         # than their display name, so embedding "Why does X matter?" searched a
         # corpus that barely contains the string "X". The caller appends the
         # canonical aliases; nothing here invents any.
-        hits = await MemoryRetriever(self.db).search(
-            org_id, retrieval_query or question, k=k, since=since, until=until
-        )
+        #
+        # CONCURRENT WHEN THE CALLER SUPPLIED SESSIONS, sequential otherwise. Both
+        # branches read the same three layers with the same arguments and compose
+        # the same candidate set; the only difference is whether the request pays
+        # for their sum or their maximum.
+        learned: list[Grounding] = []
+        insights: list[Grounding] = []
+        if sessions is not None:
+            hits, learned, insights = await self._gather_layers(
+                org_id,
+                retrieval_query or question,
+                k=k,
+                since=since,
+                until=until,
+                include_learning=include_learning,
+                include_intelligence=include_intelligence,
+                sessions=sessions,
+            )
+        else:
+            hits = await MemoryRetriever(self.db).search(
+                org_id, retrieval_query or question, k=k, since=since, until=until
+            )
         candidates: list[Grounding] = [
             Grounding(
                 kind="memory",
@@ -491,8 +606,7 @@ class ContextBuilder:
         # LEARNING_UPDATED: the Observation -> Learning -> Intelligence chain runs
         # synchronously inside one event handler, and hanging feature computation
         # off it would put ML latency on the path that records outcomes.
-        learned: list[Grounding] = []
-        if include_learning:
+        if sessions is None and include_learning:
             try:
                 learned = await learning_groundings(self.db, org_id)
             except Exception:  # noqa: BLE001 — enrichment never fails the turn
@@ -507,8 +621,7 @@ class ContextBuilder:
         # evidence, because that is what a founder asking an organizational
         # question is actually asking for: the conclusion first, the facts it was
         # drawn from after.
-        insights: list[Grounding] = []
-        if include_intelligence:
+        if sessions is None and include_intelligence:
             try:
                 insights = await intelligence_groundings(self.db, org_id)
             except Exception:  # noqa: BLE001 — enrichment never fails the turn

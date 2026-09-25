@@ -9,12 +9,33 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    UniqueConstraint,
+    func,
+    text as sa_text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import Mapped, mapped_column
 
+from navis.identity.agents import AGENT_ENVIRONMENTS, AGENT_RUNTIMES, AgentEnvironment, AgentRuntime
 from navis.platform.database.base import Base, Timestamped, UUIDPrimaryKey
+
+
+def _one_of(column: str, values: frozenset[str]) -> str:
+    """A SQL `IN (...)` predicate over a closed vocabulary, quoted deterministically.
+
+    Sorted so the constraint's rendered SQL is stable across processes — an
+    unordered set would make Alembic's autogenerate see a difference on every run.
+    """
+    literals = ", ".join(f"'{v}'" for v in sorted(values))
+    return f"{column} IN ({literals})"
 
 # SQLAlchemy does NOT detect in-place mutation of a plain JSONB dict/list
 # (`row.config["x"] = y` silently won't persist). Wrapping the type registers a
@@ -63,12 +84,45 @@ class ApiKey(UUIDPrimaryKey, Timestamped, Base):
     )
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: When this credential stops authenticating. NULL means it does not expire,
+    #: which is what every credential minted before 0052 is.
+    #:
+    #: SEPARATE FROM `revoked_at` ON PURPOSE. `revoked_at` is a decision somebody
+    #: made; this is a limit chosen when the credential was minted. A key can be
+    #: both, an audit needs to tell them apart, and authentication refuses
+    #: either. See `credential_status_of` for the one derivation both the API and
+    #: the console read.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ServiceAccount(UUIDPrimaryKey, Timestamped, Base):
-    """A non-human, org-scoped, permission-scoped principal (workers, integrations)."""
+    """A non-human, org-scoped, permission-scoped principal (workers, integrations).
+
+    THIS IS THE AGENT ROW. `/api/v1/developer/agents` is a product-facing view of
+    this table and creates nothing else — see `navis/identity/agents.py` for why
+    a separate `agents` table would be a second machine identity rather than a
+    new feature. The three descriptive columns below (0046) are what that view
+    needs and the authorization path deliberately never reads.
+    """
 
     __tablename__ = "service_accounts"
+    __table_args__ = (
+        # Closed vocabularies, enforced by the DATABASE and not only by the edge.
+        # The edge validates too, but the edge is one of several writers over the
+        # life of a table (a migration, a fixture, an operator's psql session),
+        # and a free-text tier or runtime cannot be grouped or filtered later.
+        CheckConstraint(_one_of("environment", AGENT_ENVIRONMENTS), name="ck_sa_environment"),
+        CheckConstraint(_one_of("runtime", AGENT_RUNTIMES), name="ck_sa_runtime"),
+        # The hot agent query is "this tenant's agents, newest first" — the list
+        # every console page load and every `GET /developer/agents` runs. Leading
+        # with organization_id keeps it tenant-keyed, so one organization's fleet
+        # size never affects another's scan.
+        Index(
+            "ix_service_accounts_org_created",
+            "organization_id",
+            sa_text("created_at DESC"),
+        ),
+    )
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
@@ -77,6 +131,25 @@ class ServiceAccount(UUIDPrimaryKey, Timestamped, Base):
     scopes: Mapped[list] = mapped_column(_JSONB_LIST, default=list)
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # ── Descriptive, never authoritative (0046) ─────────────────────────────
+    # Server defaults as well as Python defaults: rows written before 0046 are
+    # back-filled by the migration, and a raw INSERT that omits them gets the
+    # same values the ORM would have supplied rather than a NOT NULL violation.
+    description: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default=""
+    )
+    environment: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default=AgentEnvironment.DEVELOPMENT.value,
+        server_default=AgentEnvironment.DEVELOPMENT.value,
+    )
+    runtime: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=AgentRuntime.CUSTOM.value,
+        server_default=AgentRuntime.CUSTOM.value,
+    )
 
 
 class RevokedToken(Base):

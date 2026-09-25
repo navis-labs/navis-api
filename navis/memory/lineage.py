@@ -51,6 +51,70 @@ class FactLineage:
     entity_id: uuid.UUID | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class FactDisclosure:
+    """What a memory fact MAY say, and what it is authoritatively about.
+
+    Read for the Developer boundary, which re-renders a retrieved fact rather
+    than forwarding the string that was embedded. `memory_embeddings.source_text`
+    is built for SIMILARITY — it is the whole rendered fact including, for an
+    email thread, the message body — and what is right to embed is not
+    automatically right to hand to an external agent.
+
+    Carries the canonical `(entity_type, entity_id)` too, because it is the same
+    row and the same round trip. Both are READ, never derived: `entity_id` is
+    what the extractor recorded, not something inferred from the payload.
+    """
+
+    entity_type: str
+    entity_id: uuid.UUID | None
+    payload: dict | None
+
+
+async def disclosure_by_memory_id(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    memory_ids: Iterable[uuid.UUID],
+) -> dict[uuid.UUID, FactDisclosure]:
+    """Map memory_id -> (entity_type, entity_id, payload) in one round trip.
+
+    ORG-SCOPED IN THE QUERY, like every sibling in this module. The caller's ids
+    already come from an org-scoped vector search, so nothing crosses a tenant
+    today; filtering here means that stays a property of the QUERY rather than
+    of the caller — the standard `lineage_by_memory_id` and
+    `classifications_by_entity` already hold. A row belonging to another
+    organization cannot be returned even if a future caller supplies its id.
+
+    One statement, same shape and cost profile as its siblings: this lookup is
+    round-trip bound, so it is issued once for the whole page rather than per
+    fact.
+    """
+    ids = list(memory_ids)
+    if not ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(
+                MemoryRecord.memory_id,
+                MemoryRecord.entity_type,
+                MemoryRecord.entity_id,
+                MemoryRecord.payload,
+            ).where(
+                MemoryRecord.organization_id == org_id,
+                MemoryRecord.memory_id.in_(ids),
+            )
+        )
+    ).all()
+    return {
+        memory_id: FactDisclosure(
+            entity_type=entity_type,
+            entity_id=entity_id,
+            payload=payload if isinstance(payload, dict) else None,
+        )
+        for memory_id, entity_type, entity_id, payload in rows
+    }
+
+
 async def lineage_by_memory_id(
     db: AsyncSession,
     org_id: uuid.UUID,

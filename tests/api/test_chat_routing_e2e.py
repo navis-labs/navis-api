@@ -19,6 +19,12 @@ from types import SimpleNamespace
 import pytest
 
 from navis.api import chat_router as R
+
+# The composer moved out of `chat_router` into the shared Core module that
+# `/chat` and `POST /developer/context` both call. Its collaborators are
+# patched THERE now — patching them on `R` would no longer intercept, and
+# these tests would silently reach the real State service instead of failing.
+from navis.orchestration import context as C
 from navis.reasoning.calendar_ops.contract import (
     CalendarOpsClarification,
     MeetingMutationProposal,
@@ -350,7 +356,7 @@ async def test_empty_memory_falls_back_to_workspace_signals(monkeypatch):
             text="Start with the investor sync at 2pm.", sources=["signal:abc"]
         )
 
-    monkeypatch.setattr(R, "ContextBuilder", _EmptyContextBuilder)
+    monkeypatch.setattr(C, "ContextBuilder", _EmptyContextBuilder)
     monkeypatch.setattr(R, "build_workspace_context", _fallback)
     monkeypatch.setattr(R, "recommendation", _generator)
 
@@ -378,7 +384,7 @@ async def test_genuinely_empty_names_the_connected_sources(monkeypatch):
     async def _labels(db, org_id):
         return ["Gmail", "Google Calendar"]
 
-    monkeypatch.setattr(R, "ContextBuilder", _EmptyContextBuilder)
+    monkeypatch.setattr(C, "ContextBuilder", _EmptyContextBuilder)
     monkeypatch.setattr(R, "build_workspace_context", _empty_fallback)
     monkeypatch.setattr(R, "connected_source_labels", _labels)
 
@@ -405,7 +411,7 @@ async def test_no_sources_connected_says_so(monkeypatch):
     async def _labels(db, org_id):
         return []
 
-    monkeypatch.setattr(R, "ContextBuilder", _EmptyContextBuilder)
+    monkeypatch.setattr(C, "ContextBuilder", _EmptyContextBuilder)
     monkeypatch.setattr(R, "build_workspace_context", _empty_fallback)
     monkeypatch.setattr(R, "connected_source_labels", _labels)
 
@@ -543,11 +549,19 @@ def _stub_state(monkeypatch, *, org_seen: list, signals: list, view=None):
     # fold reached, and chat now returns it as `ChatResponse.stateWatermark` so a
     # client can tell whether an answer and the brief describe the same snapshot.
     # A fake without it isn't a stand-in for a state the pipeline can produce.
+    # `fold_frontier` is as load-bearing as `watermark` and for the mirrored
+    # reason. `watermark` is the OBSERVATION cursor — which memory record the
+    # fold reached; `fold_frontier` is the EVENT frontier — how recently the
+    # newest folded fact actually happened. The context composer publishes both,
+    # because `as_of` alone tells a caller when Navis last did work and not
+    # whether anything new has arrived. A fake carrying only the first is not a
+    # stand-in for a state the pipeline can produce.
     state_obj = SimpleNamespace(
         org_id=ORG, as_of=_AS_OF, entities={},
         watermark=SimpleNamespace(last_memory_id=_WATERMARK),
+        fold_frontier=SimpleNamespace(last_event_timestamp=_AS_OF),
     )
-    monkeypatch.setattr(R, "scope_for", lambda state, intent, policy, *, as_of: view or _empty_view())
+    monkeypatch.setattr(C, "scope_for", lambda state, intent, policy, *, as_of: view or _empty_view())
 
     class _StateService:
         def __init__(self, db):
@@ -563,8 +577,8 @@ def _stub_state(monkeypatch, *, org_seen: list, signals: list, view=None):
         seen_state.append(state)
         return signals
 
-    monkeypatch.setattr(R, "StateService", _StateService)
-    monkeypatch.setattr(R, "run_reasoning_v2", _run_reasoning)
+    monkeypatch.setattr(C, "StateService", _StateService)
+    monkeypatch.setattr(C, "run_reasoning_v2", _run_reasoning)
     return state_obj, seen_state
 
 
@@ -597,7 +611,7 @@ async def test_reasoning_groundings_use_the_authenticated_org_and_reach_the_llm(
         captured["kinds"] = [f.kind for f in context.facts]
         return SimpleNamespace(text="Chase the deck.", sources=["mem-1", str(SIGNAL_ID)])
 
-    monkeypatch.setattr(R, "ContextBuilder", _Builder)
+    monkeypatch.setattr(C, "ContextBuilder", _Builder)
     monkeypatch.setattr(R, "recommendation", _generator)
 
     resp = await R.chat(_body("What should I focus on today?"), _Principal(), _DB())
@@ -656,7 +670,7 @@ async def test_state_failure_degrades_instead_of_breaking_chat(monkeypatch):
         async def get_state(self, org_id):
             raise RuntimeError("state backend down")
 
-    monkeypatch.setattr(R, "StateService", _BrokenStateService)
+    monkeypatch.setattr(C, "StateService", _BrokenStateService)
 
     db = _DB()
     # No state read => no groundings AND no watermark. Reporting a watermark
@@ -678,8 +692,8 @@ async def test_state_timeout_degrades_instead_of_hanging_the_turn(monkeypatch):
             await _asyncio.sleep(5)
             raise AssertionError("should have been cancelled by the timeout")
 
-    monkeypatch.setattr(R, "StateService", _SlowStateService)
-    monkeypatch.setattr(R, "_REASONING_GROUNDING_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(C, "StateService", _SlowStateService)
+    monkeypatch.setattr(C, "REASONING_GROUNDING_TIMEOUT_S", 0.05)
 
     db = _DB()
     assert await R._state_groundings(db, ORG) == ([], None)
@@ -721,7 +735,7 @@ async def test_reasoning_does_not_suppress_the_workspace_fallback(monkeypatch):
         called["kinds"] = [f.kind for f in context.facts]
         return SimpleNamespace(text="Investor sync first.", sources=["signal:abc"])
 
-    monkeypatch.setattr(R, "ContextBuilder", _EmptyMemoryBuilder)
+    monkeypatch.setattr(C, "ContextBuilder", _EmptyMemoryBuilder)
     monkeypatch.setattr(R, "build_workspace_context", _fallback)
     monkeypatch.setattr(R, "recommendation", _generator)
 
@@ -768,7 +782,7 @@ def _view_with_entities():
 def test_scoped_view_maps_to_grounding_with_lineage_preserved():
     """1-3: EntityRef → Grounding, and citations survive as `lineage` rather
     than being discarded."""
-    groundings = R._scoped_view_to_groundings(_view_with_entities())
+    groundings = C.scoped_view_to_groundings(_view_with_entities())
 
     assert [g.kind for g in groundings] == ["state", "state"]
     commitment, person = groundings
@@ -800,7 +814,7 @@ def test_scoped_view_grounding_never_leaks_the_raw_field_dict():
                             first_seen=None, last_seen=None)],
         citations={"e1": Citation(entity_id="e1", memory_ids=[], signal_ids=[])},
     )
-    g = R._scoped_view_to_groundings(view)[0]
+    g = C.scoped_view_to_groundings(view)[0]
 
     assert "do-not-leak" not in g.text
     assert len(g.text) < 200  # bounded, not the whole fields dict
@@ -808,7 +822,7 @@ def test_scoped_view_grounding_never_leaks_the_raw_field_dict():
 
 def test_empty_scoped_view_yields_no_groundings():
     """7: an org with nothing scoped must not break the chat path."""
-    assert R._scoped_view_to_groundings(_empty_view()) == []
+    assert C.scoped_view_to_groundings(_empty_view()) == []
 
 
 # ---- Phase 3E.2.1: State groundings must carry the fields State already holds -
@@ -830,7 +844,7 @@ def _one_entity(entity_type, fields, *, reason="r", entity_id="e1"):
                             first_seen=None, last_seen=None)],
         citations={entity_id: Citation(entity_id=entity_id, memory_ids=[], signal_ids=[])},
     )
-    return R._scoped_view_to_groundings(view)[0].text
+    return C.scoped_view_to_groundings(view)[0].text
 
 
 def test_a_commitment_is_labelled_by_its_promise_not_the_email_subject():
@@ -929,7 +943,7 @@ def test_a_rendered_entity_stays_bounded_however_fat_the_fields_are():
         "participants": ["P" * 500] * 50,
     })
 
-    assert len(text) <= R._CONTEXT_TEXT_MAX
+    assert len(text) <= C.CONTEXT_TEXT_MAX
 
 
 def test_rendering_a_scoped_entity_is_deterministic():
@@ -951,7 +965,7 @@ def test_a_reasoning_signal_names_its_subject():
                              title="Relationship cooling",
                              why="11 days since the last interaction.")
 
-    text = R._reasoning_text(state, signal)
+    text = C.reasoning_text(state, signal)
 
     assert text == ("Relationship cooling (relationship: quiet@example.com) "
                     "— 11 days since the last interaction.")
@@ -968,11 +982,11 @@ def test_a_reasoning_signal_with_no_resolvable_subject_renders_as_before():
         return SimpleNamespace(entity_type=entity_type, entity_id=entity_id,
                                title=title, why="Because.")
 
-    assert R._reasoning_text(state, _sig(None, None)) == "Priority load — Because."
-    assert R._reasoning_text(state, _sig("commitment", "gone")) == "Priority load — Because."
+    assert C.reasoning_text(state, _sig(None, None)) == "Priority load — Because."
+    assert C.reasoning_text(state, _sig("commitment", "gone")) == "Priority load — Because."
     # Already inlined by the engine — naming it again would just repeat it.
     already = _sig("commitment", "c-1", title="Commitment slipping: Send the deck")
-    assert R._reasoning_text(state, already) == "Commitment slipping: Send the deck — Because."
+    assert C.reasoning_text(state, already) == "Commitment slipping: Send the deck — Because."
 
 
 async def test_context_and_reasoning_groundings_both_reach_the_llm(monkeypatch):
@@ -998,7 +1012,7 @@ async def test_context_and_reasoning_groundings_both_reach_the_llm(monkeypatch):
         captured["kinds"] = [f.kind for f in context.facts]
         return SimpleNamespace(text="Focus on the deck.", sources=["ent-c1"])
 
-    monkeypatch.setattr(R, "ContextBuilder", _Builder)
+    monkeypatch.setattr(C, "ContextBuilder", _Builder)
     monkeypatch.setattr(R, "recommendation", _generator)
 
     resp = await R.chat(_body("What should I focus on today?"), _Principal(), _DB())
@@ -1042,7 +1056,7 @@ async def test_state_groundings_do_not_suppress_the_workspace_fallback(monkeypat
         called["kinds"] = [f.kind for f in context.facts]
         return SimpleNamespace(text="Investor sync first.", sources=["signal:abc"])
 
-    monkeypatch.setattr(R, "ContextBuilder", _EmptyMemoryBuilder)
+    monkeypatch.setattr(C, "ContextBuilder", _EmptyMemoryBuilder)
     monkeypatch.setattr(R, "build_workspace_context", _fallback)
     monkeypatch.setattr(R, "recommendation", _generator)
 
@@ -1057,11 +1071,11 @@ def test_state_grounding_cannot_mix_organizations():
     parameter through which another tenant's entities could arrive."""
     import inspect
 
-    params = list(inspect.signature(R._scoped_view_to_groundings).parameters)
+    params = list(inspect.signature(C.scoped_view_to_groundings).parameters)
     assert params == ["view"], "adapter must not take an org_id it could mismatch"
     # Every grounding's source is an entity_id from that one view.
     view = _view_with_entities()
-    sources = {g.source for g in R._scoped_view_to_groundings(view)}
+    sources = {g.source for g in C.scoped_view_to_groundings(view)}
     assert sources == {e.entity_id for e in view.entities}
 
 
@@ -1208,7 +1222,7 @@ def _stub_persons(monkeypatch, matches, *, seen: list | None = None):
             seen.append((org_id, query))
         return PersonSearchResult(query=query, matches=tuple(matches))
 
-    monkeypatch.setattr(R, "search_persons", _search)
+    monkeypatch.setattr(C, "search_persons", _search)
 
 
 def _capture_builder(monkeypatch, captured: dict, facts=None):
@@ -1231,7 +1245,7 @@ def _capture_builder(monkeypatch, captured: dict, facts=None):
                 facts=[*(default if facts is None else facts), *(kw.get("extra") or [])],
             )
 
-    monkeypatch.setattr(R, "ContextBuilder", _Builder)
+    monkeypatch.setattr(C, "ContextBuilder", _Builder)
 
 
 # 1. Person question -> identity + context + grounded answer.
@@ -1326,7 +1340,7 @@ async def test_no_evidence_says_so_instead_of_inventing_importance(monkeypatch):
     async def _no_sources(db, org_id):
         return []
 
-    monkeypatch.setattr(R, "ContextBuilder", _Empty)
+    monkeypatch.setattr(C, "ContextBuilder", _Empty)
     monkeypatch.setattr(R, "build_workspace_context", _no_workspace)
     monkeypatch.setattr(R, "connected_source_labels", _no_sources)
     monkeypatch.setattr(
@@ -1377,7 +1391,7 @@ async def test_citation_types_follow_the_producing_layer_not_a_guess(monkeypatch
     async def _gen(org_id, context):
         return SimpleNamespace(text="Answer.", sources=sources)
 
-    monkeypatch.setattr(R, "ContextBuilder", _Builder)
+    monkeypatch.setattr(C, "ContextBuilder", _Builder)
     monkeypatch.setattr(R, "explanation", _gen)
 
     resp = await R.chat(_body("Where do we stand?"), _Principal(), _DB())
@@ -1418,7 +1432,7 @@ async def test_derived_citations_carry_their_drill_down(monkeypatch):
     async def _gen(org_id, context):
         return SimpleNamespace(text="A.", sources=["ent-1", "insight:i-1", "mem-1"])
 
-    monkeypatch.setattr(R, "ContextBuilder", _Builder)
+    monkeypatch.setattr(C, "ContextBuilder", _Builder)
     monkeypatch.setattr(R, "explanation", _gen)
 
     resp = await R.chat(_body("Where do we stand?"), _Principal(), _DB())
@@ -1648,7 +1662,7 @@ async def test_identity_resolution_failure_degrades_instead_of_failing_the_turn(
     async def _broken(db, org_id, query):
         raise RuntimeError("identity graph down")
 
-    monkeypatch.setattr(R, "search_persons", _broken)
+    monkeypatch.setattr(C, "search_persons", _broken)
     _stub_state(monkeypatch, org_seen=[], signals=[])
     captured: dict = {}
     _capture_builder(monkeypatch, captured)
@@ -1711,7 +1725,7 @@ async def test_expansion_fires_when_retrieval_found_little_about_the_subject(mon
             source_integration_id=uuid.uuid4(), dedup_key="d",
         )]
 
-    monkeypatch.setattr(R, "ContextBuilder", _Builder)
+    monkeypatch.setattr(C, "ContextBuilder", _Builder)
     monkeypatch.setattr(
         "navis.memory.lineage.records_for_entities", _records
     )
@@ -1762,7 +1776,7 @@ async def test_expansion_is_skipped_when_retrieval_already_answered(monkeypatch)
         fired.append(1)
         return []
 
-    monkeypatch.setattr(R, "ContextBuilder", _Builder)
+    monkeypatch.setattr(C, "ContextBuilder", _Builder)
     monkeypatch.setattr("navis.memory.lineage.records_for_entities", _records)
     monkeypatch.setattr(
         R, "explanation",
@@ -1805,7 +1819,7 @@ async def test_expanded_facts_carry_real_provenance_and_no_invented_provider(mon
     )
 
     subject = R._SubjectResolution(match=_ABHISHEK, query="Abhishek")
-    out = await R._entity_expansion(_DB(), ORG, subject)
+    out = await C.entity_expansion(_DB(), ORG, subject)
 
     assert [g.kind for g in out] == ["memory", "memory"]
     assert out[0].source == str(mem_id)
@@ -1822,7 +1836,7 @@ async def test_expansion_degrades_when_memory_is_unavailable(monkeypatch):
 
     monkeypatch.setattr("navis.memory.lineage.records_for_entities", _broken)
     db = _DB()
-    out = await R._entity_expansion(db, ORG, R._SubjectResolution(match=_ABHISHEK))
+    out = await C.entity_expansion(db, ORG, R._SubjectResolution(match=_ABHISHEK))
     assert out == []
     assert db.rollbacks == 1
 
@@ -1844,7 +1858,7 @@ async def test_a_person_with_no_email_alias_expands_to_nothing(monkeypatch):
         canonical_id="c-x", display_names=("Someone",), emails=(), alias_ids=("a",)
     )
 
-    out = await R._entity_expansion(
+    out = await C.entity_expansion(
         _DB(), ORG, R._SubjectResolution(match=nameless)
     )
 

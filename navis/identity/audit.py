@@ -51,6 +51,7 @@ class AuditAction(StrEnum):
     API_KEY_CREATE = "api_key_create"
     API_KEY_REVOKE = "api_key_revoke"
     SERVICE_ACCOUNT_CREATE = "service_account_create"
+    SERVICE_ACCOUNT_UPDATE = "service_account_update"
     SERVICE_ACCOUNT_ROTATE = "service_account_rotate"
     SERVICE_ACCOUNT_REVOKE = "service_account_revoke"
     SSO_UPDATED = "sso_updated"

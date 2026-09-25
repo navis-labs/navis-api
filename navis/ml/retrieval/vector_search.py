@@ -128,7 +128,25 @@ async def _search_pgvector(
         """
     )
     try:
-        rows = (await db.execute(sql, params)).all()
+        # ── THE SAVEPOINT IS LOAD-BEARING, NOT DEFENSIVE STYLE ─────────
+        # Catching the exception is not enough on PostgreSQL. A failed
+        # statement puts the whole transaction into an aborted state, and the
+        # server then refuses EVERY later command on that session with
+        # InFailedSQLTransactionError. The JSONB scan below runs on this same
+        # session, so without a savepoint the degrade path raised a second,
+        # unrelated error and a search that was designed to survive pgvector
+        # being unavailable returned a 500 instead.
+        #
+        # `begin_nested()` issues SAVEPOINT / ROLLBACK TO SAVEPOINT, which
+        # discards only this statement and leaves the caller's transaction
+        # exactly as it was. Nothing is committed here: the enclosing unit of
+        # work still decides that.
+        #
+        # Reproduced by `tests/integration/test_vector_search_fallback_postgres`
+        # against a schema with no `embedding_vec`, which is the real shape of
+        # a database whose raw-DDL migration has not run.
+        async with db.begin_nested():
+            rows = (await db.execute(sql, params)).all()
     except Exception:  # noqa: BLE001 — degrade to the Python path, never fail a search
         logger.exception("pgvector search unavailable; falling back to in-process scan")
         metrics.incr("ml.retrieval.pgvector_unavailable")

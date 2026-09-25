@@ -22,10 +22,11 @@ from navis.identity.schemas import (
     OrgMembershipOut,
     RefreshRequest,
     SignupRequest,
+    SwitchOrganizationRequest,
     TokenPair,
     UserOut,
 )
-from navis.identity.service import AuthError, IdentityService
+from navis.identity.service import AuthError, IdentityService, NoSuchAccountError
 from navis.identity.throttle import LoginThrottle
 from navis.identity.tokens import TokenRevocationService, token_predates_bulk_revoke
 from navis.platform.cache import redis_client
@@ -141,7 +142,23 @@ async def google_login(
             email=identity.email,
             google_sub=identity.google_sub,
             full_name=identity.full_name,
+            # Consulted ONLY when this Google account is new to Navis. For a
+            # returning user the workspace comes from their membership row and
+            # both of these are ignored, so one Google button can serve sign-in
+            # and sign-up without risking a second tenant for either.
+            workspace_kind=data.workspace_kind,
+            organization_name=data.organization_name,
+            # False turns this into a pure sign-in: an identity with no account
+            # is refused below instead of being handed a brand-new tenant.
+            create_workspace=data.create_workspace,
         )
+    except NoSuchAccountError as exc:
+        # 404, not 401. Google verified this person — nothing about their
+        # credential was wrong, there is simply no account behind it yet, and
+        # the caller is expected to send them into onboarding. Listed FIRST:
+        # NoSuchAccountError subclasses AuthError, so the generic arm below
+        # would otherwise report "not signed in" for a person who is.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
     except AuthError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
 
@@ -193,6 +210,68 @@ async def refresh(data: RefreshRequest, db: AsyncSession = Depends(get_session))
     except AuthError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc))
     return TokenPair(access_token=access, refresh_token=new_refresh)
+
+
+@router.post("/switch", response_model=TokenPair)
+async def switch_organization(
+    data: SwitchOrganizationRequest,
+    ctx: CurrentContext = Depends(get_current_context),
+    db: AsyncSession = Depends(get_session),
+) -> TokenPair:
+    """Issue a session for another organization THIS USER ALREADY BELONGS TO.
+
+    ── The gap this closes ─────────────────────────────────────────────
+    `/auth/me` has always published every seat the caller holds, and both
+    login paths resolve `primary_membership` — the OLDEST membership. With no
+    way to re-scope, every seat except the oldest was unreachable: a person who
+    signed up for their own workspace in January and was invited to their
+    employer's in June would land in January's forever, see the invitation
+    nowhere, and have no action available. The console said "sign in with this
+    account's other organization to work in it", which was advice that could
+    not be followed — there was no such sign-in.
+
+    ── Why this creates nothing ────────────────────────────────────────
+    No user, no organization, no membership. It reads one `memberships` row and
+    mints a token against it. That is the point: the alternative a person
+    reaches for when they cannot get into their other tenant is to sign up
+    again, which is precisely how duplicate organizations appear.
+
+    ── Authorization ───────────────────────────────────────────────────
+    `get_current_context` requires a live human session (machine principals are
+    refused 401, and revocation is already checked there). The membership
+    lookup below is filtered by `ctx.user.id`, so the only organizations
+    reachable are ones the caller is a member of; anything else is a 403 with
+    the same wording `_principal_from_jwt` uses, and cannot be told apart from
+    an organization that does not exist.
+
+    The PREVIOUS session is deliberately left valid. Switching seats is not a
+    logout, and revoking the old token would sign the person out of a second
+    browser window they never asked to close. Both tokens remain subject to the
+    same per-request membership check.
+    """
+    membership = await db.scalar(
+        select(Membership).where(
+            Membership.user_id == ctx.user.id,
+            Membership.organization_id == data.organization_id,
+        )
+    )
+    if membership is None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "no active org membership")
+
+    svc = IdentityService(db)
+    # `membership.organization_id`, not the requested id — the same "the row is
+    # the answer" discipline the rest of the stack follows. They are equal here
+    # by construction; taking it from the row means they cannot diverge if this
+    # query ever grows a condition.
+    access, refresh = await svc.issue_tokens(ctx.user, membership.organization_id)
+    await svc.record_login(ctx.user, membership.organization_id, method="switch")
+    # No explicit commit, and no event. `get_session` commits on success, and
+    # the commit-before-publish in `/auth/signup` and `/auth/google` is there
+    # only because a subscriber has to read the new org row. Nothing is
+    # provisioned here, so there is nothing to announce — this ends exactly
+    # like `/auth/login`, which also just issues a pair against a seat that
+    # already existed.
+    return TokenPair(access_token=access, refresh_token=refresh)
 
 
 _logout_bearer = HTTPBearer(auto_error=True)
@@ -247,11 +326,13 @@ async def me(
     is published for the active tenant only, so nothing here can be assembled
     into an answer about another tenant.
 
-    MULTI-ORG SWITCHING IS NOT IMPLEMENTED AND IS NOT IMPLIED. There is no
-    switch endpoint and no way to re-scope an existing token; changing the
-    active organization means authenticating into it. The full multi-org
-    experience (an active-org token mechanism, an org picker, per-org
-    onboarding) is Phase 7 work. This list is a read, and nothing more.
+    THIS LIST IS A READ, AND SWITCHING IS A SEPARATE, GATED WRITE. Since P0-8
+    there IS a way to change seats — `POST /auth/switch` — but nothing about
+    it re-scopes an EXISTING token: it mints a new one against a membership
+    row it re-reads for the authenticated user. So this response still cannot
+    be assembled into access to another tenant, which is why it still carries
+    no role and no permissions per entry. Per-org onboarding remains future
+    work.
 
     Machine principals (API key / service account) are rejected 401 by
     `get_current_context`, unchanged: /auth/me describes a human session.
@@ -292,6 +373,10 @@ async def me(
         # Passed as the raw string; MeOut resolves it and reports an unusable
         # role as null rather than raising (see MeOut._tolerate_unusable_role).
         role=principal.role,
+        # Taken from the resolved Principal, not re-read from the membership row,
+        # so what the console is told and what the gates enforce come from one
+        # resolution of one row.
+        developer_role=principal.developer_role,
         # The resolved set the gate itself checks — code defaults PLUS this org's
         # `role_permissions` grants. Scoped to `principal.org_id` by construction:
         # `grants_for` filters on that org id, so a grant made in another tenant

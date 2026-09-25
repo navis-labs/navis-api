@@ -13,6 +13,47 @@ from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _to_async_url(url: str) -> str:
+    """Normalise a Postgres URL for asyncpg.
+
+    Switches the driver and strips the query string: Neon ships
+    `?sslmode=require&channel_binding=require`, which asyncpg rejects as libpq
+    parameters. TLS is re-applied through `connect_args` by whoever builds the
+    engine.
+
+    Shared by the runtime and migration URLs so the two cannot normalise
+    differently — a difference there would mean the thing migrated and the
+    thing served were reached by subtly different rules.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme
+    if scheme == "postgresql":
+        scheme = "postgresql+asyncpg"
+    elif scheme.startswith("postgresql+") and "asyncpg" not in scheme:
+        scheme = "postgresql+asyncpg"
+    return urlunsplit((scheme, parts.netloc, parts.path, "", ""))
+
+
+def describe_database_url(url: str) -> str:
+    """A database URL with everything secret removed, safe to log.
+
+    Returns `host/database` — never the password, never the username, never
+    the query string. Neon URLs carry the password inline, so anything that
+    prints a database URL prints a credential unless it goes through here.
+
+    Deliberately total: an unparseable URL yields a marker rather than raising,
+    because this is called from error paths that must not fail themselves.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "<unparseable>"
+    host = parts.hostname or "<no-host>"
+    port = f":{parts.port}" if parts.port else ""
+    database = (parts.path or "").lstrip("/") or "<no-database>"
+    return f"{host}{port}/{database}"
+
+
 class Environment(str, enum.Enum):
     """The deployment environment. A CLOSED set, deliberately.
 
@@ -57,7 +98,31 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000"
 
     # ---- Database ----
+    #: The RUNTIME connection, and the only one the application ever opens.
+    #: Against Neon this is the POOLED (`-pooler`) endpoint, which is correct:
+    #: PgBouncer is what lets many short web requests share a small number of
+    #: Postgres backends, and it was measured to cost essentially nothing
+    #: (565ms pooled vs 574ms direct on the same link).
     database_url: str = "postgresql://localhost/navis"
+    #: MIGRATION-ONLY, and unset by default.
+    #:
+    #: Alembic prefers this when present and falls back to `database_url`
+    #: otherwise, so an environment that defines only `DATABASE_URL` keeps
+    #: working exactly as before.
+    #:
+    #: WHY MIGRATIONS WANT A DIFFERENT ENDPOINT. Runtime traffic is thousands
+    #: of short transactions and belongs behind the pooler. A migration is one
+    #: long-lived session issuing DDL, and PgBouncer's transaction pooling is
+    #: the wrong shape for it: session-scoped state and advisory locks are not
+    #: guaranteed to stay on one backend, so `CREATE INDEX CONCURRENTLY`, a
+    #: lock taken in one statement and released in another, or any `SET LOCAL`
+    #: that must outlive a statement can silently land on a different
+    #: connection. Neon documents the direct endpoint as the one to migrate
+    #: against for exactly this reason.
+    #:
+    #: It is the SAME database — the same host without `-pooler` — never a
+    #: second database, and nothing but Alembic ever reads it.
+    direct_database_url: str | None = None
 
     # ---- Redis ----
     redis_url: str = "redis://localhost:6380/0"
@@ -149,6 +214,22 @@ class Settings(BaseSettings):
     # keeps them isolated — no bad hits, just a re-embed on the next backfill).
     azure_openai_embed_deployment: str | None = None
     azure_openai_api_version: str = "2024-12-01-preview"
+    # ---- Outbound bounds on the Azure call ----
+    #
+    # WITHOUT THESE THE SDK DEFAULT APPLIES, AND IT IS 600 SECONDS. That default
+    # is `Timeout(connect=5.0, read=600.0, write=600.0, pool=600.0)`, so a hung
+    # Azure response could hold a context build for ten minutes — far longer
+    # than any caller waits and long enough to exhaust the worker while the
+    # request is still nominally in flight. An embedding of one short task
+    # string returns in ~1.5s measured, so 30s is already a wide outlier.
+    #
+    # `max_retries` is the SDK's own bounded retry with exponential backoff and
+    # jitter; it is surfaced here so a deployment can lower it rather than
+    # patch the provider. Retries multiply the ceiling, so the worst case a
+    # caller can see is roughly (1 + retries) x timeout.
+    azure_openai_timeout_seconds: float = 30.0
+    azure_openai_connect_timeout_seconds: float = 5.0
+    azure_openai_max_retries: int = 2
 
     # ---- Embedding read pin (migration control) ----
     # Retrieval reads a SPECIFIC (model, version) index. Writes go to whatever
@@ -283,6 +364,38 @@ class Settings(BaseSettings):
     # Context assembly + connector-backed reads: cheaper, but still vector search
     # and/or an outbound provider call per request.
     rate_limit_read_per_window: int = 120
+    # Machine-identity WRITES: creating an agent, editing it, minting or revoking
+    # a credential. Deliberately far below the read budget — an organization
+    # registers a handful of agents and then reads with them for months, so a
+    # burst here is a script gone wrong or an attempt to fill the table, not use.
+    rate_limit_agent_write_per_window: int = 20
+    # EXECUTION-LEDGER writes: recording a task, a run, a step, an outcome.
+    #
+    # A SEPARATE BUDGET FROM `agent_write`, and the difference is the access
+    # pattern rather than the verb. Registering an agent happens a handful of
+    # times and then never again, which is why that ceiling is 20. Recording a
+    # run is the opposite: one run legitimately appends many steps in quick
+    # succession — `MAX_STEPS_PER_RUN` is 1000 — so a 20/minute ceiling would
+    # refuse ordinary use and make the ledger lossy exactly when an agent is
+    # busiest, which is when its record matters most.
+    #
+    # Still a capacity guard: each write is one small row, `MAX_STEPS_PER_RUN`
+    # already bounds a single run, and this bounds the rate across the
+    # organization so a loop cannot fill a shared table.
+    rate_limit_run_write_per_window: int = 300
+
+    # ---- Machine identities ----
+    # A hard ceiling on ACTIVE agents (service accounts) per organization.
+    #
+    # A CAPACITY GUARD, NOT AN ENTITLEMENT. The plan model (`PLAN_CAPABILITIES`)
+    # grants capabilities, and nothing in it counts anything; a per-plan agent
+    # allowance is a commercial decision this edge is not entitled to invent. So
+    # this is one number for every tenant, in the same spirit as the rate limits
+    # above. When the product defines tiered allowances the limit moves into the
+    # entitlement model and this setting goes away.
+    #
+    # Revoked agents do not count — see `count_for_org(active_only=True)`.
+    max_agents_per_organization: int = 100
 
     # ---- Storage (S3) ----
     aws_region: str = "us-east-1"
@@ -500,19 +613,81 @@ class Settings(BaseSettings):
 
     @property
     def async_database_url(self) -> str:
-        """asyncpg-compatible URL.
+        """asyncpg-compatible RUNTIME URL.
 
         Neon ships URLs like `postgresql://...?sslmode=require&channel_binding=require`.
         asyncpg rejects libpq query params, so we switch the driver and strip the
         query string. TLS is re-applied via connect_args (see database/session.py).
         """
-        parts = urlsplit(self.database_url)
-        scheme = parts.scheme
-        if scheme == "postgresql":
-            scheme = "postgresql+asyncpg"
-        elif scheme.startswith("postgresql+") and "asyncpg" not in scheme:
-            scheme = "postgresql+asyncpg"
-        return urlunsplit((scheme, parts.netloc, parts.path, "", ""))
+        return _to_async_url(self.database_url)
+
+    # ── Migration connectivity ──────────────────────────────────────────
+    # Read by `migrations/env.py` and by nothing else. The application's
+    # engine is built from `async_database_url` above and is unaffected by
+    # every property below.
+
+    @property
+    def migration_uses_direct_url(self) -> bool:
+        """True when `DIRECT_DATABASE_URL` is set and will be used.
+
+        Exposed so the migration layer can SAY which endpoint it is about to
+        use. A migration that silently fell back to the pooled endpoint would
+        look identical to one that used the direct endpoint, right up until a
+        lock behaved unexpectedly.
+        """
+        return bool(self.direct_database_url and self.direct_database_url.strip())
+
+    @property
+    def migration_database_url(self) -> str:
+        """The database Alembic connects to: direct when set, else runtime.
+
+        The fallback is deliberate backward compatibility — an environment
+        that defines only `DATABASE_URL` keeps migrating exactly as it did
+        before this setting existed. It is reported rather than hidden.
+        """
+        url = (
+            self.direct_database_url.strip()  # type: ignore[union-attr]
+            if self.migration_uses_direct_url
+            else self.database_url.strip()
+        )
+        if not url:
+            raise ValueError(
+                "No migration database is configured. Set DIRECT_DATABASE_URL "
+                "(preferred, the non-pooled endpoint) or DATABASE_URL."
+            )
+        parts = urlsplit(url)
+        # `hostname`, not `netloc`: "postgresql://user:pass@" has a non-empty
+        # netloc and no host at all, and would otherwise be accepted here and
+        # fail later as a connection error with a credential in the message.
+        if not parts.scheme or not parts.hostname:
+            source = "DIRECT_DATABASE_URL" if self.migration_uses_direct_url else "DATABASE_URL"
+            raise ValueError(
+                f"{source} is not a usable database URL: expected "
+                f"postgresql://host/database, got {describe_database_url(url)}."
+            )
+        return url
+
+    @property
+    def async_migration_database_url(self) -> str:
+        """`migration_database_url`, normalised for asyncpg."""
+        return _to_async_url(self.migration_database_url)
+
+    @property
+    def migration_db_requires_ssl(self) -> bool:
+        """TLS decision for the MIGRATION url, not the runtime one."""
+        url = self.migration_database_url
+        return "sslmode=require" in url or "neon.tech" in url
+
+    @property
+    def migration_db_is_pooled(self) -> bool:
+        """Whether the migration URL still points at a transaction pooler.
+
+        True on the fallback path against Neon, and the reason the fallback is
+        reported loudly: prepared statements must stay disabled, and DDL is
+        running through PgBouncer.
+        """
+        url = self.migration_database_url.lower()
+        return "-pooler" in url or "pgbouncer" in url
 
     @property
     def db_requires_ssl(self) -> bool:
