@@ -137,10 +137,10 @@ async def engine():
         f"refusing to run against database {name!r}: point "
         "NAVIS_TEST_DATABASE_URL at a disposable database named navis_test*"
     )
-    # `statement_cache_size=0` mirrors what production uses on a pooled endpoint
-    # (`settings.db_is_pooled` -> "PgBouncer transaction pooling: no server-side
-    # prepared statements"). Kept for parity; it is NOT what fixes the enum-oid
-    # failure — see this fixture's docstring for the measurement.
+    # `statement_cache_size=0` is the configuration a pooled endpoint runs with
+    # when `DB_POOLER_STATEMENT_CACHE=false` (production keeps the caches on
+    # behind Neon's pooler; see `settings.db_pooler_statement_cache`). It is NOT
+    # what fixes the enum-oid failure — see this fixture's docstring.
     eng = create_async_engine(
         url, connect_args={"statement_cache_size": 0, "prepared_statement_cache_size": 0}
     )

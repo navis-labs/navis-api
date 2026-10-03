@@ -21,7 +21,7 @@ from navis.memory.meetings import cancelled_meeting_entity_ids
 from navis.ml.embeddings.pins import EmbeddingPin, read_pin
 from navis.ml.retrieval.dedupe import collapse_by_event
 from navis.ml.retrieval.reranker import rerank
-from navis.ml.retrieval.vector_search import Hit, search
+from navis.ml.retrieval.vector_search import Hit, index_has_rows, search
 
 # How many candidates the reranker gets to see, as a multiple of k.
 #
@@ -75,13 +75,26 @@ class MemoryRetriever:
         since: datetime | None = None,
         until: datetime | None = None,
     ) -> list[Hit]:
+        version = self.pin.version if version is None else version
+        # ── AN EMPTY INDEX HAS AN ANSWER THAT NEEDS NO EMBEDDING ──────────
+        # With no row for this (organization, model, version), `search` returns
+        # `[]` for ANY query vector — so embedding the query first was a remote
+        # call (0.4s warm, 1.6s cold) that could not change the result.
+        #
+        # This is not the "empty context that looks like a quiet organization"
+        # `ContextBuilder` refuses to fabricate: it returns empty only when the
+        # database has just shown there is nothing to search. A real failure is
+        # still raised — this check's own, the embedding's for any organization
+        # that has an index, and the search's — exactly as before.
+        if not await index_has_rows(self.db, org_id, model=self.model, version=version):
+            return []
         qvec = (await self.provider.embed([query])).vectors[0]
         hits = await search(
             self.db,
             org_id,
             qvec,
             model=self.model,
-            version=self.pin.version if version is None else version,
+            version=version,
             k=k * CANDIDATE_MULTIPLIER,
             since=since,
             until=until,

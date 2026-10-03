@@ -402,6 +402,48 @@ async def test_the_azure_client_is_bounded_and_reused_within_a_loop(monkeypatch)
     assert AzureProvider(deployment="gpt", embed_deployment="my-embed")._client() is client
 
 
+async def test_the_azure_client_keeps_idle_connections_for_the_configured_window(monkeypatch):
+    """KEEP-ALIVE is not a timeout, and httpx's 5s default cost every call.
+
+    Agents call context tens of seconds apart. With pooled connections expiring
+    after 5s idle, nearly every embedding opened a new TCP + TLS connection to
+    the East US endpoint: measured 1.6-2.1s per call against ~0.4-0.6s on a
+    reused one.
+
+    The window is BOUNDED, not "as long as possible": a connection a middlebox
+    dropped silently fails on the write, so it must be discarded before the path
+    forgets it. Measured, Azure closed an idle connection somewhere between 120s
+    and 240s; AWS NAT gateways drop idle flows at 350s. The default stays under
+    both, and passing our own client must not quietly change anything else —
+    the SDK's pool sizes and our bounded timeout are asserted beside it.
+    """
+    from navis.ml.providers.azure import AzureProvider
+    from navis.platform.config import settings
+
+    monkeypatch.setattr(
+        settings,
+        "azure_openai_api_key",
+        settings.azure_openai_api_key or "not-a-real-key-no-request-is-made",
+    )
+    monkeypatch.setattr(settings, "azure_openai_keepalive_expiry_seconds", 42.0)
+
+    client = AzureProvider(deployment="gpt", embed_deployment="my-embed")._client()
+    pool = client._client._transport._pool
+
+    assert pool._keepalive_expiry == 42.0
+    assert pool._max_connections == 1000          # the SDK's own default
+    assert pool._max_keepalive_connections == 100  # the SDK's own default
+    assert client.timeout.read == settings.azure_openai_timeout_seconds
+    assert client.timeout.connect == settings.azure_openai_connect_timeout_seconds
+
+
+def test_the_default_keepalive_window_stays_under_what_the_path_holds():
+    from navis.platform.config.settings import Settings
+
+    default = Settings(_env_file=None).azure_openai_keepalive_expiry_seconds
+    assert 5.0 < default < 120.0, "above 5s to reuse at all; under 120s, the longest idle Azure was seen to hold"
+
+
 def test_the_azure_client_cache_does_not_leak_across_event_loops(monkeypatch):
     """httpx pools are not shareable between asyncio loops, so a plain module
     global would be reused from the wrong loop and fail at the transport. Each

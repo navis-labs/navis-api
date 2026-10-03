@@ -24,6 +24,18 @@ from navis.ml.retrieval.vector_search import Hit
 NOW = datetime(2026, 8, 6, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def _the_faked_index_has_rows(monkeypatch):
+    """The retriever test below fakes its I/O and models a POPULATED index, which
+    `MemoryRetriever` now confirms before it embeds (`index_has_rows`)."""
+    import navis.ml.retrieval.retriever as mod
+
+    async def _has_rows(db, org_id, *, model, version):
+        return True
+
+    monkeypatch.setattr(mod, "index_has_rows", _has_rows)
+
+
 def hit(text: str, cosine: float, entity_type: str = "thread") -> Hit:
     return Hit(uuid.uuid4(), cosine, entity_type, text, NOW)
 

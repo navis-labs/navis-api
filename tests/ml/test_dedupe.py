@@ -9,11 +9,26 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
+import pytest
 
 from navis.ml.retrieval.dedupe import collapse_by_event
 from navis.ml.retrieval.vector_search import Hit
 
 NOW = datetime(2026, 8, 6, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _the_faked_index_has_rows(monkeypatch):
+    """The retriever tests below fake every I/O call and return hits, so they
+    model a POPULATED index — which `MemoryRetriever` now confirms before it
+    embeds (`index_has_rows`). Answered here, with no database, as the fakes'
+    own premise."""
+    import navis.ml.retrieval.retriever as mod
+
+    async def _has_rows(db, org_id, *, model, version):
+        return True
+
+    monkeypatch.setattr(mod, "index_has_rows", _has_rows)
 
 
 def hit(text: str, cosine: float = 0.3, entity_type: str = "thread") -> Hit:

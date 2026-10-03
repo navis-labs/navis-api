@@ -39,6 +39,10 @@ DEFAULT_DEPLOYMENT = "gpt-4o-mini"
 # sane placeholder; NOT used as a fallback deployment name (Azure would 404).
 UNSET_EMBED_MODEL = "azure-embed-unconfigured"
 EMBED_DIM = 1536  # text-embedding-3-small / -large default; correct for both
+# The openai SDK's own pool sizes (`openai._constants.DEFAULT_CONNECTION_LIMITS`),
+# restated because passing `limits` replaces them. Only keep-alive is changed.
+_SDK_MAX_CONNECTIONS = 1000
+_SDK_MAX_KEEPALIVE_CONNECTIONS = 100
 
 
 class AzureProvider(MLProvider):
@@ -91,8 +95,15 @@ class AzureProvider(MLProvider):
         reuses exactly one pool.
 
         Dead loops are dropped on lookup so the map cannot grow without bound.
+
+        ── WHY IT CARRIES ITS OWN HTTP CLIENT ─────────────────────────────
+        Only to set `keepalive_expiry` (see the setting). The SDK exposes no
+        other supported way to change it, and `DefaultAsyncHttpxClient` is the
+        SDK's own type for this, so everything else stays the SDK's default —
+        except `limits`, which it replaces wholesale, hence the SDK's pool sizes
+        restated below.
         """
-        from openai import AsyncAzureOpenAI
+        from openai import AsyncAzureOpenAI, DefaultAsyncHttpxClient
 
         loop = asyncio.get_running_loop()
         cached = _CLIENTS.get(loop)
@@ -102,16 +113,25 @@ class AzureProvider(MLProvider):
         for dead in [lp for lp in _CLIENTS if lp.is_closed()]:
             _CLIENTS.pop(dead, None)
 
+        # BOUNDED, because the SDK default read timeout is 600s. See the note
+        # on these settings; a hung Azure response must not be able to hold a
+        # context build for ten minutes.
+        timeout = httpx.Timeout(
+            settings.azure_openai_timeout_seconds,
+            connect=settings.azure_openai_connect_timeout_seconds,
+        )
         client = AsyncAzureOpenAI(
             api_key=settings.azure_openai_api_key,
             azure_endpoint=settings.azure_openai_endpoint or "",
             api_version=settings.azure_openai_api_version,
-            # BOUNDED, because the SDK default read timeout is 600s. See the
-            # note on these settings; a hung Azure response must not be able
-            # to hold a context build for ten minutes.
-            timeout=httpx.Timeout(
-                settings.azure_openai_timeout_seconds,
-                connect=settings.azure_openai_connect_timeout_seconds,
+            timeout=timeout,
+            http_client=DefaultAsyncHttpxClient(
+                timeout=timeout,
+                limits=httpx.Limits(
+                    max_connections=_SDK_MAX_CONNECTIONS,
+                    max_keepalive_connections=_SDK_MAX_KEEPALIVE_CONNECTIONS,
+                    keepalive_expiry=settings.azure_openai_keepalive_expiry_seconds,
+                ),
             ),
             # The SDK's own retry: bounded, with exponential backoff and
             # jitter. Left at the configured value rather than disabled — a

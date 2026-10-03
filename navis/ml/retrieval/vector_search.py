@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import select, text
+from sqlalchemy import exists, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from navis.memory.models import MemoryRecord
@@ -160,6 +160,42 @@ async def _search_pgvector(
         Hit(r.memory_id, float(r.score), r.entity_type, r.source_text, r.event_timestamp)
         for r in rows
     ]
+
+
+async def index_has_rows(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    *,
+    model: str,
+    version: int,
+) -> bool:
+    """Could `search` return ANYTHING for this organization's index?
+
+    False only when no `memory_embeddings` row exists for (organization, model,
+    version) — and then both of `search`'s paths return `[]` for every query
+    vector and every time window, because each filters on exactly those three
+    columns and narrows further from there. So False is a PROOF of an empty
+    answer, never an estimate of one.
+
+    Deliberately broader than `search`: no `memory_records` join, no window,
+    no `embedding_vec IS NOT NULL`. Each of those can only remove rows, so a row
+    this counts that `search` would not merely sends the caller down the normal
+    path — the error is always towards doing the work, never towards skipping it.
+
+    One indexed lookup (`ix_me_org`) that stops at the first row: measured at
+    0.04ms of server time, so its whole cost is one round trip.
+    """
+    return bool(
+        await db.scalar(
+            select(
+                exists().where(
+                    MemoryEmbedding.organization_id == org_id,
+                    MemoryEmbedding.model == model,
+                    MemoryEmbedding.version == version,
+                )
+            )
+        )
+    )
 
 
 def _rank_key(hit: Hit) -> tuple[float, str]:

@@ -230,6 +230,22 @@ class Settings(BaseSettings):
     azure_openai_timeout_seconds: float = 30.0
     azure_openai_connect_timeout_seconds: float = 5.0
     azure_openai_max_retries: int = 2
+    # How long an IDLE pooled Azure connection is kept for reuse. A different
+    # concern from the timeouts above: those bound a request in flight, this
+    # decides whether the NEXT request has to open a connection at all.
+    #
+    # httpx's default is 5s, and agents call context tens of seconds apart, so
+    # almost every embedding paid a fresh TCP + TLS handshake to the East US
+    # endpoint — measured 1.6-2.1s per call against ~0.4-0.6s on a reused one.
+    #
+    # BOUNDED BELOW WHAT THE PATH WILL HOLD, because a connection a middlebox has
+    # silently dropped cannot be detected before it is written to. Measured: Azure
+    # itself kept an idle connection at 120s and had closed it (with a FIN, which
+    # httpcore detects and discards cleanly) by 240s; Azure Load Balancer's
+    # documented default idle timeout is 4 min, and an AWS NAT gateway drops idle
+    # flows at 350s with a RST on next use. 90s stays under all three. Set 5 to
+    # restore httpx's default exactly.
+    azure_openai_keepalive_expiry_seconds: float = 90.0
 
     # ---- Embedding read pin (migration control) ----
     # Retrieval reads a SPECIFIC (model, version) index. Writes go to whatever
@@ -330,6 +346,27 @@ class Settings(BaseSettings):
     # Server-side cap: a single statement may not run longer than this. Prevents a
     # runaway query from pinning a pooled connection forever (reliability at scale).
     db_statement_timeout_seconds: float = 30.0
+    # Keep the asyncpg and SQLAlchemy prepared-statement caches ON behind a
+    # transaction pooler (`db_is_pooled`). Off, every ORM statement costs THREE
+    # round trips — Parse/Describe, Bind/Execute, and a Close of the statement
+    # before it — instead of one. Measured against the production Neon pooler
+    # (~95ms RTT): GET /developer/me 14 round trips -> 6, p50 ~1.5s -> ~0.68s.
+    #
+    # It is safe on Neon because of what the pooler IS, not because of a default:
+    # PgBouncer >= 1.21 with `max_prepared_statements > 0` tracks protocol-level
+    # NAMED statements per client and re-prepares them on whichever backend a
+    # transaction lands on (Neon: 1.22+, 1000). Both halves were verified on the
+    # live endpoint — a client statement name comes back as `PGBOUNCER_<n>` in
+    # `pg_prepared_statements` — and with the caches OFF the server was already
+    # holding Core's ORM statements that way, because SQLAlchemy's asyncpg
+    # adapter names every statement it prepares. Only the client side changes.
+    #
+    # Set False for a pooler WITHOUT prepared-statement tracking (PgBouncer
+    # < 1.21, or `max_prepared_statements = 0`), where cached names collide
+    # across backends ("prepared statement ... does not exist / already exists").
+    # A direct (non-pooled) URL always uses the library defaults; this setting
+    # does not apply to it.
+    db_pooler_statement_cache: bool = True
 
     # ---- Redis pool ----
     redis_max_connections: int = 50

@@ -1,11 +1,11 @@
 """Async SQLAlchemy engine + session management.
 
 Production notes:
-  * Neon's pooled endpoint (`-pooler`) runs PgBouncer in transaction mode, which
-    is incompatible with asyncpg's prepared-statement cache. We disable both the
-    asyncpg statement cache and SQLAlchemy's prepared-statement cache for pooled
-    URLs, otherwise queries fail intermittently with
-    `prepared statement "__asyncpg_..." does not exist` under concurrency.
+  * Neon's pooled endpoint (`-pooler`) runs PgBouncer in transaction mode WITH
+    protocol-level prepared-statement tracking (PgBouncer >= 1.21,
+    `max_prepared_statements` > 0), so the asyncpg and SQLAlchemy statement
+    caches stay on there — see `settings.db_pooler_statement_cache` for the
+    measurement and for the one kind of pooler where they must be turned off.
   * `pool_recycle` is set below Neon's idle-connection timeout so we never hand a
     dead connection to a request.
 """
@@ -22,20 +22,30 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from navis.platform.config import settings
+from navis.platform.config.settings import Settings
 
-# asyncpg needs TLS via connect_args (not the libpq URL query string).
-_connect_args: dict = {}
-if settings.db_requires_ssl:
-    _connect_args["ssl"] = True
-if settings.db_is_pooled:
-    # PgBouncer transaction pooling: no server-side prepared statements.
-    _connect_args["statement_cache_size"] = 0
-    _connect_args["prepared_statement_cache_size"] = 0
-# Hard cap on how long any single statement may run, enforced by asyncpg. A runaway
-# query is cancelled instead of pinning a pooled connection forever — bounding the
-# blast radius of a bad query under load. Tune via DB_STATEMENT_TIMEOUT_SECONDS.
-if settings.db_statement_timeout_seconds and settings.db_statement_timeout_seconds > 0:
-    _connect_args["command_timeout"] = settings.db_statement_timeout_seconds
+
+def build_connect_args(s: Settings) -> dict:
+    """The asyncpg `connect_args` for the runtime engine. Pure, so it is testable."""
+    args: dict = {}
+    # asyncpg needs TLS via connect_args (not the libpq URL query string).
+    if s.db_requires_ssl:
+        args["ssl"] = True
+    if s.db_is_pooled and not s.db_pooler_statement_cache:
+        # A pooler that does NOT track prepared statements: cached statement
+        # names would collide across the backends a transaction may land on.
+        args["statement_cache_size"] = 0
+        args["prepared_statement_cache_size"] = 0
+    # Hard cap on how long any single statement may run, enforced by asyncpg. A
+    # runaway query is cancelled instead of pinning a pooled connection forever —
+    # bounding the blast radius of a bad query under load. Tune via
+    # DB_STATEMENT_TIMEOUT_SECONDS.
+    if s.db_statement_timeout_seconds and s.db_statement_timeout_seconds > 0:
+        args["command_timeout"] = s.db_statement_timeout_seconds
+    return args
+
+
+_connect_args: dict = build_connect_args(settings)
 
 engine = create_async_engine(
     settings.async_database_url,
